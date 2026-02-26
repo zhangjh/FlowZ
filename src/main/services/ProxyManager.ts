@@ -74,6 +74,7 @@ interface SingBoxDnsRule {
   rule_set?: string;
   query_type?: string[];
   domain?: string[];
+  domain_suffix?: string[];
   server: string;
 }
 
@@ -167,6 +168,7 @@ interface SingBoxRouteRule {
   domain?: string[];
   domain_suffix?: string[];
   domain_keyword?: string[];
+  domain_regex?: string[];
   ip_cidr?: string[];
   action: string;
   outbound?: string;
@@ -958,7 +960,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       rules,
       default_domain_resolver: 'dns-local',
       auto_detect_interface: true,
-      final: proxyMode === 'direct' ? 'direct' : 'proxy',
+      final: proxyMode === 'global' ? 'proxy' : 'direct',
     };
 
     // 添加 rule_set（除非是直连模式）
