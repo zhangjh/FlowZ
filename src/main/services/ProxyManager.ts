@@ -934,13 +934,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 智能分流规则（默认启用，除非是直连模式）
     if (proxyMode !== 'direct') {
-      // 国外域名走代理
-      rules.push({
-        rule_set: 'geosite-geolocation-!cn',
-        action: 'route',
-        outbound: 'proxy',
-      });
-      // 中国域名直连
+      // 中国域名直连（优先匹配）
       rules.push({
         rule_set: 'geosite-cn',
         action: 'route',
@@ -951,6 +945,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         rule_set: 'geoip-cn',
         action: 'route',
         outbound: 'direct',
+      });
+      // 国外域名走代理
+      rules.push({
+        rule_set: 'geosite-geolocation-!cn',
+        action: 'route',
+        outbound: 'proxy',
       });
     }
 
