@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -20,9 +19,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { Plus, Edit, Trash2, Server, ChevronDown, Link, Copy } from 'lucide-react';
+import { Plus, Edit, Trash2, Server, ChevronDown, Link, Share2 } from 'lucide-react';
 import { ImportUrlDialog } from './import-url-dialog';
-import { generateShareUrl } from '@/bridge/api-wrapper';
+import { ShareServerDialog } from './share-server-dialog';
 import type { ServerConfig } from '@/bridge/types';
 
 type ServerConfigWithId = ServerConfig;
@@ -47,24 +46,15 @@ export function ServerList({
   onImportSuccess,
 }: ServerListProps) {
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
+  const [sharingServer, setSharingServer] = useState<ServerConfigWithId | null>(null);
 
   const handleDelete = (serverId: string) => {
     onDeleteServer(serverId);
   };
 
-  const handleCopyShareUrl = async (server: ServerConfigWithId, e: React.MouseEvent) => {
+  const handleShare = (server: ServerConfigWithId, e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      const response = await generateShareUrl(server);
-      if (response.success && response.data) {
-        await navigator.clipboard.writeText(response.data);
-        toast.success('分享链接已复制到剪贴板');
-      } else {
-        toast.error(response.error || '生成分享链接失败');
-      }
-    } catch (error) {
-      toast.error('复制失败');
-    }
+    setSharingServer(server);
   };
 
   const formatDate = (dateString?: string) => {
@@ -159,10 +149,10 @@ export function ServerList({
                     <Button
                       variant="ghost"
                       size="sm"
-                      title="复制分享链接"
-                      onClick={(e) => handleCopyShareUrl(server, e)}
+                      title="分享"
+                      onClick={(e) => handleShare(server, e)}
                     >
-                      <Copy className="h-4 w-4" />
+                      <Share2 className="h-4 w-4" />
                     </Button>
                     <Button
                       variant="ghost"
@@ -241,6 +231,12 @@ export function ServerList({
         open={isImportDialogOpen}
         onOpenChange={setIsImportDialogOpen}
         onImportSuccess={onImportSuccess}
+      />
+
+      <ShareServerDialog
+        open={!!sharingServer}
+        onOpenChange={(open) => { if (!open) setSharingServer(null); }}
+        server={sharingServer}
       />
     </div>
   );
