@@ -1143,13 +1143,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           // macOS: 使用 osascript 请求管理员权限运行
           // 注意：路径中可能包含空格，需要使用转义引号
           // sing-box 配置中已经设置了 log.output，日志会写入文件
-          // 使用 & 让进程在后台运行，并将 PID 写入文件
+          // 使用 nohup + & 让进程在后台运行并脱离 shell 会话：
+          //   - nohup: 忽略 SIGHUP 信号，防止 bash 退出时 sing-box 被杀
+          //   - </dev/null: 断开 stdin，防止 pipe 关闭导致异常
+          //   - disown: 从 bash 作业表中移除，彻底脱离 shell 生命周期
           const pidFile = path.join(getUserDataPath(), 'singbox.pid');
           command = '/usr/bin/osascript';
-          // 使用 bash -c 来执行后台命令，确保 & 正常工作
           args = [
             '-e',
-            `do shell script "/bin/bash -c '\\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" & echo $! > \\"${pidFile}\\"'" with administrator privileges`,
+            `do shell script "/bin/bash -c 'nohup \\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" </dev/null >/dev/null 2>&1 & echo $! > \\"${pidFile}\\"; disown'" with administrator privileges`,
           ];
           this.logToManager('info', 'TUN 模式需要管理员权限，正在请求...');
         } else if (this.needsWindowsUAC()) {
