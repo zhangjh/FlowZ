@@ -794,12 +794,18 @@ app.on('window-all-closed', () => {
 });
 
 // 使用 will-quit 事件来清理资源
+// 用标志位防止 app.exit() 再次触发 will-quit 导致无限循环
+let isCleaningUp = false;
 app.on('will-quit', async (_event) => {
-  // 阻止默认退出，先清理资源
+  if (isCleaningUp) {
+    // 已经在清理中（由 app.exit 再次触发），直接放行
+    return;
+  }
+
+  isCleaningUp = true;
   _event.preventDefault();
 
   try {
-    // 清理资源
     await cleanupResources();
 
     // 清理托盘图标
@@ -807,14 +813,12 @@ app.on('will-quit', async (_event) => {
       trayManager.destroyTray();
       trayManager = null;
     }
-
-    // 现在可以安全退出了
-    app.exit(0);
   } catch (error) {
     console.error('Error during app quit:', error);
-    // 即使清理失败，也要退出
-    app.exit(1);
   }
+
+  // 清理完成，退出应用
+  app.exit(0);
 });
 
 // 处理 SIGINT 和 SIGTERM 信号

@@ -1225,6 +1225,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           this.singboxProcess.stdout.on('data', (data: Buffer) => {
             this.handleProcessOutput(data.toString());
           });
+          this.singboxProcess.stdout.on('error', (error) => {
+            console.error('sing-box stdout error:', error);
+          });
         }
 
         if (this.singboxProcess.stderr) {
@@ -1232,6 +1235,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             const output = data.toString();
             this.lastErrorOutput = output;
             this.handleProcessOutput(output);
+          });
+          this.singboxProcess.stderr.on('error', (error) => {
+            console.error('sing-box stderr error:', error);
           });
         }
 
@@ -1548,10 +1554,92 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const pidToKill = this.singboxPid;
     this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})，需要管理员权限...`);
 
+    // 策略：先尝试普通权限 taskkill，失败再用 UAC 提权，最后用 wmic 兜底
+    const killed = await this.tryKillWindowsProcess(pidToKill);
+
+    if (!killed && this.isProcessAlive(pidToKill)) {
+      this.logToManager('error', `无法终止 sing-box 进程 (PID: ${pidToKill})，进程仍在运行`);
+      // 不清理 PID 信息，让调用方知道停止失败
+      throw new Error(`无法终止 sing-box 进程 (PID: ${pidToKill})`);
+    }
+
+    this.logToManager('info', 'sing-box 进程已停止');
+
+    // 清理 PID 文件
+    const fsSync = require('fs');
+    try {
+      fsSync.unlinkSync(this.getPidFilePath());
+    } catch {
+      // 忽略错误
+    }
+
+    this.cleanup();
+
+    // 触发停止事件
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+  }
+
+  /**
+   * 多策略尝试终止 Windows 进程
+   * 依次尝试：普通 taskkill → UAC 提权 taskkill → wmic 终止
+   * @returns 是否成功终止
+   */
+  private async tryKillWindowsProcess(pid: number): Promise<boolean> {
+    const { execSync } = require('child_process');
+
+    // 策略 1：普通权限 taskkill（系统代理模式下的进程不需要提权）
+    try {
+      execSync(`taskkill /F /PID ${pid}`, {
+        windowsHide: true,
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      // 等待进程退出
+      if (await this.waitForProcessExit(pid, 3000)) {
+        this.logToManager('debug', `普通 taskkill 成功终止进程 ${pid}`);
+        return true;
+      }
+    } catch {
+      this.logToManager('debug', `普通 taskkill 无法终止进程 ${pid}，尝试提权...`);
+    }
+
+    // 策略 2：UAC 提权 taskkill
+    try {
+      const uacKilled = await this.killWithUAC(pid);
+      if (uacKilled && await this.waitForProcessExit(pid, 3000)) {
+        this.logToManager('debug', `UAC taskkill 成功终止进程 ${pid}`);
+        return true;
+      }
+    } catch {
+      this.logToManager('debug', `UAC taskkill 无法终止进程 ${pid}，尝试 wmic...`);
+    }
+
+    // 策略 3：wmic 终止（不需要 UAC 弹窗，某些情况下比 taskkill 更可靠）
+    try {
+      execSync(`wmic process where "ProcessId=${pid}" call terminate`, {
+        windowsHide: true,
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      if (await this.waitForProcessExit(pid, 3000)) {
+        this.logToManager('debug', `wmic 成功终止进程 ${pid}`);
+        return true;
+      }
+    } catch {
+      this.logToManager('debug', `wmic 也无法终止进程 ${pid}`);
+    }
+
+    // 所有策略都失败
+    return !this.isProcessAlive(pid);
+  }
+
+  /**
+   * 使用 UAC 提权执行 taskkill
+   */
+  private killWithUAC(pid: number): Promise<boolean> {
     return new Promise((resolve) => {
-      // 直接使用 PowerShell 以管理员权限执行 taskkill
-      // sing-box 以 UAC 启动，必须用 UAC 权限才能终止
-      const psScript = "Start-Process -FilePath 'taskkill' -ArgumentList '/F','/PID','" + pidToKill.toString() + "' -Verb RunAs -Wait -WindowStyle Hidden";
+      const psScript = "Start-Process -FilePath 'taskkill' -ArgumentList '/F','/PID','" + pid.toString() + "' -Verb RunAs -Wait -WindowStyle Hidden";
 
       const killProcess = spawn('powershell.exe', [
         '-NoProfile',
@@ -1561,39 +1649,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         windowsHide: true,
       });
 
-      killProcess.stderr?.on('data', (data) => {
-        this.logToManager('warn', `taskkill stderr: ${data.toString()}`);
-      });
+      const timeout = setTimeout(() => {
+        try { killProcess.kill(); } catch { /* ignore */ }
+        resolve(false);
+      }, 15000); // UAC 对话框超时 15 秒
 
       killProcess.on('exit', (code) => {
-        if (code === 0) {
-          this.logToManager('info', 'sing-box 进程已停止');
-        } else {
-          // 非零退出码可能是进程已退出或用户取消 UAC
-          this.logToManager('warn', `停止进程结果: code=${code}`);
-        }
-
-        // 清理 PID 文件
-        const fsSync = require('fs');
-        try {
-          fsSync.unlinkSync(this.getPidFilePath());
-        } catch {
-          // 忽略错误
-        }
-
-        this.cleanup();
-
-        // 触发停止事件
-        this.emit('stopped');
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
-
-        resolve();
+        clearTimeout(timeout);
+        resolve(code === 0);
       });
 
-      killProcess.on('error', (error) => {
-        this.logToManager('error', `停止 sing-box 进程失败: ${error.message}`);
-        this.cleanup();
-        resolve();
+      killProcess.on('error', () => {
+        clearTimeout(timeout);
+        resolve(false);
       });
     });
   }
@@ -1760,62 +1828,53 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 优化：排除当前正在管理的进程，避免误杀
    */
   private async killOrphanedProcessesWindows(): Promise<void> {
-    return new Promise((resolve) => {
-      const { execSync } = require('child_process');
-      
-      try {
-        // 使用 wmic 获取所有 sing-box.exe 进程的 PID
-        const result = execSync('wmic process where "name=\'sing-box.exe\'" get ProcessId /format:list', {
-          encoding: 'utf-8',
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'ignore']
-        });
-        
-        // 解析 PID 列表
-        const pidMatches = result.match(/ProcessId=(\d+)/g);
-        if (!pidMatches || pidMatches.length === 0) {
-          resolve();
-          return;
-        }
-        
-        let pidList = pidMatches
-          .map((m: string) => parseInt(m.replace('ProcessId=', ''), 10))
-          .filter((p: number) => !isNaN(p) && p > 0);
-        
-        // 排除当前正在管理的进程
-        const currentPid = this.singboxPid || this.pid;
-        if (currentPid) {
-          pidList = pidList.filter((p: number) => p !== currentPid);
-        }
-        
-        if (pidList.length === 0) {
-          resolve();
-          return;
-        }
-        
-        this.logToManager('warn', `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`);
-        
-        // 逐个终止进程
-        for (const pid of pidList) {
-          try {
-            execSync(`taskkill /F /PID ${pid}`, {
-              windowsHide: true,
-              stdio: 'ignore'
-            });
-          } catch {
-            // 忽略单个进程终止失败
-          }
-        }
-        
-        this.logToManager('info', '残留进程已清理');
-        
-        // 等待一小段时间让系统清理
-        setTimeout(resolve, 500);
-      } catch {
-        // wmic 命令失败，可能没有残留进程
-        resolve();
+    const { execSync } = require('child_process');
+
+    try {
+      // 使用 wmic 获取所有 sing-box.exe 进程的 PID
+      const result = execSync('wmic process where "name=\'sing-box.exe\'" get ProcessId /format:list', {
+        encoding: 'utf-8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+
+      // 解析 PID 列表
+      const pidMatches = result.match(/ProcessId=(\d+)/g);
+      if (!pidMatches || pidMatches.length === 0) {
+        return;
       }
-    });
+
+      let pidList = pidMatches
+        .map((m: string) => parseInt(m.replace('ProcessId=', ''), 10))
+        .filter((p: number) => !isNaN(p) && p > 0);
+
+      // 排除当前正在管理的进程
+      const currentPid = this.singboxPid || this.pid;
+      if (currentPid) {
+        pidList = pidList.filter((p: number) => p !== currentPid);
+      }
+
+      if (pidList.length === 0) {
+        return;
+      }
+
+      this.logToManager('warn', `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`);
+
+      // 使用多策略逐个终止进程
+      for (const pid of pidList) {
+        const killed = await this.tryKillWindowsProcess(pid);
+        if (!killed) {
+          this.logToManager('warn', `无法终止残留进程 ${pid}`);
+        }
+      }
+
+      this.logToManager('info', '残留进程清理完成');
+
+      // 等待一小段时间让系统清理
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch {
+      // wmic 命令失败，可能没有残留进程
+    }
   }
 
   /**
@@ -1834,7 +1893,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         const result = execSync(`tasklist /FI "PID eq ${pid}" /NH`, { 
           encoding: 'utf-8',
           windowsHide: true,
-          stdio: ['ignore', 'pipe', 'ignore']
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
         });
         // 如果进程存在，输出会包含进程信息；不存在则输出 "INFO: No tasks..."
         return !result.includes('No tasks') && result.includes(String(pid));
@@ -1842,7 +1902,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // macOS/Linux: 使用 ps 检测进程
         const result = execSync(`ps -p ${pid} -o pid=`, { 
           encoding: 'utf-8',
-          stdio: ['ignore', 'pipe', 'ignore']
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
         });
         return result.trim() === String(pid);
       }
@@ -1896,10 +1957,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
+    // 二次确认：第一次检测到进程不存在时，等待短暂时间后再次确认
+    // 避免因系统负载高导致的瞬时误判
     if (!this.isProcessAlive(activePid)) {
-      // 尝试获取更多退出信息
+      // 使用同步等待 200ms 后再次检查（健康检查本身在 setInterval 中，短暂阻塞可接受）
+      const { execSync } = require('child_process');
+      try { execSync('sleep 0.2'); } catch { /* ignore */ }
+
+      if (this.isProcessAlive(activePid)) {
+        // 第二次检查进程存活，是误判，记录警告
+        this.logToManager('warn', `健康检查首次误判进程 ${activePid} 已退出，二次确认进程仍存活`);
+        return;
+      }
+
+      // 确认进程确实退出了，收集诊断信息
       const exitInfo = this.getProcessExitInfo();
-      this.logToManager('error', `检测到 sing-box 进程 (PID: ${activePid}) 已意外退出${exitInfo ? `，${exitInfo}` : ''}`);
+      const diagInfo = this.collectExitDiagnostics(activePid, isTunMode);
+      const fullInfo = [exitInfo, diagInfo].filter(Boolean).join('; ');
+
+      this.logToManager('error', `检测到 sing-box 进程 (PID: ${activePid}) 已意外退出${fullInfo ? `，${fullInfo}` : ''}`);
 
       // 清理资源（但不停止健康检查，因为可能要重启）
       this.singboxProcess = null;
@@ -1909,7 +1985,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 尝试自动重启
       if (this.shouldAutoRestart()) {
-        this.attemptAutoRestart();
+        // 立即设置 isRestarting 标志，防止下次健康检查并发触发重启
+        this.isRestarting = true;
+        this.attemptAutoRestart().catch((error) => {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          this.logToManager('error', `自动重启过程中发生未预期的错误: ${errorMessage}`);
+          this.isRestarting = false;
+        });
       } else {
         // 无法自动重启，通知用户
         this.emit('error', {
@@ -1929,6 +2011,68 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         this.cleanup();
       }
     }
+  }
+
+  /**
+   * 收集进程退出的诊断信息
+   * 用于在健康检查发现进程退出时，尽可能多地收集上下文
+   */
+  private collectExitDiagnostics(pid: number, isTunMode: boolean): string {
+    const info: string[] = [];
+    const { execSync } = require('child_process');
+
+    try {
+      info.push(`模式: ${isTunMode ? 'TUN' : '系统代理'}`);
+      info.push(`运行时长: ${this.startTime ? Math.floor((Date.now() - this.startTime.getTime()) / 1000) + 's' : '未知'}`);
+
+      if (process.platform === 'darwin') {
+        // 检查是否有该 PID 的退出记录（通过 sysctl 或 dmesg）
+        try {
+          // 查询 ASL (Apple System Log) 中的进程退出记录
+          const aslLog = execSync(
+            `log show --predicate 'eventMessage CONTAINS "${pid}" AND (eventMessage CONTAINS "exit" OR eventMessage CONTAINS "signal" OR eventMessage CONTAINS "killed" OR eventMessage CONTAINS "jettisoned")' --last 2m --style compact 2>/dev/null | tail -5`,
+            { encoding: 'utf-8', timeout: 3000 }
+          ).trim();
+          const aslLines = aslLog.split('\n').filter((l: string) => !l.startsWith('Timestamp') && l.trim());
+          if (aslLines.length > 0) {
+            info.push(`系统退出记录: ${aslLines.join(' | ').substring(0, 300)}`);
+          }
+        } catch {
+          // 忽略
+        }
+
+        // 检查是否被 macOS 的 memory pressure 杀掉
+        try {
+          const memPressure = execSync(
+            `log show --predicate 'process == "kernel" AND eventMessage CONTAINS "jettisoned"' --last 2m --style compact 2>/dev/null | tail -3`,
+            { encoding: 'utf-8', timeout: 3000 }
+          ).trim();
+          const memLines = memPressure.split('\n').filter((l: string) => !l.startsWith('Timestamp') && l.trim());
+          if (memLines.length > 0) {
+            info.push(`内存压力事件: ${memLines.join(' | ').substring(0, 200)}`);
+          }
+        } catch {
+          // 忽略
+        }
+
+        // 检查当前内存压力状态
+        try {
+          const memStatus = execSync('memory_pressure 2>/dev/null | head -1', {
+            encoding: 'utf-8',
+            timeout: 2000,
+          }).trim();
+          if (memStatus) {
+            info.push(`内存状态: ${memStatus.substring(0, 100)}`);
+          }
+        } catch {
+          // 忽略
+        }
+      }
+    } catch {
+      // 忽略诊断错误
+    }
+
+    return info.length > 0 ? info.join('; ') : '';
   }
 
   /**
@@ -2044,16 +2188,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (fsSync.existsSync(logFilePath)) {
         const logContent = fsSync.readFileSync(logFilePath, 'utf-8');
         const lines = logContent.trim().split('\n');
-        const lastLines = lines.slice(-10); // 最后 10 行
+        const lastLines = lines.slice(-20); // 最后 20 行（增加范围以获取更多上下文）
         
-        // 查找错误或警告信息
+        // 先查找错误或警告信息
+        const errorLines: string[] = [];
         for (const line of lastLines) {
           const lowerLine = line.toLowerCase();
           if (lowerLine.includes('error') || lowerLine.includes('fatal') || 
-              lowerLine.includes('panic') || lowerLine.includes('failed')) {
-            info.push(`日志: ${line.substring(0, 200)}`);
+              lowerLine.includes('panic') || lowerLine.includes('failed') ||
+              lowerLine.includes('closed') || lowerLine.includes('terminated')) {
+            errorLines.push(line.substring(0, 200));
           }
         }
+        
+        if (errorLines.length > 0) {
+          info.push(`日志: ${errorLines.join(' | ')}`);
+        } else if (lastLines.length > 0) {
+          // 没有明确的错误信息，输出最后 3 行作为上下文
+          const tail = lastLines.slice(-3).map((l: string) => l.substring(0, 150));
+          info.push(`最后日志: ${tail.join(' | ')}`);
+        } else {
+          info.push('日志文件为空');
+        }
+      } else {
+        info.push('日志文件不存在');
       }
       
       // macOS: 尝试从系统日志获取信息
@@ -2066,10 +2224,45 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             { encoding: 'utf-8', timeout: 3000 }
           ).trim();
           if (sysLog) {
-            info.push(`系统日志: ${sysLog.substring(0, 300)}`);
+            // 过滤掉只有表头没有实际内容的情况
+            const sysLogLines = sysLog.split('\n').filter((l: string) => !l.startsWith('Timestamp') && l.trim());
+            if (sysLogLines.length > 0) {
+              info.push(`系统日志: ${sysLogLines.join(' | ').substring(0, 300)}`);
+            }
           }
         } catch {
           // 忽略系统日志查询失败
+        }
+        
+        // 额外检查：是否有 crash report
+        try {
+          const crashLog = execSync(
+            `ls -t ~/Library/Logs/DiagnosticReports/sing-box* 2>/dev/null | head -1`,
+            { encoding: 'utf-8', timeout: 2000 }
+          ).trim();
+          if (crashLog) {
+            info.push(`发现崩溃报告: ${crashLog}`);
+            // 读取崩溃报告的前几行
+            try {
+              const crashContent = execSync(
+                `head -20 "${crashLog}" 2>/dev/null`,
+                { encoding: 'utf-8', timeout: 2000 }
+              ).trim();
+              if (crashContent) {
+                // 提取关键信息：Exception Type 和 Termination Reason
+                const relevantLines = crashContent.split('\n').filter((l: string) => 
+                  l.includes('Exception') || l.includes('Termination') || l.includes('Signal')
+                );
+                if (relevantLines.length > 0) {
+                  info.push(`崩溃原因: ${relevantLines.join('; ').substring(0, 200)}`);
+                }
+              }
+            } catch {
+              // 忽略
+            }
+          }
+        } catch {
+          // 忽略
         }
       }
     } catch (error) {
@@ -2152,14 +2345,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 每 500ms 检查一次日志文件
     this.logFileWatcher = setInterval(async () => {
+      let fd: import('fs/promises').FileHandle | null = null;
       try {
         const stats = await fs.stat(logFilePath);
         if (stats.size > this.lastLogFileSize) {
           // 读取新增的内容
-          const fd = await fs.open(logFilePath, 'r');
+          fd = await fs.open(logFilePath, 'r');
           const buffer = Buffer.alloc(stats.size - this.lastLogFileSize);
           await fd.read(buffer, 0, buffer.length, this.lastLogFileSize);
-          await fd.close();
 
           const newContent = buffer.toString('utf-8');
           this.lastLogFileSize = stats.size;
@@ -2171,6 +2364,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
       } catch {
         // 文件可能还不存在，忽略错误
+      } finally {
+        // 确保文件句柄始终被关闭
+        if (fd) {
+          try {
+            await fd.close();
+          } catch {
+            // 忽略关闭错误
+          }
+        }
       }
     }, 500);
   }
