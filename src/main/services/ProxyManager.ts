@@ -1141,41 +1141,57 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         if (this.needsOsascript()) {
           // macOS: 使用 osascript 请求管理员权限运行
-          // 使用 wrapper 脚本启动 sing-box：
-          //   1. 启动 sing-box 后台进程并记录 PID
-          //   2. wrapper 脚本持续运行，wait sing-box 进程
-          //   3. sing-box 退出时，捕获退出码和信号，写入诊断文件
-          //   4. 所有信号都被 trap 记录，帮助诊断异常退出原因
+          // 将 wrapper 脚本写入临时文件，避免多层引号转义问题
+          // wrapper 脚本功能：
+          //   1. 启动 sing-box 并记录 PID
+          //   2. 持续运行，wait 等待 sing-box 退出
+          //   3. 捕获退出码和信号，写入诊断文件
           const pidFile = path.join(getUserDataPath(), 'singbox.pid');
           const exitInfoFile = path.join(getUserDataPath(), 'singbox_exit.log');
-          command = '/usr/bin/osascript';
-          // wrapper 脚本说明：
-          // - trap 捕获所有常见信号并记录到诊断文件
-          // - sing-box 在后台运行，wrapper 用 wait 等待它退出
-          // - wait 返回后记录退出码（128+N 表示被信号 N 杀死）
-          const wrapperScript = [
-            // 记录启动时间
-            `echo \\"[$(date)] wrapper started\\" > \\"${exitInfoFile}\\"`,
-            // trap 信号：如果 wrapper 自身收到信号，记录并转发给 sing-box
-            `trap 'echo \\"[$(date)] wrapper received SIGHUP\\" >> \\"${exitInfoFile}\\"' HUP`,
-            `trap 'echo \\"[$(date)] wrapper received SIGTERM\\" >> \\"${exitInfoFile}\\"; kill -TERM $SBPID 2>/dev/null' TERM`,
-            `trap 'echo \\"[$(date)] wrapper received SIGINT\\" >> \\"${exitInfoFile}\\"; kill -INT $SBPID 2>/dev/null' INT`,
-            // 启动 sing-box
-            `\\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" &`,
-            `SBPID=$!`,
-            `echo $SBPID > \\"${pidFile}\\"`,
-            `echo \\"[$(date)] sing-box started PID=$SBPID\\" >> \\"${exitInfoFile}\\"`,
-            // wait 等待 sing-box 退出，捕获退出码
-            `wait $SBPID`,
-            `EXIT_CODE=$?`,
-            `echo \\"[$(date)] sing-box exited code=$EXIT_CODE (128+N means signal N)\\" >> \\"${exitInfoFile}\\"`,
-            // 如果退出码 > 128，计算信号编号
-            `if [ $EXIT_CODE -gt 128 ]; then SIG=$((EXIT_CODE - 128)); echo \\"[$(date)] killed by signal $SIG\\" >> \\"${exitInfoFile}\\"; fi`,
-          ].join('; ');
+          const wrapperScriptFile = path.join(getUserDataPath(), 'singbox_wrapper.sh');
 
+          // 生成 wrapper 脚本内容
+          const wrapperContent = [
+            '#!/bin/bash',
+            `SINGBOX_PATH="${this.singboxPath}"`,
+            `CONFIG_PATH="${this.configPath}"`,
+            `PID_FILE="${pidFile}"`,
+            `EXIT_LOG="${exitInfoFile}"`,
+            '',
+            '# 记录启动时间',
+            'echo "[$(date)] wrapper started" > "$EXIT_LOG"',
+            '',
+            '# trap 信号：记录并转发给 sing-box',
+            'trap \'echo "[$(date)] wrapper received SIGHUP" >> "$EXIT_LOG"\' HUP',
+            'trap \'echo "[$(date)] wrapper received SIGTERM" >> "$EXIT_LOG"; kill -TERM $SBPID 2>/dev/null\' TERM',
+            'trap \'echo "[$(date)] wrapper received SIGINT" >> "$EXIT_LOG"; kill -INT $SBPID 2>/dev/null\' INT',
+            '',
+            '# 启动 sing-box',
+            '"$SINGBOX_PATH" run -c "$CONFIG_PATH" &',
+            'SBPID=$!',
+            'echo $SBPID > "$PID_FILE"',
+            'echo "[$(date)] sing-box started PID=$SBPID" >> "$EXIT_LOG"',
+            '',
+            '# wait 等待 sing-box 退出',
+            'wait $SBPID',
+            'EXIT_CODE=$?',
+            'echo "[$(date)] sing-box exited code=$EXIT_CODE (128+N means signal N)" >> "$EXIT_LOG"',
+            '',
+            '# 如果退出码 > 128，计算信号编号',
+            'if [ $EXIT_CODE -gt 128 ]; then',
+            '  SIG=$((EXIT_CODE - 128))',
+            '  echo "[$(date)] killed by signal $SIG" >> "$EXIT_LOG"',
+            'fi',
+          ].join('\n');
+
+          // 写入 wrapper 脚本文件
+          const fsSync = require('fs');
+          fsSync.writeFileSync(wrapperScriptFile, wrapperContent, { mode: 0o755 });
+
+          command = '/usr/bin/osascript';
           args = [
             '-e',
-            `do shell script "/bin/bash -c '${wrapperScript}'" with administrator privileges`,
+            `do shell script "/bin/bash \\"${wrapperScriptFile}\\"" with administrator privileges`,
           ];
           this.logToManager('info', 'TUN 模式需要管理员权限，正在请求...');
         } else if (this.needsWindowsUAC()) {
