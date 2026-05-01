@@ -1141,15 +1141,59 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         if (this.needsOsascript()) {
           // macOS: 使用 osascript 请求管理员权限运行
-          // 注意：路径中可能包含空格，需要使用转义引号
-          // sing-box 配置中已经设置了 log.output，日志会写入文件
-          // 使用 & 让进程在后台运行，并将 PID 写入文件
+          // 将 wrapper 脚本写入临时文件，避免多层引号转义问题
+          // wrapper 脚本功能：
+          //   1. 启动 sing-box 并记录 PID
+          //   2. 持续运行，wait 等待 sing-box 退出
+          //   3. 捕获退出码和信号，写入诊断文件
           const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+          const exitInfoFile = path.join(getUserDataPath(), 'singbox_exit.log');
+          const wrapperScriptFile = path.join(getUserDataPath(), 'singbox_wrapper.sh');
+
+          // 生成 wrapper 脚本内容
+          const wrapperContent = [
+            '#!/bin/bash',
+            `SINGBOX_PATH="${this.singboxPath}"`,
+            `CONFIG_PATH="${this.configPath}"`,
+            `PID_FILE="${pidFile}"`,
+            `EXIT_LOG="${exitInfoFile}"`,
+            '',
+            '# 记录启动时间',
+            'echo "[$(date)] wrapper started" > "$EXIT_LOG"',
+            '',
+            '# trap 信号：记录并转发给 sing-box',
+            'trap \'echo "[$(date)] wrapper received SIGHUP" >> "$EXIT_LOG"\' HUP',
+            'trap \'echo "[$(date)] wrapper received SIGTERM" >> "$EXIT_LOG"; kill -TERM $SBPID 2>/dev/null\' TERM',
+            'trap \'echo "[$(date)] wrapper received SIGINT" >> "$EXIT_LOG"; kill -INT $SBPID 2>/dev/null\' INT',
+            '',
+            '# 启动 sing-box',
+            '"$SINGBOX_PATH" run -c "$CONFIG_PATH" &',
+            'SBPID=$!',
+            'echo $SBPID > "$PID_FILE"',
+            'echo "[$(date)] sing-box started PID=$SBPID" >> "$EXIT_LOG"',
+            '',
+            '# wait 等待 sing-box 退出',
+            'wait $SBPID',
+            'EXIT_CODE=$?',
+            'echo "[$(date)] sing-box exited code=$EXIT_CODE (128+N means signal N)" >> "$EXIT_LOG"',
+            '',
+            '# 如果退出码 > 128，计算信号编号',
+            'if [ $EXIT_CODE -gt 128 ]; then',
+            '  SIG=$((EXIT_CODE - 128))',
+            '  echo "[$(date)] killed by signal $SIG" >> "$EXIT_LOG"',
+            'fi',
+          ].join('\n');
+
+          // 写入 wrapper 脚本文件
+          const fsSync = require('fs');
+          fsSync.writeFileSync(wrapperScriptFile, wrapperContent, { mode: 0o755 });
+
           command = '/usr/bin/osascript';
-          // 使用 bash -c 来执行后台命令，确保 & 正常工作
+          // do shell script 用 /bin/sh 执行，需要显式调用 /bin/bash
+          // 路径含空格，用单引号包裹避免 sh 解析问题
           args = [
             '-e',
-            `do shell script "/bin/bash -c '\\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" & echo $! > \\"${pidFile}\\"'" with administrator privileges`,
+            `do shell script "/bin/bash '${wrapperScriptFile}'" with administrator privileges`,
           ];
           this.logToManager('info', 'TUN 模式需要管理员权限，正在请求...');
         } else if (this.needsWindowsUAC()) {
@@ -1253,12 +1297,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         this.singboxProcess.on('exit', (code, signal) => {
           console.log(`sing-box process exited with code ${code}, signal ${signal}`);
 
-          // 对于 macOS TUN 模式，osascript 退出码为 0 表示成功启动了后台进程
+          // 对于 macOS TUN 模式，osascript 退出码为 0 表示脚本执行成功
           if (this.needsOsascript()) {
             if (code === 0) {
-              // osascript 成功执行，sing-box 在后台运行
-              // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
-              return; // 不调用 handleProcessExit，因为 sing-box 还在运行
+              // wrapper 脚本正常退出，可能是：
+              // 1. 启动阶段：sing-box 刚启动，PID 文件已写入（由 setTimeout 中的 waitForPidFile 处理）
+              // 2. 运行阶段：sing-box 退出导致 wait 返回，wrapper 脚本结束
+              // 两种情况都不需要在这里处理，健康检查会监控 sing-box 进程状态
+              if (this.singboxPid) {
+                // 已经在运行阶段，wrapper 退出说明 sing-box 退出了
+                this.logToManager('info', 'wrapper 脚本退出，sing-box 进程可能已结束，等待健康检查确认');
+              }
+              return;
             } else {
               // osascript 执行失败（用户取消或其他错误）
               const errorMessage =
@@ -2182,6 +2232,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     
     try {
       const fsSync = require('fs');
+
+      // 读取 wrapper 脚本的退出诊断文件（macOS TUN 模式）
+      const exitInfoFile = path.join(getUserDataPath(), 'singbox_exit.log');
+      if (fsSync.existsSync(exitInfoFile)) {
+        try {
+          const exitContent = fsSync.readFileSync(exitInfoFile, 'utf-8').trim();
+          if (exitContent) {
+            info.push(`退出诊断: ${exitContent.substring(0, 500)}`);
+          }
+        } catch {
+          // 忽略
+        }
+      }
+
       const logFilePath = this.getLogFilePath();
       
       // 读取 sing-box 日志文件的最后几行
