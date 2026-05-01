@@ -1189,9 +1189,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           fsSync.writeFileSync(wrapperScriptFile, wrapperContent, { mode: 0o755 });
 
           command = '/usr/bin/osascript';
+          // do shell script 用 /bin/sh 执行，需要显式调用 /bin/bash
+          // 路径含空格，用单引号包裹避免 sh 解析问题
           args = [
             '-e',
-            `do shell script "/bin/bash \\"${wrapperScriptFile}\\"" with administrator privileges`,
+            `do shell script "/bin/bash '${wrapperScriptFile}'" with administrator privileges`,
           ];
           this.logToManager('info', 'TUN 模式需要管理员权限，正在请求...');
         } else if (this.needsWindowsUAC()) {
