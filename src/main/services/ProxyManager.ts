@@ -1944,22 +1944,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           encoding: 'utf-8',
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'ignore'],
-          timeout: 5000,
+          timeout: 10000,
         });
-        // 如果进程存在，输出会包含进程信息；不存在则输出 "INFO: No tasks..."
-        return !result.includes('No tasks') && result.includes(String(pid));
+        // 进程不存在时，中文 Windows 输出"信息: 没有运行的任务匹配指定标准"
+        // 英文 Windows 输出 "INFO: No tasks are running..."
+        // 统一判断：如果输出包含 PID 数字，说明进程存在
+        return result.includes(String(pid));
       } else {
         // macOS/Linux: 使用 ps 检测进程
         const result = execSync(`ps -p ${pid} -o pid=`, { 
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'ignore'],
-          timeout: 5000,
+          timeout: 10000,
         });
         return result.trim() === String(pid);
       }
     } catch {
-      // 命令执行失败，进程不存在
-      return false;
+      // 命令超时或执行失败
+      // 超时不能断定进程已死，返回 true 保守处理，让下次健康检查再确认
+      return true;
     }
   }
 
@@ -2007,16 +2010,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    // 二次确认：第一次检测到进程不存在时，等待短暂时间后再次确认
-    // 避免因系统负载高导致的瞬时误判
+    // 二次确认：第一次检测到进程不存在时，等待后再次确认
+    // 避免因系统负载高导致 tasklist/ps 超时而误判
     if (!this.isProcessAlive(activePid)) {
-      // 使用同步等待 200ms 后再次检查（健康检查本身在 setInterval 中，短暂阻塞可接受）
-      const { execSync } = require('child_process');
-      try { execSync('sleep 0.2'); } catch { /* ignore */ }
+      // 使用 Atomics.wait 实现跨平台同步等待（Windows 没有 sleep 命令）
+      const sharedBuf = new SharedArrayBuffer(4);
+      const sharedArr = new Int32Array(sharedBuf);
+      Atomics.wait(sharedArr, 0, 0, 500);
 
       if (this.isProcessAlive(activePid)) {
-        // 第二次检查进程存活，是误判，记录警告
         this.logToManager('warn', `健康检查首次误判进程 ${activePid} 已退出，二次确认进程仍存活`);
+        return;
+      }
+
+      // 第三次确认，间隔更长
+      Atomics.wait(sharedArr, 0, 0, 1000);
+
+      if (this.isProcessAlive(activePid)) {
+        this.logToManager('warn', `健康检查二次误判进程 ${activePid} 已退出，三次确认进程仍存活`);
         return;
       }
 
