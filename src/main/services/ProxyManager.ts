@@ -14,6 +14,7 @@ import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
 import { getUserDataPath } from '../utils/paths';
+import { isRunningAsAdmin } from './AdminPrivilege';
 
 /**
  * 私有 IP 地址段（CIDR 格式）
@@ -721,7 +722,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             ? 'gvisor'
             : config.tunConfig?.stack || 'system',
         sniff: true,
-        sniff_override_destination: true,
+        // FakeIP 模式下不设置 sniff_override_destination：
+        // FakeIP 通过映射表反查域名，不依赖 sniff 识别目标地址。
+        // sniff_override_destination 是真实 IP 模式的配置，在 FakeIP 模式下会导致
+        // SSH、QUIC 等 sniff 不可靠的协议拿着 FakeIP 直接发出连接，必然失败。
         // 在系统路由层面排除本地地址，确保本地代理端口可访问
         route_exclude_address: ['127.0.0.0/8', '::1/128'],
       };
@@ -1536,6 +1540,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     const pidToKill = this.singboxPid;
+
+    // 进程已不存在，直接清理
+    if (!this.isProcessAlive(pidToKill)) {
+      this.logToManager('info', `sing-box 进程 (PID: ${pidToKill}) 已不存在，跳过终止`);
+      try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
+      this.cleanup();
+      this.emit('stopped');
+      this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+      return;
+    }
+
     this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})...`);
 
     return new Promise((resolve) => {
@@ -1601,16 +1616,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    const pidToKill = this.singboxPid;
-    this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})，需要管理员权限...`);
+    this.logToManager('info', '正在停止所有 sing-box 进程...');
 
-    // 策略：先尝试普通权限 taskkill，失败再用 UAC 提权，最后用 wmic 兜底
-    const killed = await this.tryKillWindowsProcess(pidToKill);
+    // 按进程名杀掉所有 sing-box.exe 实例（包括残留的）
+    // taskkill /IM 比按 PID 更可靠：不依赖 PID 文件，能清理残留进程
+    const killed = await this.killAllSingBoxOnWindows();
 
-    if (!killed && this.isProcessAlive(pidToKill)) {
-      this.logToManager('error', `无法终止 sing-box 进程 (PID: ${pidToKill})，进程仍在运行`);
-      // 不清理 PID 信息，让调用方知道停止失败
-      throw new Error(`无法终止 sing-box 进程 (PID: ${pidToKill})`);
+    if (!killed) {
+      this.logToManager('error', '无法终止 sing-box 进程，可能仍在运行');
+      throw new Error('无法终止 sing-box 进程');
     }
 
     this.logToManager('info', 'sing-box 进程已停止');
@@ -1631,70 +1645,94 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 多策略尝试终止 Windows 进程
-   * 依次尝试：普通 taskkill → UAC 提权 taskkill → wmic 终止
-   * @returns 是否成功终止
+   * 终止所有 sing-box.exe 进程
+   * 使用 PowerShell cmdlet（Get-Process / Stop-Process），避免 tasklist/taskkill/wmic
+   * 在某些系统上的"关键错误"问题
    */
-  private async tryKillWindowsProcess(pid: number): Promise<boolean> {
+  private async killAllSingBoxOnWindows(): Promise<boolean> {
     const { execSync } = require('child_process');
 
-    // 策略 1：普通权限 taskkill（系统代理模式下的进程不需要提权）
-    try {
-      execSync(`taskkill /F /PID ${pid}`, {
-        windowsHide: true,
-        stdio: 'ignore',
-        timeout: 5000,
-      });
-      // 等待进程退出
-      if (await this.waitForProcessExit(pid, 3000)) {
-        this.logToManager('debug', `普通 taskkill 成功终止进程 ${pid}`);
-        return true;
+    // 检查是否还有 sing-box 进程
+    const hasSingBox = (): boolean => {
+      try {
+        const result = execSync(
+          'powershell -NoProfile -Command "@(Get-Process sing-box -ErrorAction SilentlyContinue).Count"',
+          {
+            encoding: 'utf-8',
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 5000,
+          }
+        );
+        const count = parseInt(result.trim(), 10);
+        return !isNaN(count) && count > 0;
+      } catch {
+        return false;
       }
-    } catch {
-      this.logToManager('debug', `普通 taskkill 无法终止进程 ${pid}，尝试提权...`);
+    };
+
+    if (!hasSingBox()) {
+      this.logToManager('debug', '没有 sing-box 进程在运行');
+      return true;
     }
 
-    // 策略 2：UAC 提权 taskkill
-    try {
-      const uacKilled = await this.killWithUAC(pid);
-      if (uacKilled && await this.waitForProcessExit(pid, 3000)) {
-        this.logToManager('debug', `UAC taskkill 成功终止进程 ${pid}`);
-        return true;
+    // 当前是 TUN 模式且 FlowZ 非管理员权限运行：
+    // sing-box 是 UAC 提权启动的，普通 Stop-Process 必然失败，直接走 UAC 提权
+    const isTunMode = this.currentConfig?.proxyModeType === 'tun';
+    const skipNormalKill = isTunMode && !isRunningAsAdmin();
+
+    if (!skipNormalKill) {
+      // 策略 1：Stop-Process -Force
+      try {
+        execSync(
+          'powershell -NoProfile -Command "Stop-Process -Name sing-box -Force -ErrorAction Stop"',
+          {
+            windowsHide: true,
+            stdio: 'pipe',
+            timeout: 5000,
+          }
+        );
+        this.logToManager('debug', 'Stop-Process 执行完毕');
+      } catch (e: any) {
+        this.logToManager('debug', `Stop-Process 失败: stderr="${e.stderr?.toString().trim()}" status=${e.status}`);
       }
-    } catch {
-      this.logToManager('debug', `UAC taskkill 无法终止进程 ${pid}，尝试 wmic...`);
+
+      for (let i = 0; i < 30; i++) {
+        if (!hasSingBox()) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
     }
 
-    // 策略 3：wmic 终止（不需要 UAC 弹窗，某些情况下比 taskkill 更可靠）
+    // 策略 2：UAC 提权 Stop-Process（针对高完整性级别的进程）
     try {
-      execSync(`wmic process where "ProcessId=${pid}" call terminate`, {
-        windowsHide: true,
-        stdio: 'ignore',
-        timeout: 5000,
-      });
-      if (await this.waitForProcessExit(pid, 3000)) {
-        this.logToManager('debug', `wmic 成功终止进程 ${pid}`);
-        return true;
+      this.logToManager('info', '通过 UAC 提权终止 sing-box 进程');
+      const uacKilled = await this.killAllSingBoxWithUAC();
+      if (uacKilled) {
+        for (let i = 0; i < 30; i++) {
+          if (!hasSingBox()) return true;
+          await new Promise((r) => setTimeout(r, 100));
+        }
       }
-    } catch {
-      this.logToManager('debug', `wmic 也无法终止进程 ${pid}`);
+    } catch (e) {
+      this.logToManager('debug', `UAC Stop-Process 异常: ${e}`);
     }
 
-    // 所有策略都失败
-    return !this.isProcessAlive(pid);
+    return !hasSingBox();
   }
 
   /**
-   * 使用 UAC 提权执行 taskkill
+   * UAC 提权终止所有 sing-box 进程
    */
-  private killWithUAC(pid: number): Promise<boolean> {
+  private killAllSingBoxWithUAC(): Promise<boolean> {
     return new Promise((resolve) => {
-      const psScript = "Start-Process -FilePath 'taskkill' -ArgumentList '/F','/PID','" + pid.toString() + "' -Verb RunAs -Wait -WindowStyle Hidden";
+      // 通过 -Verb RunAs 启动一个新的 PowerShell 进程执行 Stop-Process
+      const psScript =
+        "Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-Command','Stop-Process -Name sing-box -Force' -Verb RunAs -Wait -WindowStyle Hidden";
 
       const killProcess = spawn('powershell.exe', [
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
-        '-Command', psScript
+        '-Command', psScript,
       ], {
         windowsHide: true,
       });
@@ -1702,7 +1740,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const timeout = setTimeout(() => {
         try { killProcess.kill(); } catch { /* ignore */ }
         resolve(false);
-      }, 15000); // UAC 对话框超时 15 秒
+      }, 15000);
 
       killProcess.on('exit', (code) => {
         clearTimeout(timeout);
@@ -1881,21 +1919,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const { execSync } = require('child_process');
 
     try {
-      // 使用 wmic 获取所有 sing-box.exe 进程的 PID
-      const result = execSync('wmic process where "name=\'sing-box.exe\'" get ProcessId /format:list', {
-        encoding: 'utf-8',
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'ignore']
-      });
+      // 使用 PowerShell Get-Process 获取所有 sing-box 进程的 PID
+      // 避免 wmic 在某些系统上的"关键错误"
+      const result = execSync(
+        'powershell -NoProfile -Command "Get-Process sing-box -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }"',
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
+        }
+      );
 
-      // 解析 PID 列表
-      const pidMatches = result.match(/ProcessId=(\d+)/g);
-      if (!pidMatches || pidMatches.length === 0) {
-        return;
-      }
-
-      let pidList = pidMatches
-        .map((m: string) => parseInt(m.replace('ProcessId=', ''), 10))
+      let pidList: number[] = result
+        .split(/\s+/)
+        .map((s: string) => parseInt(s.trim(), 10))
         .filter((p: number) => !isNaN(p) && p > 0);
 
       // 排除当前正在管理的进程
@@ -1910,20 +1948,33 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       this.logToManager('warn', `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`);
 
-      // 使用多策略逐个终止进程
-      for (const pid of pidList) {
-        const killed = await this.tryKillWindowsProcess(pid);
-        if (!killed) {
-          this.logToManager('warn', `无法终止残留进程 ${pid}`);
-        }
+      // 用一次 Stop-Process 批量终止（按 PID）
+      const pidArgs = pidList.join(',');
+      try {
+        execSync(
+          `powershell -NoProfile -Command "Stop-Process -Id ${pidArgs} -Force -ErrorAction SilentlyContinue"`,
+          {
+            windowsHide: true,
+            stdio: 'pipe',
+            timeout: 5000,
+          }
+        );
+      } catch (e: any) {
+        this.logToManager('debug', `批量 Stop-Process 失败: ${e.stderr?.toString().trim()}`);
+      }
+
+      // 还有残留就 UAC 提权再杀一次
+      const stillAlive = pidList.filter((p) => this.isProcessAlive(p));
+      if (stillAlive.length > 0) {
+        this.logToManager('warn', `${stillAlive.length} 个进程未被普通权限终止，尝试 UAC 提权`);
+        await this.killAllSingBoxWithUAC();
       }
 
       this.logToManager('info', '残留进程清理完成');
 
-      // 等待一小段时间让系统清理
       await new Promise((resolve) => setTimeout(resolve, 500));
     } catch {
-      // wmic 命令失败，可能没有残留进程
+      // 命令失败，可能没有残留进程
     }
   }
 
@@ -1938,18 +1989,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const { execSync } = require('child_process');
       
       if (process.platform === 'win32') {
-        // Windows: 使用 tasklist 检测进程
-        // /FI "PID eq xxx" 过滤指定 PID，/NH 不显示表头
-        const result = execSync(`tasklist /FI "PID eq ${pid}" /NH`, { 
-          encoding: 'utf-8',
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'ignore'],
-          timeout: 10000,
-        });
-        // 进程不存在时，中文 Windows 输出"信息: 没有运行的任务匹配指定标准"
-        // 英文 Windows 输出 "INFO: No tasks are running..."
-        // 统一判断：如果输出包含 PID 数字，说明进程存在
-        return result.includes(String(pid));
+        // Windows: 使用 PowerShell Get-Process 检测进程
+        // 避免 tasklist 在某些系统上的"关键错误"问题
+        const result = execSync(
+          `powershell -NoProfile -Command "if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { 'alive' } else { 'dead' }"`,
+          {
+            encoding: 'utf-8',
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 10000,
+          }
+        );
+        const alive = result.trim() === 'alive';
+        this.logToManager('debug', `isProcessAlive pid=${pid} alive=${alive}`);
+        return alive;
       } else {
         // macOS/Linux: 使用 ps 检测进程
         const result = execSync(`ps -p ${pid} -o pid=`, { 

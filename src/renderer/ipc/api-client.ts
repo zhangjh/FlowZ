@@ -241,6 +241,13 @@ export const logsApi = {
   },
 
   /**
+   * 打开日志文件夹
+   */
+  async openFolder(): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.LOGS_OPEN_FOLDER);
+  },
+
+  /**
    * 监听日志接收事件
    */
   onReceived(listener: (log: LogEntry) => void): () => void {

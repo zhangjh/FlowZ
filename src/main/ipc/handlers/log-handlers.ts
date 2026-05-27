@@ -3,13 +3,14 @@
  * 处理日志相关的 IPC 请求
  */
 
-import { IpcMainInvokeEvent } from 'electron';
+import { IpcMainInvokeEvent, shell } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type { LogEntry, LogLevel } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { LogManager } from '../../services/LogManager';
 import { ProxyManager } from '../../services/ProxyManager';
 import { broadcastEvent } from '../ipc-events';
+import { getLogsPath } from '../../utils/paths';
 
 /**
  * 注册日志管理相关的 IPC 处理器
@@ -39,6 +40,20 @@ export function registerLogHandlers(logManager: LogManager, proxyManager?: Proxy
     IPC_CHANNELS.LOGS_SET_LEVEL,
     async (_event: IpcMainInvokeEvent, args: { level: LogLevel }) => {
       logManager.setLogLevel(args.level);
+    }
+  );
+
+  // 打开日志文件
+  registerIpcHandler<void, void>(
+    IPC_CHANNELS.LOGS_OPEN_FOLDER,
+    async (_event: IpcMainInvokeEvent) => {
+      const path = require('path');
+      const logFile = path.join(getLogsPath(), 'app.log');
+      const result = await shell.openPath(logFile);
+      if (result) {
+        // 非空字符串表示打开失败
+        throw new Error(`打开日志文件失败: ${result}`);
+      }
     }
   );
 

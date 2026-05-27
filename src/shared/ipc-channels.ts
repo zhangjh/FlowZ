@@ -37,6 +37,7 @@ export const IPC_CHANNELS = {
   LOGS_GET: 'logs:get',
   LOGS_CLEAR: 'logs:clear',
   LOGS_SET_LEVEL: 'logs:setLevel',
+  LOGS_OPEN_FOLDER: 'logs:openFolder',
 
   // 系统代理管理
   SYSTEM_PROXY_ENABLE: 'systemProxy:enable',
