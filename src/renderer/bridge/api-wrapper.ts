@@ -210,6 +210,16 @@ export async function clearLogs(): Promise<ApiResponse<void>> {
   }
 }
 
+export async function openLogFolder(): Promise<ApiResponse<void>> {
+  try {
+    await api.logs.openFolder();
+    return { success: true };
+  } catch (error: any) {
+    ErrorHandler.handleApiError(error, '打开日志文件夹');
+    return { success: false, error: error?.message };
+  }
+}
+
 /**
  * Version Information APIs
  */
