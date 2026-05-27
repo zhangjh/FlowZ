@@ -32,13 +32,18 @@ export function isRunningAsAdmin(): boolean {
 
 /**
  * Windows 管理员权限检测
- * 通过尝试访问需要管理员权限的注册表项来判断
+ * 通过 whoami /groups 检查是否包含管理员组 SID
  */
 function isWindowsAdmin(): boolean {
   try {
     const { execSync } = require('child_process');
-    execSync('net session', { stdio: 'ignore', windowsHide: true });
-    return true;
+    const result = execSync('whoami /groups', {
+      encoding: 'utf-8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    // S-1-16-12288 是 High Mandatory Level（管理员完整性级别）
+    return result.includes('S-1-16-12288');
   } catch {
     return false;
   }
