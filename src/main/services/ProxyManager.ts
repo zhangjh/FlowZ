@@ -722,10 +722,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             ? 'gvisor'
             : config.tunConfig?.stack || 'system',
         sniff: true,
-        // FakeIP 模式下不设置 sniff_override_destination：
-        // FakeIP 通过映射表反查域名，不依赖 sniff 识别目标地址。
-        // sniff_override_destination 是真实 IP 模式的配置，在 FakeIP 模式下会导致
-        // SSH、QUIC 等 sniff 不可靠的协议拿着 FakeIP 直接发出连接，必然失败。
+        // macOS TUN + smart routing needs the sniffed domain as the destination
+        // so geosite rules can match foreign sites instead of falling through to direct.
+        // Windows keeps this disabled to preserve the FakeIP behavior fixed for
+        // SSH/QUIC-style traffic in a6f9cd8.
+        sniff_override_destination: process.platform === 'darwin',
         // 在系统路由层面排除本地地址，确保本地代理端口可访问
         route_exclude_address: ['127.0.0.0/8', '::1/128'],
       };
