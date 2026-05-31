@@ -38,7 +38,7 @@
     "trojan",
     "flowz"
   ],
-  "author": "",
+  "author": "zhangjh <njhxzhangjihong@126.com>",
   "license": "MIT",
   "devDependencies": {
     "@types/jest": "^30.0.0",
