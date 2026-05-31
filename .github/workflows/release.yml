@@ -19,6 +19,8 @@ jobs:
             platform: win
           - os: macos-14
             platform: mac
+          - os: ubuntu-latest
+            platform: linux
 
     steps:
       - name: Checkout code
@@ -68,6 +70,8 @@ jobs:
           path: |
             dist-package/*.exe
             dist-package/*.dmg
+            dist-package/*.AppImage
+            dist-package/*.deb
           retention-days: 5
 
   create-release:
@@ -119,5 +123,7 @@ jobs:
           files: |
             artifacts/**/*.exe
             artifacts/**/*.dmg
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
