@@ -573,6 +573,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     try {
       // 清空日志文件（截断为空）
       await fs.writeFile(logFilePath, '', 'utf-8');
+      // 重置文件监控位置，否则后续 stats.size > this.lastLogFileSize 恒为 false
+      this.lastLogFileSize = 0;
       this.logToManager('info', 'sing-box 日志文件已清空');
     } catch (error: any) {
       // 文件不存在，忽略
@@ -633,10 +635,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     // 根据代理模式配置 FakeIP 规则
-    if (proxyMode === 'smart' || proxyMode === 'global') {
-      // 智能分流/全局代理：A/AAAA 查询走 FakeIP
+    if (proxyMode === 'global') {
+      // 全局代理：所有 A/AAAA 查询走 FakeIP
       dnsRules.push({
         query_type: ['A', 'AAAA'],
+        server: 'fakeip',
+      } as SingBoxDnsRule);
+    } else if (proxyMode === 'smart') {
+      // 智能分流：仅非中国域名走 FakeIP
+      // 中国域名使用本地 DNS 解析真实 IP，即使代理不可达也能直连访问
+      dnsRules.push({
+        rule_set: 'geosite-geolocation-!cn',
         server: 'fakeip',
       } as SingBoxDnsRule);
     }
