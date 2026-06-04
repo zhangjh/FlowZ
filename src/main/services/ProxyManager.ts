@@ -8,6 +8,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { EventEmitter } from 'events';
+import { isIP } from 'net';
 import type { UserConfig, ServerConfig, ProxyStatus } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
@@ -613,7 +614,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const dnsRules: SingBoxDnsRule[] = [];
 
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）
-    if (selectedServer?.address) {
+    // IP 地址不需要 DNS 规则
+    if (selectedServer?.address && !isIP(selectedServer.address)) {
       dnsRules.push({
         domain: [selectedServer.address],
         server: 'dns-local',
@@ -915,14 +917,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       action: 'hijack-dns',
     });
 
-    // 排除代理服务器域名，确保代理服务器的连接走直连
+    // 排除代理服务器域名/IP，确保代理服务器的连接走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
     if (selectedServer?.address) {
-      rules.push({
-        domain: [selectedServer.address],
-        action: 'route',
-        outbound: 'direct',
-      });
+      if (isIP(selectedServer.address)) {
+        const cidr = isIP(selectedServer.address) === 6
+          ? `${selectedServer.address}/128`
+          : `${selectedServer.address}/32`;
+        rules.push({
+          ip_cidr: [cidr],
+          action: 'route',
+          outbound: 'direct',
+        });
+      } else {
+        rules.push({
+          domain: [selectedServer.address],
+          action: 'route',
+          outbound: 'direct',
+        });
+      }
     }
 
     // 自定义规则（优先级最高，必须放在智能分流规则之前）
