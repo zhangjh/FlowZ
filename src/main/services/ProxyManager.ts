@@ -2592,24 +2592,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private isLowValueLog(line: string): boolean {
     const lowerLine = line.toLowerCase();
 
-    // 优先过滤的噪音日志（即使包含其他关键词也要过滤）
-    const noisePatterns = [
-      'connection upload closed',
-      'connection download closed',
-      'forcibly closed',
-      'connection closed',
-      'connection established',
-      'tls handshake',
-      'handshake completed',
-    ];
-
-    for (const pattern of noisePatterns) {
-      if (lowerLine.includes(pattern)) {
-        return true; // 过滤掉
-      }
-    }
-
-    // 高价值日志模式 - 这些日志应该保留
+    // 高价值日志模式 - 这些日志应该优先保留，即使包含噪音关键词
     const keepPatterns = [
       'started', // 启动完成
       'stopped', // 停止
@@ -2626,10 +2609,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       'outbound/proxy', // 代理出站 - 用户关心的
     ];
 
-    // 检查是否包含高价值模式
     for (const pattern of keepPatterns) {
       if (lowerLine.includes(pattern)) {
         return false; // 不过滤，保留这条日志
+      }
+    }
+
+    // 优先过滤的噪音日志（仅在不包含高价值关键词时才过滤）
+    const noisePatterns = [
+      'connection upload closed',
+      'connection download closed',
+      'forcibly closed',
+      'connection closed',
+      'connection established',
+      'tls handshake',
+      'handshake completed',
+    ];
+
+    for (const pattern of noisePatterns) {
+      if (lowerLine.includes(pattern)) {
+        return true; // 过滤掉
       }
     }
 
