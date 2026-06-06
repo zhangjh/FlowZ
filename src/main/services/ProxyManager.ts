@@ -8,6 +8,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { EventEmitter } from 'events';
+import { isIP } from 'net';
 import type { UserConfig, ServerConfig, ProxyStatus } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
@@ -572,6 +573,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     try {
       // 清空日志文件（截断为空）
       await fs.writeFile(logFilePath, '', 'utf-8');
+      // 重置文件监控位置，否则后续 stats.size > this.lastLogFileSize 恒为 false
+      this.lastLogFileSize = 0;
       this.logToManager('info', 'sing-box 日志文件已清空');
     } catch (error: any) {
       // 文件不存在，忽略
@@ -613,7 +616,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const dnsRules: SingBoxDnsRule[] = [];
 
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）
-    if (selectedServer?.address) {
+    // IP 地址不需要 DNS 规则
+    if (selectedServer?.address && !isIP(selectedServer.address)) {
       dnsRules.push({
         domain: [selectedServer.address],
         server: 'dns-local',
@@ -631,10 +635,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     // 根据代理模式配置 FakeIP 规则
-    if (proxyMode === 'smart' || proxyMode === 'global') {
-      // 智能分流/全局代理：A/AAAA 查询走 FakeIP
+    if (proxyMode === 'global') {
+      // 全局代理：所有 A/AAAA 查询走 FakeIP
       dnsRules.push({
         query_type: ['A', 'AAAA'],
+        server: 'fakeip',
+      } as SingBoxDnsRule);
+    } else if (proxyMode === 'smart') {
+      // 智能分流：仅非中国域名走 FakeIP
+      // 中国域名使用本地 DNS 解析真实 IP，即使代理不可达也能直连访问
+      dnsRules.push({
+        rule_set: 'geosite-geolocation-!cn',
         server: 'fakeip',
       } as SingBoxDnsRule);
     }
@@ -915,14 +926,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       action: 'hijack-dns',
     });
 
-    // 排除代理服务器域名，确保代理服务器的连接走直连
+    // 排除代理服务器域名/IP，确保代理服务器的连接走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
     if (selectedServer?.address) {
-      rules.push({
-        domain: [selectedServer.address],
-        action: 'route',
-        outbound: 'direct',
-      });
+      if (isIP(selectedServer.address)) {
+        const cidr = isIP(selectedServer.address) === 6
+          ? `${selectedServer.address}/128`
+          : `${selectedServer.address}/32`;
+        rules.push({
+          ip_cidr: [cidr],
+          action: 'route',
+          outbound: 'direct',
+        });
+      } else {
+        rules.push({
+          domain: [selectedServer.address],
+          action: 'route',
+          outbound: 'direct',
+        });
+      }
     }
 
     // 自定义规则（优先级最高，必须放在智能分流规则之前）
@@ -2579,24 +2601,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private isLowValueLog(line: string): boolean {
     const lowerLine = line.toLowerCase();
 
-    // 优先过滤的噪音日志（即使包含其他关键词也要过滤）
-    const noisePatterns = [
-      'connection upload closed',
-      'connection download closed',
-      'forcibly closed',
-      'connection closed',
-      'connection established',
-      'tls handshake',
-      'handshake completed',
-    ];
-
-    for (const pattern of noisePatterns) {
-      if (lowerLine.includes(pattern)) {
-        return true; // 过滤掉
-      }
-    }
-
-    // 高价值日志模式 - 这些日志应该保留
+    // 高价值日志模式 - 这些日志应该优先保留，即使包含噪音关键词
     const keepPatterns = [
       'started', // 启动完成
       'stopped', // 停止
@@ -2613,10 +2618,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       'outbound/proxy', // 代理出站 - 用户关心的
     ];
 
-    // 检查是否包含高价值模式
     for (const pattern of keepPatterns) {
       if (lowerLine.includes(pattern)) {
         return false; // 不过滤，保留这条日志
+      }
+    }
+
+    // 优先过滤的噪音日志（仅在不包含高价值关键词时才过滤）
+    const noisePatterns = [
+      'connection upload closed',
+      'connection download closed',
+      'forcibly closed',
+      'connection closed',
+      'connection established',
+      'tls handshake',
+      'handshake completed',
+    ];
+
+    for (const pattern of noisePatterns) {
+      if (lowerLine.includes(pattern)) {
+        return true; // 过滤掉
       }
     }
 

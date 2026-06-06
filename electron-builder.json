@@ -152,7 +152,7 @@
       }
     ],
     "category": "Network",
-    "icon": "build/icon.ico",
+    "icon": "build/icon.png",
     "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
     "extraResources": [
       {

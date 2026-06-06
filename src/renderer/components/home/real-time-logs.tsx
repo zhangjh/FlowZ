@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useLayoutEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -12,6 +12,7 @@ export function RealTimeLogs() {
   const [isAutoScroll, setIsAutoScroll] = useState(false);
   const isAutoScrollRef = useRef(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const scrollAdjustmentRef = useRef(0);
   const connectionStatus = useAppStore((state) => state.connectionStatus);
 
   const getScrollElement = useCallback((): HTMLElement | null => {
@@ -33,18 +34,43 @@ export function RealTimeLogs() {
     loadInitialLogs();
 
     const handleLogReceived = (logEntry: LogEntry) => {
-      setLogs((prev) => [...prev, logEntry].slice(-500));
+      setLogs((prev) => {
+        const next = [...prev, logEntry];
+        // 当自动滚动关闭且需要裁剪旧日志时，累计被移除日志的高度用于补偿滚动偏移
+        if (!isAutoScrollRef.current && next.length > 500) {
+          const removedCount = next.length - 500;
+          const el = getScrollElement();
+          if (el) {
+            let totalHeight = 0;
+            const container = el.querySelector('.space-y-1');
+            if (container) {
+              const children = Array.from(container.children);
+              for (let i = 0; i < removedCount && i < children.length; i++) {
+                totalHeight += (children[i] as HTMLElement).offsetHeight;
+              }
+            }
+            scrollAdjustmentRef.current += totalHeight;
+          }
+        }
+        return next.slice(-500);
+      });
     };
 
     addEventListener('logReceived', handleLogReceived);
     return () => removeEventListener('logReceived', handleLogReceived);
   }, []);
 
-  // 新日志到来时，只有开启了自动滚动才滚到底部
-  useEffect(() => {
+  // 使用 useLayoutEffect 在浏览器绘制前调整滚动位置
+  useLayoutEffect(() => {
+    const el = getScrollElement();
+    if (!el) return;
+
     if (isAutoScrollRef.current) {
-      const el = getScrollElement();
-      if (el) el.scrollTop = el.scrollHeight;
+      el.scrollTop = el.scrollHeight;
+    } else if (scrollAdjustmentRef.current > 0) {
+      // 补偿 .slice(-500) 移除首条日志导致的视窗偏移
+      el.scrollTop = Math.max(0, el.scrollTop - scrollAdjustmentRef.current);
+      scrollAdjustmentRef.current = 0;
     }
   }, [logs, getScrollElement]);
 

@@ -592,6 +592,7 @@ app.whenReady().then(async () => {
         logManager.addLog('info', `Starting speed test for ${config.servers.length} servers`, 'Main');
 
         const net = require('net');
+        const tls = require('tls');
         const dgram = require('dgram');
         const results = new Map<string, number | null>();
 
@@ -633,29 +634,64 @@ app.whenReady().then(async () => {
               });
             } else {
               // VLESS/Trojan 使用 TCP
-              const socket = new net.Socket();
-              socket.setTimeout(5000);
+              const security = (server.security || '').toLowerCase();
+              const useTls = security === 'tls' || security === 'reality' || !!server.tlsSettings;
 
-              socket.on('connect', () => {
-                const latency = Date.now() - startTime;
-                socket.destroy();
-                results.set(server.id, latency);
-                resolve();
-              });
+              if (useTls) {
+                // TLS 握手验证：检测证书、SNI 等 TLS 层问题
+                const tlsSocket = tls.connect({
+                  host: server.tlsSettings?.serverName || server.address,
+                  port: server.port,
+                  servername: server.tlsSettings?.serverName || undefined,
+                  rejectUnauthorized: !server.tlsSettings?.allowInsecure,
+                });
 
-              socket.on('timeout', () => {
-                socket.destroy();
-                results.set(server.id, null);
-                resolve();
-              });
+                const tlsTimeout = setTimeout(() => {
+                  tlsSocket.destroy();
+                  results.set(server.id, null);
+                  resolve();
+                }, 5000);
 
-              socket.on('error', () => {
-                socket.destroy();
-                results.set(server.id, null);
-                resolve();
-              });
+                tlsSocket.on('secureConnect', () => {
+                  clearTimeout(tlsTimeout);
+                  const latency = Date.now() - startTime;
+                  tlsSocket.end();
+                  results.set(server.id, latency);
+                  resolve();
+                });
 
-              socket.connect(server.port, server.address);
+                tlsSocket.on('error', () => {
+                  clearTimeout(tlsTimeout);
+                  tlsSocket.destroy();
+                  results.set(server.id, null);
+                  resolve();
+                });
+              } else {
+                // 无 TLS：仅检测 TCP 连通性
+                const socket = new net.Socket();
+                socket.setTimeout(5000);
+
+                socket.on('connect', () => {
+                  const latency = Date.now() - startTime;
+                  socket.destroy();
+                  results.set(server.id, latency);
+                  resolve();
+                });
+
+                socket.on('timeout', () => {
+                  socket.destroy();
+                  results.set(server.id, null);
+                  resolve();
+                });
+
+                socket.on('error', () => {
+                  socket.destroy();
+                  results.set(server.id, null);
+                  resolve();
+                });
+
+                socket.connect(server.port, server.address);
+              }
             }
           });
         };
