@@ -596,6 +596,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private generateDnsConfig(config: UserConfig, selectedServer: ServerConfig): SingBoxDnsConfig {
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
+    const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+    const isTunMode = modeType !== 'systemproxy';
 
     const dnsConfig: SingBoxDnsConfig = {
       servers: [
@@ -639,14 +641,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } as SingBoxDnsRule);
     }
 
-    // 根据代理模式配置 FakeIP 规则
-    if (proxyMode === 'global') {
-      // 全局代理：所有 A/AAAA 查询走 FakeIP
+    // TUN 模式下所有普通 A/AAAA 查询都走 FakeIP。
+    // Ubuntu 的系统 DNS 在 TUN 接管路由后容易对海外域名或 AAAA 查询超时；
+    // FakeIP 避免把客户端 DNS 查询交给本地 DNS，再由路由规则决定直连/代理。
+    if (isTunMode && proxyMode !== 'direct') {
       dnsRules.push({
         query_type: ['A', 'AAAA'],
         server: 'fakeip',
       } as SingBoxDnsRule);
-    } else if (proxyMode === 'smart') {
+    }
+
+    // 根据代理模式配置 FakeIP 规则
+    if (proxyMode === 'global') {
+      // 全局代理：所有 A/AAAA 查询走 FakeIP
+      if (!isTunMode) {
+        dnsRules.push({
+          query_type: ['A', 'AAAA'],
+          server: 'fakeip',
+        } as SingBoxDnsRule);
+      }
+    } else if (proxyMode === 'smart' && !isTunMode) {
       // 智能分流：仅非中国域名走 FakeIP
       // 中国域名使用本地 DNS 解析真实 IP，即使代理不可达也能直连访问
       dnsRules.push({
@@ -2974,6 +2988,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const lowerMessage = message.toLowerCase();
 
     // 常见错误模式匹配
+    if (lowerMessage.includes('dns') && lowerMessage.includes('fail')) {
+      return `DNS 解析失败：无法解析服务器域名，请检查 DNS 设置 [${message}]`;
+    }
+
     if (
       lowerMessage.includes('connection refused') ||
       lowerMessage.includes('connect: connection refused')
@@ -2990,10 +3008,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         return ''; // 返回空字符串，后续会被过滤
       }
       return target ? `连接超时: ${target}` : '连接超时：服务器响应超时';
-    }
-
-    if (lowerMessage.includes('dns') && lowerMessage.includes('fail')) {
-      return `DNS 解析失败：无法解析服务器域名，请检查 DNS 设置 [${message}]`;
     }
 
     if (
