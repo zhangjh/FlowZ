@@ -9,7 +9,7 @@
  * - 配置文件路径变为 /var/root/...，导致配置隔离
  * 
  * 正确的做法是：Electron 应用以普通用户身份运行，只有需要特权的
- * 子进程（如 TUN 模式的 sing-box）通过 osascript 请求管理员权限运行。
+ * 子进程（如 TUN 模式的 sing-box）通过平台权限工具请求管理员权限运行。
  * 这部分逻辑已在 ProxyManager.ts 中实现。
  */
 
@@ -26,6 +26,8 @@ export function isRunningAsAdmin(): boolean {
     return isWindowsAdmin();
   } else if (process.platform === 'darwin') {
     return isMacOSAdmin();
+  } else if (process.platform === 'linux') {
+    return isLinuxRoot();
   }
   return false;
 }
@@ -63,6 +65,19 @@ function isMacOSAdmin(): boolean {
 }
 
 /**
+ * Linux root 权限检测
+ */
+function isLinuxRoot(): boolean {
+  try {
+    const { execSync } = require('child_process');
+    const result = execSync('id -u', { encoding: 'utf-8' }).trim();
+    return result === '0';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 管理员权限服务类
  */
 export class AdminPrivilegeService implements IAdminPrivilege {
@@ -81,7 +96,7 @@ export class AdminPrivilegeService implements IAdminPrivilege {
   /**
    * 检查 TUN 模式是否需要提升权限
    * 返回 false 因为我们不再通过重启应用来提升权限
-   * sing-box 进程会在 TUN 模式下通过 osascript 自己请求管理员权限
+   * sing-box 进程会在 TUN 模式下通过平台权限工具自己请求管理员权限
    */
   needsElevationForTun(): boolean {
     return false;

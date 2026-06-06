@@ -659,12 +659,11 @@ open "${installerPath}"
 
       return asset || null;
     } else if (platform === 'linux') {
-      // Linux: 优先 AppImage，其次 deb
-      let asset = assets.find((a: any) => a.name.endsWith('.AppImage'));
-      if (!asset) {
-        asset = assets.find((a: any) => a.name.endsWith('.deb'));
-      }
-      return asset || null;
+      // Ubuntu: 只支持 deb 安装包
+      const debAsset = assets.find(
+        (a: any) => a.name.endsWith('.deb') && a.name.includes('linux')
+      );
+      return debAsset || null;
     }
 
     return null;

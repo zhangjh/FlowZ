@@ -17,6 +17,10 @@ import { retry } from '../utils/retry';
 import { getUserDataPath } from '../utils/paths';
 import { isRunningAsAdmin } from './AdminPrivilege';
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
  * 私有 IP 地址段（CIDR 格式）
  * 用于路由规则中的直连配置
@@ -315,7 +319,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     await this.writeSingBoxConfig(singboxConfig);
 
     // TUN 模式下，删除旧的 PID 文件，确保不会读到旧的 PID
-    if (this.needsOsascript() || this.needsWindowsUAC()) {
+    if (this.needsPrivilegedWrapper()) {
       await this.deletePidFile();
     }
 
@@ -542,14 +546,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       timestamp: true,
     };
 
-    // 在 TUN 模式下（macOS 和 Windows），使用权限提升运行时无法捕获 stdout
+    // 在 TUN 模式下（macOS、Windows 和 Linux），使用权限提升运行时无法捕获 stdout
     // 需要将日志输出到文件，然后通过文件监控读取
     // 注意：这里直接根据 config 参数判断，而不是 this.currentConfig
     const isTunMode = config.proxyModeType?.toLowerCase() !== 'systemproxy';
     const isMacTunMode = process.platform === 'darwin' && isTunMode;
     const isWindowsTunMode = process.platform === 'win32' && isTunMode;
+    const isLinuxTunMode = process.platform === 'linux' && isTunMode;
     
-    if (isMacTunMode || isWindowsTunMode) {
+    if (isMacTunMode || isWindowsTunMode || isLinuxTunMode) {
       logConfig.output = this.getLogFilePath();
     }
 
@@ -1069,8 +1074,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 只有 TUN 模式才需要管理员权限
     // proxyModeType 的值为 'systemProxy' 或 'tun'
     const isTunMode = this.currentConfig?.proxyModeType === 'tun';
-    // Windows 和 macOS 的 TUN 模式都需要管理员权限
-    return isTunMode && (process.platform === 'darwin' || process.platform === 'win32');
+    // Windows、macOS 和 Linux 的 TUN 模式都需要管理员/root 权限
+    return (
+      isTunMode &&
+      (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux')
+    );
   }
 
   /**
@@ -1085,6 +1093,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private needsWindowsUAC(): boolean {
     return process.platform === 'win32' && this.needsRootPrivilege();
+  }
+
+  /**
+   * 检查是否需要使用 pkexec 提升权限运行（Linux TUN 模式）
+   */
+  private needsLinuxPkexec(): boolean {
+    return process.platform === 'linux' && this.needsRootPrivilege();
+  }
+
+  /**
+   * 检查 sing-box 是否会通过后台提权 wrapper 启动
+   */
+  private needsPrivilegedWrapper(): boolean {
+    return this.needsOsascript() || this.needsWindowsUAC() || this.needsLinuxPkexec();
   }
 
   /**
@@ -1162,6 +1184,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 根据平台和模式选择启动方式：
         // - macOS TUN 模式: 使用 osascript 请求管理员权限
         // - Windows TUN 模式: 使用 PowerShell Start-Process -Verb RunAs 请求 UAC 权限
+        // - Linux TUN 模式: 使用 pkexec 请求管理员权限
         // - 其他情况: 直接运行
         let command: string;
         let args: string[];
@@ -1268,8 +1291,42 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
           args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
           this.logToManager('info', 'TUN 模式需要管理员权限，正在请求 UAC 授权...');
+        } else if (this.needsLinuxPkexec()) {
+          const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+          const exitInfoFile = path.join(getUserDataPath(), 'singbox_exit.log');
+          const wrapperScriptFile = path.join(getUserDataPath(), 'singbox_wrapper.sh');
+
+          const wrapperContent = [
+            '#!/bin/bash',
+            `SINGBOX_PATH=${shellQuote(this.singboxPath)}`,
+            `CONFIG_PATH=${shellQuote(this.configPath)}`,
+            `PID_FILE=${shellQuote(pidFile)}`,
+            `EXIT_LOG=${shellQuote(exitInfoFile)}`,
+            '',
+            'echo "[$(date)] linux wrapper started" > "$EXIT_LOG"',
+            'trap \'echo "[$(date)] wrapper received SIGTERM" >> "$EXIT_LOG"; kill -TERM $SBPID 2>/dev/null\' TERM',
+            'trap \'echo "[$(date)] wrapper received SIGINT" >> "$EXIT_LOG"; kill -INT $SBPID 2>/dev/null\' INT',
+            '',
+            '"$SINGBOX_PATH" run -c "$CONFIG_PATH" &',
+            'SBPID=$!',
+            'echo $SBPID > "$PID_FILE"',
+            'chmod 644 "$PID_FILE" "$EXIT_LOG" 2>/dev/null || true',
+            'echo "[$(date)] sing-box started PID=$SBPID" >> "$EXIT_LOG"',
+            '',
+            'wait $SBPID',
+            'EXIT_CODE=$?',
+            'echo "[$(date)] sing-box exited code=$EXIT_CODE (128+N means signal N)" >> "$EXIT_LOG"',
+            'exit $EXIT_CODE',
+          ].join('\n');
+
+          const fsSync = require('fs');
+          fsSync.writeFileSync(wrapperScriptFile, wrapperContent, { mode: 0o755 });
+
+          command = '/usr/bin/pkexec';
+          args = ['/bin/bash', wrapperScriptFile];
+          this.logToManager('info', 'TUN 模式需要管理员权限，正在请求 Linux 授权...');
         } else {
-          // 系统代理模式或 Linux：直接运行
+          // 系统代理模式：直接运行
           command = this.singboxPath;
           args = ['run', '-c', this.configPath];
         }
@@ -1283,9 +1340,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         this.pid = this.singboxProcess.pid || null;
         this.startTime = new Date();
 
-        // macOS/Windows TUN 模式下，这个 PID 是 osascript/PowerShell 的 PID，不是 sing-box 的
+        // macOS/Windows/Linux TUN 模式下，这个 PID 是提权进程的 PID，不是 sing-box 的
         // 实际的 sing-box PID 会在 waitForPidFile 中从 PID 文件读取
-        if (this.needsOsascript() || this.needsWindowsUAC()) {
+        if (this.needsPrivilegedWrapper()) {
           this.logToManager('info', `正在启动 sing-box（权限提升进程 PID: ${this.pid}）...`);
         } else {
           this.logToManager('info', `正在启动 sing-box 进程 (PID: ${this.pid})...`);
@@ -1364,6 +1421,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             }
           }
 
+          if (this.needsLinuxPkexec()) {
+            if (code === 0) {
+              if (this.singboxPid) {
+                this.logToManager('info', 'Linux wrapper 退出，sing-box 进程可能已结束，等待健康检查确认');
+              }
+              return;
+            } else {
+              const errorMessage =
+                code === 126 || code === 127
+                  ? '未找到 pkexec 或无法执行授权命令，请安装 policykit-1'
+                  : code === 1
+                    ? '用户取消了管理员权限请求或 Linux 授权失败'
+                    : `Linux 授权启动失败，退出码: ${code}`;
+              this.logToManager('error', errorMessage);
+              reject(new Error(errorMessage));
+              this.handleProcessExit(code, signal);
+              return;
+            }
+          }
+
           // 如果在启动阶段就退出了，说明启动失败
           const startupTime = Date.now() - (this.startTime?.getTime() || Date.now());
           if (startupTime < 2000 && code !== null && code !== 0) {
@@ -1377,17 +1454,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         // 等待一小段时间确保进程启动成功
         setTimeout(async () => {
-          // macOS TUN 模式或 Windows TUN 模式：检查 singboxPid（从 PID 文件读取）
+          // macOS/Windows/Linux TUN 模式：检查 singboxPid（从 PID 文件读取）
           // 其他模式：检查 singboxProcess 和 pid
           const isMacTunMode = this.needsOsascript();
           const isWindowsTunMode = this.needsWindowsUAC();
+          const isLinuxTunMode = this.needsLinuxPkexec();
 
-          if (isMacTunMode || isWindowsTunMode) {
+          if (isMacTunMode || isWindowsTunMode || isLinuxTunMode) {
             // TUN 模式：等待 PID 文件被写入
             await this.waitForPidFile();
 
             if (this.singboxPid) {
-              // 启动日志文件监控（macOS 和 Windows TUN 模式都需要，因为后台进程的 stdout 无法被捕获）
+              // 启动日志文件监控（提权 TUN 模式无法直接捕获后台进程 stdout）
               this.startLogFileWatcher();
               // 启动健康检查定时器
               this.startHealthCheck();
@@ -1466,7 +1544,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (errorOutput) {
       const lowerOutput = errorOutput.toLowerCase();
 
-      if (lowerOutput.includes('permission denied') || lowerOutput.includes('access denied')) {
+      if (
+        lowerOutput.includes('permission denied') ||
+        lowerOutput.includes('access denied') ||
+        lowerOutput.includes('operation not permitted') ||
+        lowerOutput.includes('netlink') ||
+        lowerOutput.includes('tun')
+      ) {
         return `TUN 模式需要管理员权限，请以管理员身份运行应用 [${errorOutput}]`;
       }
 
@@ -1524,6 +1608,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止
     if (this.singboxPid && process.platform === 'win32') {
       return this.stopSingBoxOnWindows();
+    }
+
+    // Linux TUN 模式：sing-box 以 root 权限在后台运行，需要用 pkexec 终止
+    if (this.singboxPid && process.platform === 'linux') {
+      return this.stopSingBoxOnLinux();
     }
 
     if (!this.singboxProcess) {
@@ -1665,6 +1754,75 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 触发停止事件
     this.emit('stopped');
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+  }
+
+  /**
+   * 停止 sing-box 进程（Linux TUN 模式）
+   * sing-box 通过 pkexec 以 root 权限启动，停止时也需要 pkexec 授权
+   */
+  private async stopSingBoxOnLinux(): Promise<void> {
+    if (!this.singboxPid) {
+      this.cleanup();
+      return;
+    }
+
+    const pidToKill = this.singboxPid;
+
+    if (!this.isProcessAlive(pidToKill)) {
+      this.logToManager('info', `sing-box 进程 (PID: ${pidToKill}) 已不存在，跳过终止`);
+      try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
+      this.cleanup();
+      this.emit('stopped');
+      this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+      return;
+    }
+
+    this.logToManager('info', `正在停止 Linux sing-box 进程 (PID: ${pidToKill})...`);
+
+    const terminated = await this.runPkexecKill(pidToKill, 'TERM');
+    if (terminated) {
+      await this.waitForProcessExit(pidToKill, 3000);
+    }
+
+    if (this.isProcessAlive(pidToKill)) {
+      this.logToManager('warn', '进程未响应 SIGTERM，尝试强制终止...');
+      await this.runPkexecKill(pidToKill, 'KILL');
+      await this.waitForProcessExit(pidToKill, 3000);
+    }
+
+    if (this.isProcessAlive(pidToKill)) {
+      this.logToManager('error', '无法终止 Linux sing-box 进程，可能仍在运行');
+      throw new Error('无法终止 sing-box 进程');
+    }
+
+    try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
+
+    this.cleanup();
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+    this.logToManager('info', 'Linux sing-box 进程已停止');
+  }
+
+  private runPkexecKill(pid: number, signal: 'TERM' | 'KILL'): Promise<boolean> {
+    return new Promise((resolve) => {
+      const killProcess = spawn('/usr/bin/pkexec', ['/bin/kill', `-${signal}`, String(pid)]);
+
+      const timeout = setTimeout(() => {
+        try { killProcess.kill(); } catch { /* ignore */ }
+        resolve(false);
+      }, 30000);
+
+      killProcess.on('exit', (code) => {
+        clearTimeout(timeout);
+        resolve(code === 0);
+      });
+
+      killProcess.on('error', (error) => {
+        clearTimeout(timeout);
+        this.logToManager('error', `执行 pkexec kill 失败: ${error.message}`);
+        resolve(false);
+      });
+    });
   }
 
   /**
@@ -1838,6 +1996,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await this.killOrphanedProcessesMac();
     } else if (process.platform === 'win32') {
       await this.killOrphanedProcessesWindows();
+    } else if (process.platform === 'linux') {
+      await this.killOrphanedProcessesLinux();
     }
   }
 
@@ -1999,6 +2159,79 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } catch {
       // 命令失败，可能没有残留进程
     }
+  }
+
+  /**
+   * Linux: 清理残留的 sing-box 进程
+   * TUN 模式下残留进程通常是 root 权限，需要 pkexec 终止
+   */
+  private async killOrphanedProcessesLinux(): Promise<void> {
+    return new Promise((resolve) => {
+      const pgrep = spawn('/usr/bin/pgrep', ['-f', 'sing-box']);
+      let pids = '';
+
+      pgrep.stdout.on('data', (data: Buffer) => {
+        pids += data.toString();
+      });
+
+      pgrep.on('close', async () => {
+        let pidList = pids
+          .trim()
+          .split('\n')
+          .filter((p) => p.trim())
+          .map((p) => parseInt(p.trim(), 10))
+          .filter((p) => !isNaN(p) && p > 0);
+
+        const currentPid = this.singboxPid || this.pid;
+        if (currentPid) {
+          pidList = pidList.filter((p) => p !== currentPid);
+        }
+
+        if (pidList.length === 0) {
+          resolve();
+          return;
+        }
+
+        this.logToManager('warn', `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`);
+
+        const killed = await this.runPkexecKillMany(pidList, 'KILL');
+        if (killed) {
+          this.logToManager('info', 'Linux 残留进程已清理');
+        } else {
+          this.logToManager('warn', 'Linux 残留进程清理可能失败');
+        }
+
+        await this.waitForNetworkCleanup();
+        resolve();
+      });
+
+      pgrep.on('error', () => {
+        resolve();
+      });
+    });
+  }
+
+  private runPkexecKillMany(pids: number[], signal: 'TERM' | 'KILL'): Promise<boolean> {
+    return new Promise((resolve) => {
+      const args = ['/bin/kill', `-${signal}`, ...pids.map((pid) => String(pid))];
+      const killProcess = spawn('/usr/bin/pkexec', args);
+
+      const timeout = setTimeout(() => {
+        try { killProcess.kill(); } catch { /* ignore */ }
+        resolve(false);
+      }, 30000);
+
+      killProcess.on('exit', (code) => {
+        clearTimeout(timeout);
+        resolve(code === 0);
+      });
+
+      killProcess.on('error', (error) => {
+        clearTimeout(timeout);
+        this.logToManager('error', `执行 pkexec 批量 kill 失败: ${error.message}`);
+        resolve(false);
+      });
+    });
   }
 
   /**
@@ -2430,7 +2663,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private async waitForPidFile(): Promise<void> {
     const pidFile = this.getPidFilePath();
-    const maxWaitTime = 10000; // 最多等待 10 秒
+    const maxWaitTime = this.needsLinuxPkexec() ? 60000 : 10000; // Linux pkexec 可能需要等待用户授权
     const checkInterval = 200; // 每 200ms 检查一次
     const startTime = Date.now();
 
