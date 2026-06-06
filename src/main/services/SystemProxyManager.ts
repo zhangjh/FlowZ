@@ -9,6 +9,10 @@ import { retry } from '../utils/retry';
 
 const execAsync = promisify(exec);
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
  * 系统代理状态
  */
@@ -521,6 +525,206 @@ export class MacOSSystemProxy extends SystemProxyBase {
   }
 }
 
+interface LinuxProxySettings {
+  mode: string;
+  httpHost: string;
+  httpPort: number;
+  httpsHost: string;
+  httpsPort: number;
+  socksHost: string;
+  socksPort: number;
+  ignoreHosts: string;
+}
+
+/**
+ * Linux 系统代理管理器
+ * 使用 GNOME gsettings 配置桌面环境代理（Ubuntu 默认支持）
+ */
+export class LinuxSystemProxy extends SystemProxyBase {
+  private originalLinuxSettings: LinuxProxySettings | null = null;
+
+  /**
+   * 启用系统代理
+   */
+  async enableProxy(address: string, httpPort: number, socksPort: number): Promise<void> {
+    console.log(`正在设置 Linux 系统代理: ${address}:${httpPort}`);
+
+    await this.ensureGsettingsAvailable();
+
+    try {
+      this.originalSettings = await this.getProxyStatus();
+      this.originalLinuxSettings = await this.getCurrentSettings();
+      console.log('已保存原始 Linux 代理设置:', this.originalLinuxSettings);
+    } catch (error) {
+      console.warn('无法获取原始 Linux 代理设置:', error);
+    }
+
+    try {
+      await retry(
+        async () => {
+          await this.setString('org.gnome.system.proxy.http', 'host', address);
+          await this.setInt('org.gnome.system.proxy.http', 'port', httpPort);
+          await this.setString('org.gnome.system.proxy.https', 'host', address);
+          await this.setInt('org.gnome.system.proxy.https', 'port', httpPort);
+          await this.setString('org.gnome.system.proxy.socks', 'host', address);
+          await this.setInt('org.gnome.system.proxy.socks', 'port', socksPort);
+          await this.setRaw(
+            'org.gnome.system.proxy',
+            'ignore-hosts',
+            shellQuote(
+              "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']"
+            )
+          );
+          await this.setString('org.gnome.system.proxy', 'mode', 'manual');
+        },
+        {
+          maxRetries: 2,
+          delay: 500,
+          shouldRetry: (error) => {
+            const message = error.message.toLowerCase();
+            return !message.includes('no such schema') && !message.includes('permission');
+          },
+          onRetry: (error, attempt) => {
+            console.log(`设置 Linux 系统代理失败，正在进行第 ${attempt} 次重试:`, error.message);
+          },
+        }
+      );
+
+      console.log('Linux 系统代理设置成功');
+    } catch (error) {
+      console.error('设置 Linux 系统代理失败:', error);
+
+      if (this.originalLinuxSettings) {
+        try {
+          await this.restoreLinuxSettings(this.originalLinuxSettings);
+        } catch (rollbackError) {
+          console.error('回滚 Linux 代理设置失败:', rollbackError);
+        }
+      }
+
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `设置 Linux 系统代理失败: ${errorMessage}\n\n可能的原因:\n1. 当前桌面环境不支持 GNOME gsettings 代理配置\n2. gsettings 命令不可用\n3. 系统策略限制修改代理设置`
+      );
+    }
+  }
+
+  /**
+   * 禁用系统代理
+   */
+  async disableProxy(): Promise<void> {
+    console.log('正在禁用 Linux 系统代理...');
+
+    await this.ensureGsettingsAvailable();
+
+    try {
+      if (this.originalLinuxSettings) {
+        await this.restoreLinuxSettings(this.originalLinuxSettings);
+        this.originalLinuxSettings = null;
+        this.originalSettings = null;
+        console.log('已恢复原始 Linux 代理设置');
+      } else {
+        await this.setString('org.gnome.system.proxy', 'mode', 'none');
+        console.log('已禁用 Linux 系统代理');
+      }
+    } catch (error) {
+      console.error('禁用 Linux 系统代理失败:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`禁用 Linux 系统代理失败: ${errorMessage}\n\n建议手动检查系统代理设置`);
+    }
+  }
+
+  /**
+   * 获取代理状态
+   */
+  async getProxyStatus(): Promise<SystemProxyStatus> {
+    try {
+      await this.ensureGsettingsAvailable();
+
+      const mode = await this.getString('org.gnome.system.proxy', 'mode');
+      if (mode !== 'manual') {
+        return { enabled: false };
+      }
+
+      const httpHost = await this.getString('org.gnome.system.proxy.http', 'host');
+      const httpPort = await this.getInt('org.gnome.system.proxy.http', 'port');
+      const httpsHost = await this.getString('org.gnome.system.proxy.https', 'host');
+      const httpsPort = await this.getInt('org.gnome.system.proxy.https', 'port');
+      const socksHost = await this.getString('org.gnome.system.proxy.socks', 'host');
+      const socksPort = await this.getInt('org.gnome.system.proxy.socks', 'port');
+
+      const status: SystemProxyStatus = { enabled: true };
+      if (httpHost && httpPort > 0) status.httpProxy = `${httpHost}:${httpPort}`;
+      if (httpsHost && httpsPort > 0) status.httpsProxy = `${httpsHost}:${httpsPort}`;
+      if (socksHost && socksPort > 0) status.socksProxy = `${socksHost}:${socksPort}`;
+
+      return status;
+    } catch {
+      return { enabled: false };
+    }
+  }
+
+  private async ensureGsettingsAvailable(): Promise<void> {
+    try {
+      await execAsync('command -v gsettings');
+    } catch {
+      throw new Error('未找到 gsettings，当前 Linux 桌面环境暂不支持自动设置系统代理');
+    }
+  }
+
+  private async getCurrentSettings(): Promise<LinuxProxySettings> {
+    return {
+      mode: await this.getString('org.gnome.system.proxy', 'mode'),
+      httpHost: await this.getString('org.gnome.system.proxy.http', 'host'),
+      httpPort: await this.getInt('org.gnome.system.proxy.http', 'port'),
+      httpsHost: await this.getString('org.gnome.system.proxy.https', 'host'),
+      httpsPort: await this.getInt('org.gnome.system.proxy.https', 'port'),
+      socksHost: await this.getString('org.gnome.system.proxy.socks', 'host'),
+      socksPort: await this.getInt('org.gnome.system.proxy.socks', 'port'),
+      ignoreHosts: await this.getRaw('org.gnome.system.proxy', 'ignore-hosts'),
+    };
+  }
+
+  private async restoreLinuxSettings(settings: LinuxProxySettings): Promise<void> {
+    await this.setString('org.gnome.system.proxy.http', 'host', settings.httpHost);
+    await this.setInt('org.gnome.system.proxy.http', 'port', settings.httpPort);
+    await this.setString('org.gnome.system.proxy.https', 'host', settings.httpsHost);
+    await this.setInt('org.gnome.system.proxy.https', 'port', settings.httpsPort);
+    await this.setString('org.gnome.system.proxy.socks', 'host', settings.socksHost);
+    await this.setInt('org.gnome.system.proxy.socks', 'port', settings.socksPort);
+    await this.setRaw('org.gnome.system.proxy', 'ignore-hosts', shellQuote(settings.ignoreHosts));
+    await this.setString('org.gnome.system.proxy', 'mode', settings.mode);
+  }
+
+  private async getString(schema: string, key: string): Promise<string> {
+    const rawValue = await this.getRaw(schema, key);
+    return rawValue.replace(/^'/, '').replace(/'$/, '').replace(/\\'/g, "'");
+  }
+
+  private async getInt(schema: string, key: string): Promise<number> {
+    const rawValue = await this.getRaw(schema, key);
+    const parsed = Number.parseInt(rawValue, 10);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  private async getRaw(schema: string, key: string): Promise<string> {
+    const { stdout } = await execAsync(`gsettings get ${schema} ${key}`);
+    return stdout.trim();
+  }
+
+  private async setString(schema: string, key: string, value: string): Promise<void> {
+    await this.setRaw(schema, key, shellQuote(value));
+  }
+
+  private async setInt(schema: string, key: string, value: number): Promise<void> {
+    await this.setRaw(schema, key, String(value));
+  }
+
+  private async setRaw(schema: string, key: string, value: string): Promise<void> {
+    await execAsync(`gsettings set ${schema} ${key} ${value}`);
+  }
+}
+
 /**
  * 创建系统代理管理器
  * 根据当前平台返回对应的实现
@@ -532,6 +736,8 @@ export function createSystemProxyManager(): ISystemProxyManager {
     return new WindowsSystemProxy();
   } else if (platform === 'darwin') {
     return new MacOSSystemProxy();
+  } else if (platform === 'linux') {
+    return new LinuxSystemProxy();
   }
 
   throw new Error(`不支持的平台: ${platform}`);

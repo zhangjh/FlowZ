@@ -127,6 +127,12 @@ export class ResourceManager {
         // 生产环境：打包后统一使用 mac 目录
         return path.join(baseDir, 'mac');
       }
+    } else if (this.platform === 'linux') {
+      if (this.isDev) {
+        return path.join(baseDir, `linux-${this.arch}`);
+      }
+
+      return path.join(baseDir, 'linux');
     }
 
     throw new Error(`Unsupported platform: ${this.platform}`);
