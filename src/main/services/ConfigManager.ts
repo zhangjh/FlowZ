@@ -43,50 +43,22 @@ export class ConfigManager implements IConfigManager {
    */
   async loadConfig(): Promise<UserConfig> {
     try {
-      // 检查配置文件是否存在
       await fs.access(this.configPath);
-
-      // 读取配置文件
-      const content = await fs.readFile(this.configPath, 'utf-8');
-      const config = JSON.parse(content) as UserConfig;
-
-      // 验证配置
-      this.validateConfig(config);
-
-      // 缓存配置
-      this.currentConfig = config;
-
-      return config;
-    } catch (error) {
-      // 文件不存在或解析失败，返回默认配置
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.warn('配置文件加载失败，使用默认配置:', errorMessage);
-
-      // 记录详细错误信息
-      if (error instanceof SyntaxError) {
-        console.error('配置文件 JSON 格式错误:', errorMessage);
-      } else if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        console.info('配置文件不存在，将创建默认配置');
-      } else if ((error as NodeJS.ErrnoException).code === 'EACCES') {
-        console.error('配置文件权限不足，无法读取');
-      } else {
-        console.error('配置验证失败:', errorMessage);
-      }
-
+    } catch {
+      // 文件不存在（首次启动），创建默认配置
       const defaultConfig = this.createDefaultConfig();
       this.currentConfig = defaultConfig;
-
-      // 尝试保存默认配置
-      try {
-        await this.saveConfig(defaultConfig);
-        console.info('默认配置已保存到:', this.configPath);
-      } catch (saveError) {
-        console.error('保存默认配置失败:', saveError);
-        // 即使保存失败，也返回默认配置，让应用继续运行
-      }
-
+      await this.saveConfig(defaultConfig);
+      console.info('默认配置已创建:', this.configPath);
       return defaultConfig;
     }
+
+    // 文件存在，读取并验证
+    const content = await fs.readFile(this.configPath, 'utf-8');
+    const config = JSON.parse(content) as UserConfig;
+    this.validateConfig(config);
+    this.currentConfig = config;
+    return config;
   }
 
   /**
