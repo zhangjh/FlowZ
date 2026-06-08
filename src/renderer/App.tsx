@@ -58,7 +58,11 @@ function App() {
       'speedTestResult',
       (results) => {
         const message = results
-          .map((r) => (r.latency !== null ? `${r.name}（${r.protocol}）: ${r.latency}ms` : `${r.name}（${r.protocol}）: 超时`))
+          .map((r) =>
+            r.latency !== null
+              ? `${r.name}（${r.protocol}）: ${r.latency}ms`
+              : `${r.name}（${r.protocol}）: 超时`
+          )
           .join('\n');
 
         toast.info('测速结果', {
