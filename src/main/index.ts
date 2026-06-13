@@ -25,6 +25,7 @@ import { UpdateService } from './services/UpdateService';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
+import { getSystemDnsServers } from './utils/dns';
 
 let mainWindow: BrowserWindow | null = null;
 let trayManager: TrayManager | null = null;
@@ -733,8 +734,18 @@ app.whenReady().then(async () => {
           routeRules.unshift({ ip_cidr: serverIPs, outbound: 'direct' });
         }
 
+        const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
+        for (const dnsIp of systemDnsServers) {
+          const cidr = dnsIp.includes(':') ? `${dnsIp}/128` : `${dnsIp}/32`;
+          routeRules.unshift({ ip_cidr: [cidr], outbound: 'direct' });
+        }
+
+        const dnsServers: any[] = systemDnsServers.length > 0
+          ? systemDnsServers.map(ip => ({ tag: 'dns-local', type: 'udp', server: ip }))
+          : [{ tag: 'dns-local', type: 'local' }];
+
         const dnsConfig: any = {
-          servers: [{ tag: 'dns-local', type: 'local' }],
+          servers: dnsServers,
           rules: [] as any[],
           final: 'dns-local',
         };
