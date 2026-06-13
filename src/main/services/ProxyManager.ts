@@ -1862,36 +1862,42 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   private async tryKill(pid: number, signal: 'SIGTERM' | 'SIGKILL'): Promise<boolean> {
     try {
-      process.kill(pid, signal);
+      process.kill(pid, signal === 'SIGTERM' ? 15 : 9);
       return true;
     } catch (e: any) {
       if (e.code === 'ESRCH') {
         this.logToManager('debug', `进程 ${pid} 已不存在`);
         return true;
-      } else if (e.code === 'EPERM') {
-        // process.kill 使用 SIGxxx 格式，runPkexecKill 使用 xxx 格式（传给 /bin/kill）
-        const pkexecSignal = signal === 'SIGTERM' ? 'TERM' : 'KILL';
+      }
+
+      if (e.code === 'EPERM') {
+        const sigName = signal === 'SIGTERM' ? 'TERM' : 'KILL';
+
+        // 策略1：pkexec kill（polkit 弹窗认证）
         this.logToManager('debug', `进程 ${pid} 需要提权终止，尝试 pkexec`);
-        const pkexecResult = await this.runPkexecKill(pid, pkexecSignal);
+        const pkexecResult = await this.runPrivilegedKill('/usr/bin/pkexec', pid, sigName);
         if (pkexecResult) {
           return true;
         }
-        if (signal === 'SIGTERM' && this.singboxProcess && !this.singboxProcess.killed) {
-          this.logToManager('warn', `pkexec 终止失败，尝试终止 wrapper 进程`);
-          this.singboxProcess.kill(signal);
+
+        // 策略2：sudo kill（终端输入密码）
+        this.logToManager('warn', `pkexec 终止失败，尝试 sudo kill`);
+        const sudoResult = await this.runPrivilegedKill('/usr/bin/sudo', pid, sigName);
+        if (sudoResult) {
           return true;
         }
-        return false;
-      } else {
-        this.logToManager('error', `终止进程 ${pid} 失败: ${e.message}`);
+
         return false;
       }
+
+      this.logToManager('error', `终止进程 ${pid} 失败: ${e.message}`);
+      return false;
     }
   }
 
-  private runPkexecKill(pid: number, signal: 'TERM' | 'KILL'): Promise<boolean> {
+  private runPrivilegedKill(command: string, pid: number, signal: 'TERM' | 'KILL'): Promise<boolean> {
     return new Promise((resolve) => {
-      const killProcess = spawn('/usr/bin/pkexec', ['/bin/kill', `-${signal}`, String(pid)]);
+      const killProcess = spawn(command, ['/bin/kill', `-${signal}`, String(pid)]);
 
       const timeout = setTimeout(() => {
         try { killProcess.kill(); } catch { /* ignore */ }
@@ -1905,7 +1911,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       killProcess.on('error', (error) => {
         clearTimeout(timeout);
-        this.logToManager('error', `执行 pkexec kill 失败: ${error.message}`);
+        this.logToManager('error', `执行 ${command} kill 失败: ${error.message}`);
         resolve(false);
       });
     });
@@ -2052,7 +2058,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       killProcess.on('error', () => {
         // 最后尝试普通 kill
         try {
-          process.kill(pid, 'SIGKILL');
+          process.kill(pid, 9);
         } catch {
           // 忽略错误
         }
