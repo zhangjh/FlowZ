@@ -2,22 +2,55 @@ import { useEffect, useRef, useState, useCallback, useLayoutEffect } from 'react
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAppStore } from '@/store/app-store';
-import { Trash2, ArrowDown, ArrowDownToLine, FolderOpen } from 'lucide-react';
-import { getLogs, clearLogs, openLogFolder, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
+import { Trash2, ArrowDown, ArrowDownToLine } from 'lucide-react';
+import { getLogs, clearLogs, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
 import type { LogEntry } from '@/bridge/types';
+
+const LOG_ENTRY_HEIGHT = 20;
+const MAX_LOGS = 500;
+
+function LogRow({ log }: { log: LogEntry }) {
+  const timestamp = new Date(log.timestamp).toLocaleTimeString('zh-CN');
+  const levelColor = (() => {
+    switch (log.level) {
+      case 'error': return 'text-red-500';
+      case 'warn': return 'text-yellow-500';
+      case 'info': return 'text-blue-500';
+      case 'debug': return 'text-gray-500';
+      default: return 'text-foreground';
+    }
+  })();
+
+  return (
+    <div className="text-xs font-mono select-text" style={{ height: LOG_ENTRY_HEIGHT }}>
+      <span className="text-muted-foreground">[{timestamp}]</span>
+      <span className={`ml-2 font-semibold ${levelColor}`}>
+        {log.level.toUpperCase()}:
+      </span>
+      <span className="ml-2 truncate">{log.message}</span>
+    </div>
+  );
+}
 
 export function RealTimeLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isAutoScroll, setIsAutoScroll] = useState(false);
   const isAutoScrollRef = useRef(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
-  const scrollAdjustmentRef = useRef(0);
   const connectionStatus = useAppStore((state) => state.connectionStatus);
 
   const getScrollElement = useCallback((): HTMLElement | null => {
     return scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]') ?? null;
   }, []);
+
+  const virtualizer = useVirtualizer({
+    count: logs.length,
+    getScrollElement,
+    estimateSize: () => LOG_ENTRY_HEIGHT,
+    overscan: 10,
+  });
 
   useEffect(() => {
     const loadInitialLogs = async () => {
@@ -36,23 +69,7 @@ export function RealTimeLogs() {
     const handleLogReceived = (logEntry: LogEntry) => {
       setLogs((prev) => {
         const next = [...prev, logEntry];
-        // 当自动滚动关闭且需要裁剪旧日志时，累计被移除日志的高度用于补偿滚动偏移
-        if (!isAutoScrollRef.current && next.length > 500) {
-          const removedCount = next.length - 500;
-          const el = getScrollElement();
-          if (el) {
-            let totalHeight = 0;
-            const container = el.querySelector('.space-y-1');
-            if (container) {
-              const children = Array.from(container.children);
-              for (let i = 0; i < removedCount && i < children.length; i++) {
-                totalHeight += (children[i] as HTMLElement).offsetHeight;
-              }
-            }
-            scrollAdjustmentRef.current += totalHeight;
-          }
-        }
-        return next.slice(-500);
+        return next.slice(-MAX_LOGS);
       });
     };
 
@@ -60,18 +77,24 @@ export function RealTimeLogs() {
     return () => removeEventListener('logReceived', handleLogReceived);
   }, []);
 
-  // 使用 useLayoutEffect 在浏览器绘制前调整滚动位置
+  const prevTotalSize = useRef(0);
   useLayoutEffect(() => {
     const el = getScrollElement();
-    if (!el) return;
+    if (!el || logs.length === 0) return;
 
     if (isAutoScrollRef.current) {
       el.scrollTop = el.scrollHeight;
-    } else if (scrollAdjustmentRef.current > 0) {
-      // 补偿 .slice(-500) 移除首条日志导致的视窗偏移
-      el.scrollTop = Math.max(0, el.scrollTop - scrollAdjustmentRef.current);
-      scrollAdjustmentRef.current = 0;
+    } else {
+      const totalSize = logs.length * LOG_ENTRY_HEIGHT;
+      const removed = totalSize - prevTotalSize.current;
+      if (removed > 0) {
+        const overflow = totalSize - el.scrollTop - el.clientHeight;
+        if (overflow < LOG_ENTRY_HEIGHT * 2) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
     }
+    prevTotalSize.current = logs.length * LOG_ENTRY_HEIGHT;
   }, [logs, getScrollElement]);
 
   const handleToggleAutoScroll = () => {
@@ -93,14 +116,9 @@ export function RealTimeLogs() {
     }
   };
 
-  const getLevelColor = (level: LogEntry['level']) => {
-    switch (level) {
-      case 'error': return 'text-red-500';
-      case 'warn': return 'text-yellow-500';
-      case 'info': return 'text-blue-500';
-      case 'debug': return 'text-gray-500';
-      default: return 'text-foreground';
-    }
+  const handleScrollToBottom = () => {
+    const el = getScrollElement();
+    if (el) el.scrollTop = el.scrollHeight;
   };
 
   return (
@@ -120,15 +138,6 @@ export function RealTimeLogs() {
             <Button
               variant="outline"
               size="sm"
-              onClick={openLogFolder}
-              title="用记事本打开 app.log 查看历史日志"
-            >
-              <FolderOpen className="h-4 w-4 mr-1" />
-              本地日志
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
               onClick={handleClearLogs}
               disabled={logs.length === 0}
             >
@@ -141,26 +150,35 @@ export function RealTimeLogs() {
       <CardContent>
         <ScrollArea
           ref={scrollAreaRef}
-          className="h-64 w-full rounded border bg-muted/30 p-3"
+          className="h-64 w-full rounded border bg-muted/30"
         >
           {logs.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+            <div className="flex items-center justify-center h-full text-muted-foreground text-sm p-3">
               {connectionStatus?.proxyCore?.running ? '等待日志输出...' : '请先启动代理服务'}
             </div>
           ) : (
-            <div className="space-y-1 select-text cursor-text">
-              {logs.map((log, index) => {
-                const timestamp = new Date(log.timestamp).toLocaleTimeString('zh-CN');
-                return (
-                  <div key={index} className="text-xs font-mono select-text">
-                    <span className="text-muted-foreground">[{timestamp}]</span>
-                    <span className={`ml-2 font-semibold ${getLevelColor(log.level)}`}>
-                      {log.level.toUpperCase()}:
-                    </span>
-                    <span className="ml-2">{log.message}</span>
-                  </div>
-                );
-              })}
+            <div
+              style={{
+                height: `${virtualizer.getTotalSize()}px`,
+                width: '100%',
+                position: 'relative',
+                padding: '12px',
+              }}
+            >
+              {virtualizer.getVirtualItems().map((virtualItem) => (
+                <div
+                  key={virtualItem.key}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${virtualItem.start}px)`,
+                  }}
+                >
+                  <LogRow log={logs[virtualItem.index]} />
+                </div>
+              ))}
             </div>
           )}
         </ScrollArea>
@@ -170,10 +188,7 @@ export function RealTimeLogs() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => {
-                const el = getScrollElement();
-                if (el) el.scrollTop = el.scrollHeight;
-              }}
+              onClick={handleScrollToBottom}
               className="text-xs h-7"
             >
               <ArrowDown className="h-3 w-3 mr-1" />

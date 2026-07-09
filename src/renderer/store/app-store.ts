@@ -283,8 +283,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshConnectionStatus: async () => {
     try {
       const proxyStatus = await api.proxy.getStatus();
-      // 将 ProxyStatus 转换为 ConnectionStatus
-      const connectionStatus: ConnectionStatus = {
+      const current = get().connectionStatus;
+      const next: ConnectionStatus = {
         proxyCore: {
           running: proxyStatus.running,
           pid: proxyStatus.pid,
@@ -297,7 +297,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         },
         proxyModeType: get().config?.proxyModeType || 'systemProxy',
       };
-      set({ connectionStatus });
+      if (
+        !current ||
+        current.proxyCore.running !== next.proxyCore.running ||
+        current.proxyCore.pid !== next.proxyCore.pid ||
+        current.proxyCore.error !== next.proxyCore.error ||
+        current.proxy.enabled !== next.proxy.enabled ||
+        current.proxy.server !== next.proxy.server ||
+        current.proxyModeType !== next.proxyModeType
+      ) {
+        set({ connectionStatus: next });
+      }
     } catch (error) {
       console.error('Failed to refresh connection status:', error);
     }

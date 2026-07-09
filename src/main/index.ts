@@ -1,4 +1,12 @@
 import { app, BrowserWindow, dialog, Menu } from 'electron';
+
+// 优化 Chromium 资源占用
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+app.commandLine.appendSwitch('disable-accelerated-2d-canvas');
+app.commandLine.appendSwitch('disable-webgl');
+app.commandLine.appendSwitch('disable-features', 'TranslateUI,OptimizationGuide,ChromeWhatsNewUI,MediaRouter,InterestFeedContentSuggestions');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
 import * as path from 'path';
 import { ConfigManager } from './services/ConfigManager';
 import { ProtocolParser } from './services/ProtocolParser';
@@ -217,6 +225,20 @@ function createWindow() {
   // 处理窗口加载错误
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
     logManager.addLog('error', `Window failed to load: ${errorDescription} (${errorCode})`, 'Main');
+  });
+
+  // 窗口隐藏时降低帧率，减少 GPU 开销
+  mainWindow.on('hide', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.setFrameRate(2);
+    }
+  });
+
+  // 窗口显示时恢复帧率
+  mainWindow.on('show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.setFrameRate(60);
+    }
   });
 
   // 处理窗口关闭事件

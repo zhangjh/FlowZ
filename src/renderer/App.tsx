@@ -17,20 +17,11 @@ function App() {
   const loadConfig = useAppStore((state) => state.loadConfig);
   const refreshConnectionStatus = useAppStore((state) => state.refreshConnectionStatus);
 
-  // Listen to native events
   useNativeEventListeners();
 
-  // Load initial data
   useEffect(() => {
     loadConfig();
     refreshConnectionStatus();
-
-    // Poll connection status every 2 seconds
-    const statusInterval = setInterval(() => {
-      refreshConnectionStatus();
-    }, 2000);
-
-    return () => clearInterval(statusInterval);
   }, [loadConfig, refreshConnectionStatus]);
 
   // Listen to navigate events from main process (tray menu)
