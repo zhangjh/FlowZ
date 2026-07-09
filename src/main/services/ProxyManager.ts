@@ -15,6 +15,7 @@ import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
 import { getUserDataPath } from '../utils/paths';
+import { getSystemDnsServers } from '../utils/dns';
 import { isRunningAsAdmin } from './AdminPrivilege';
 
 function shellQuote(value: string): string {
@@ -600,22 +601,40 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
     const isTunMode = modeType !== 'systemproxy';
 
-    const dnsConfig: SingBoxDnsConfig = {
-      servers: [
-        {
-          // 本地/系统 DNS：使用操作系统当前的 DNS 配置
-          // 用于解析代理服务器地址、Fail-safe 解析以及直连域名的真实 IP 解析
+    // 在 Linux 上，检测系统上游 DNS 服务器（绕过 systemd-resolved 等本地 stub）
+    // 避免 TUN 模式下 DNS 查询因路由拦截而超时
+    const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
+    const useExplicitDns = systemDnsServers.length > 0;
+
+    const dnsServers: SingBoxDnsServer[] = [];
+
+    if (useExplicitDns) {
+      // Linux（Ubuntu）上使用检测到的上游 DNS 服务器，直接发送 DNS 查询
+      // 配合路由规则中的 DNS IP 直连规则，避免 TUN 拦截
+      for (const server of systemDnsServers) {
+        dnsServers.push({
           tag: 'dns-local',
-          type: 'local',
-        },
-        {
-          // FakeIP 服务器：返回虚假 IP，由 sniff 识别真实域名
-          tag: 'fakeip',
-          type: 'fakeip',
-          inet4_range: '198.18.0.0/15',
-          inet6_range: 'fc00::/18',
-        },
-      ],
+          type: 'udp',
+          server: server,
+        });
+        break;
+      }
+    } else {
+      dnsServers.push({
+        tag: 'dns-local',
+        type: 'local',
+      });
+    }
+
+    dnsServers.push({
+      tag: 'fakeip',
+      type: 'fakeip',
+      inet4_range: '198.18.0.0/15',
+      inet6_range: 'fc00::/18',
+    });
+
+    const dnsConfig: SingBoxDnsConfig = {
+      servers: dnsServers,
       rules: [],
       final: 'dns-local',
       // 不设置 strategy，允许 IPv4 和 IPv6 DNS 查询都返回 FakeIP
@@ -758,8 +777,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // Windows keeps this disabled to preserve the FakeIP behavior fixed for
         // SSH/QUIC-style traffic in a6f9cd8.
         sniff_override_destination: process.platform === 'darwin',
-        // 在系统路由层面排除本地地址，确保本地代理端口可访问
-        route_exclude_address: ['127.0.0.0/8', '::1/128'],
+        // 在系统路由层面排除本地地址和 DNS 服务器，确保本地代理端口和 DNS 可访问
+        route_exclude_address: [
+          '127.0.0.0/8', '::1/128',
+          ...process.platform === 'linux' ? getSystemDnsServers().map(ip =>
+            ip.includes(':') ? `${ip}/128` : `${ip}/32`
+          ) : [],
+        ],
       };
 
       // macOS 平台特定配置
@@ -978,6 +1002,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       action: 'route',
       outbound: 'direct',
     });
+
+    // DNS 服务器 IP 直连：确保上游 DNS 查询不经过 TUN
+    // 解决 Ubuntu systemd-resolved 在 TUN 模式下 DNS 超时的问题
+    const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
+    for (const dnsIp of systemDnsServers) {
+      if (dnsIp.includes(':')) {
+        rules.push({
+          ip_cidr: [`${dnsIp}/128`],
+          action: 'route',
+          outbound: 'direct',
+        });
+      } else {
+        rules.push({
+          ip_cidr: [`${dnsIp}/32`],
+          action: 'route',
+          outbound: 'direct',
+        });
+      }
+    }
 
     // 智能分流规则（默认启用，除非是直连模式）
     if (proxyMode !== 'direct') {
@@ -1767,14 +1810,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     this.logToManager('info', `正在停止 Linux sing-box 进程 (PID: ${pidToKill})...`);
 
-    const terminated = await this.runPkexecKill(pidToKill, 'TERM');
+    const terminated = await this.tryKill(pidToKill, 'SIGTERM');
     if (terminated) {
       await this.waitForProcessExit(pidToKill, 3000);
     }
 
     if (await this.isProcessAlive(pidToKill)) {
       this.logToManager('warn', '进程未响应 SIGTERM，尝试强制终止...');
-      await this.runPkexecKill(pidToKill, 'KILL');
+      await this.tryKill(pidToKill, 'SIGKILL');
       await this.waitForProcessExit(pidToKill, 3000);
     }
 
@@ -1791,9 +1834,44 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.logToManager('info', 'Linux sing-box 进程已停止');
   }
 
-  private runPkexecKill(pid: number, signal: 'TERM' | 'KILL'): Promise<boolean> {
+  private async tryKill(pid: number, signal: 'SIGTERM' | 'SIGKILL'): Promise<boolean> {
+    try {
+      process.kill(pid, signal === 'SIGTERM' ? 15 : 9);
+      return true;
+    } catch (e: any) {
+      if (e.code === 'ESRCH') {
+        this.logToManager('debug', `进程 ${pid} 已不存在`);
+        return true;
+      }
+
+      if (e.code === 'EPERM') {
+        const sigName = signal === 'SIGTERM' ? 'TERM' : 'KILL';
+
+        // 策略1：pkexec kill（polkit 弹窗认证）
+        this.logToManager('debug', `进程 ${pid} 需要提权终止，尝试 pkexec`);
+        const pkexecResult = await this.runPrivilegedKill('/usr/bin/pkexec', pid, sigName);
+        if (pkexecResult) {
+          return true;
+        }
+
+        // 策略2：sudo kill（终端输入密码）
+        this.logToManager('warn', `pkexec 终止失败，尝试 sudo kill`);
+        const sudoResult = await this.runPrivilegedKill('/usr/bin/sudo', pid, sigName);
+        if (sudoResult) {
+          return true;
+        }
+
+        return false;
+      }
+
+      this.logToManager('error', `终止进程 ${pid} 失败: ${e.message}`);
+      return false;
+    }
+  }
+
+  private runPrivilegedKill(command: string, pid: number, signal: 'TERM' | 'KILL'): Promise<boolean> {
     return new Promise((resolve) => {
-      const killProcess = spawn('/usr/bin/pkexec', ['/bin/kill', `-${signal}`, String(pid)]);
+      const killProcess = spawn(command, ['/bin/kill', `-${signal}`, String(pid)]);
 
       const timeout = setTimeout(() => {
         try { killProcess.kill(); } catch { /* ignore */ }
@@ -1807,7 +1885,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       killProcess.on('error', (error) => {
         clearTimeout(timeout);
-        this.logToManager('error', `执行 pkexec kill 失败: ${error.message}`);
+        this.logToManager('error', `执行 ${command} kill 失败: ${error.message}`);
         resolve(false);
       });
     });
@@ -1954,7 +2032,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       killProcess.on('error', () => {
         // 最后尝试普通 kill
         try {
-          process.kill(pid, 'SIGKILL');
+          process.kill(pid, 9);
         } catch {
           // 忽略错误
         }
