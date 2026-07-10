@@ -468,8 +468,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const isTunMode = this.currentConfig?.proxyModeType === 'tun';
     const activePid = isTunMode ? this.singboxPid : (this.singboxPid || this.pid);
     
-    // 验证进程是否真正存活
-    const isRunning = activePid !== null && this.isProcessAlive(activePid);
+    // 验证进程是否真正存活（同步快速检查，仅用于状态显示）
+    const isRunning = activePid !== null && (() => {
+      try { process.kill(activePid, 0); return true; }
+      catch (e: any) { return e.code !== 'ESRCH'; }
+    })();
 
     if (!isRunning || !activePid) {
       return {
@@ -1685,7 +1688,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const pidToKill = this.singboxPid;
 
     // 进程已不存在，直接清理
-    if (!this.isProcessAlive(pidToKill)) {
+    if (!(await this.isProcessAlive(pidToKill))) {
       this.logToManager('info', `sing-box 进程 (PID: ${pidToKill}) 已不存在，跳过终止`);
       try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
       this.cleanup();
@@ -1799,7 +1802,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const pidToKill = this.singboxPid;
 
-    if (!this.isProcessAlive(pidToKill)) {
+    if (!(await this.isProcessAlive(pidToKill))) {
       this.logToManager('info', `sing-box 进程 (PID: ${pidToKill}) 已不存在，跳过终止`);
       try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
       this.cleanup();
@@ -2007,12 +2010,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private async waitForProcessExit(pid: number, timeout: number): Promise<boolean> {
     const startTime = Date.now();
     while (Date.now() - startTime < timeout) {
-      if (!this.isProcessAlive(pid)) {
+      if (!(await this.isProcessAlive(pid))) {
         return true;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    return !this.isProcessAlive(pid);
+    return !(await this.isProcessAlive(pid));
   }
 
   /**
@@ -2213,7 +2216,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
 
       // 还有残留就 UAC 提权再杀一次
-      const stillAlive = pidList.filter((p) => this.isProcessAlive(p));
+      const stillAlive: number[] = [];
+      for (const p of pidList) {
+        if (await this.isProcessAlive(p)) {
+          stillAlive.push(p);
+        }
+      }
       if (stillAlive.length > 0) {
         this.logToManager('warn', `${stillAlive.length} 个进程未被普通权限终止，尝试 UAC 提权`);
         await this.killAllSingBoxWithUAC();
@@ -2304,6 +2312,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 检查进程是否存活
    *
    * 优先使用 process.kill(pid, 0)（纯系统调用，不创建子进程）。
+   * - ESRCH → 进程已不存在，直接返回 false
+   * - EPERM → 权限不足，回退到系统命令检测
+   * - 其他错误 → 保守返回 true
+   *
    * 对于 TUN 模式下以管理员权限运行的进程，process.kill 可能不可靠，
    * 此时回退到系统命令检测。
    */
@@ -2311,29 +2323,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
-      // process.kill 失败（无权限或进程已不存在）
+    } catch (e: any) {
+      if (e.code === 'ESRCH') {
+        return false;
+      }
     }
 
     try {
-      const { exec } = require('child_process');
-      const run = (cmd: string): Promise<string> =>
-        new Promise((resolve, reject) => {
-          exec(cmd, { encoding: 'utf-8', windowsHide: true, timeout: 10000 }, (err: Error | null, stdout: string) =>
-            err ? reject(err) : resolve(stdout)
+      const { execFile } = require('child_process');
+      const run = (cmd: string, args: string[]): Promise<string> =>
+        new Promise((resolve) => {
+          execFile(cmd, args, { encoding: 'utf-8', windowsHide: true, timeout: 10000 }, (_err: Error | null, stdout: string) =>
+            resolve(stdout.trim())
           );
         });
 
       if (process.platform === 'win32') {
-        const result = await run(
-          `powershell -NoProfile -Command "if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { 'alive' } else { 'dead' }"`
-        );
-        const alive = result.trim() === 'alive';
+        const result = await run('powershell', [
+          '-NoProfile', '-Command',
+          `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { 'alive' } else { 'dead' }`,
+        ]);
+        const alive = result === 'alive';
         this.logToManager('debug', `isProcessAlive pid=${pid} alive=${alive}`);
         return alive;
       } else {
-        const result = await run(`ps -p ${pid} -o pid=`);
-        return result.trim() === String(pid);
+        const result = await run('ps', ['-p', String(pid), '-o', 'pid=']);
+        const alive = result === String(pid);
+        this.logToManager('debug', `isProcessAlive pid=${pid} alive=${alive}`);
+        return alive;
       }
     } catch {
       return true;
