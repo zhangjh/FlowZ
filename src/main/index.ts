@@ -172,7 +172,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      devTools: false, // 启用开发者工具以便调试
+      devTools: true, // 启用开发者工具以便调试
     },
     // macOS 特定配置
     ...(process.platform === 'darwin' && {
@@ -198,6 +198,15 @@ function createWindow() {
     mainWindow?.show();
     logManager.addLog('info', 'Main window shown', 'Main');
   });
+
+  // 生产环境下允许通过快捷键打开开发者工具（用于调试）
+  if (!isDevelopment) {
+    mainWindow.webContents.on('before-input-event', (_event, input) => {
+      if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
+        mainWindow?.webContents.toggleDevTools();
+      }
+    });
+  }
 
   // 开发环境加载 Vite 开发服务器
   if (isDevelopment) {
