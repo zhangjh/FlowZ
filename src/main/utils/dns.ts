@@ -21,16 +21,24 @@ function isLoopback(ip: string): boolean {
   return ip.startsWith('127.');
 }
 
+function isDockerBridge(ip: string): boolean {
+  if (!ip.includes('.')) return false;
+  const parts = ip.split('.').map(Number);
+  return parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
+}
+
 export function getSystemDnsServers(): string[] {
   if (process.platform !== 'linux') return [];
 
+  const isUsable = (ip: string) => !isLoopback(ip) && !isDockerBridge(ip);
+
   let servers = parseResolvConf('/etc/resolv.conf');
-  let filtered = servers.filter(ip => !isLoopback(ip));
+  let filtered = servers.filter(isUsable);
 
   if (filtered.length > 0) return filtered;
 
   servers = parseResolvConf('/run/systemd/resolve/resolv.conf');
-  filtered = servers.filter(ip => !isLoopback(ip));
+  filtered = servers.filter(isUsable);
 
   if (filtered.length > 0) return filtered;
 
