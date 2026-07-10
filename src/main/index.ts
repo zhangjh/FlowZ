@@ -522,12 +522,7 @@ app.whenReady().then(async () => {
         await configManager.saveConfig(config);
         logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
 
-        // 如果代理正在运行，重启以应用新服务器
-        if (proxyManager && proxyManager.getStatus().running) {
-          await proxyManager.stop();
-          await proxyManager.start(config);
-          logManager.addLog('info', 'Proxy restarted with new server', 'Main');
-        }
+        // saveConfig 已触发 CONFIG_CHANGED，自动处理热更新或重启
 
         // 更新托盘菜单
         updateTrayMenuState(proxyManager?.getStatus().running ?? false);
@@ -546,12 +541,7 @@ app.whenReady().then(async () => {
         await configManager.saveConfig(config);
         logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
 
-        // 如果代理正在运行，重启以应用新模式
-        if (proxyManager && proxyManager.getStatus().running) {
-          await proxyManager.stop();
-          await proxyManager.start(config);
-          logManager.addLog('info', 'Proxy restarted with new mode', 'Main');
-        }
+        // saveConfig 已触发 CONFIG_CHANGED，自动处理重启
 
         // 更新托盘菜单
         updateTrayMenuState(proxyManager?.getStatus().running ?? false);
@@ -1026,19 +1016,37 @@ app.whenReady().then(async () => {
   }, 5000);
 
   // 监听配置变更事件，更新托盘菜单并自动重启代理
-  mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {
+  mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async (_newConfig?: any) => {
     // 1. 更新托盘菜单
     const isRunning = proxyManager?.getStatus().running ?? false;
     updateTrayMenuState(isRunning);
 
-    // 2. 如果代理正在运行，自动重启以应用新配置
+    // 2. 如果代理正在运行，尝试热更新或重启以应用新配置
     if (isRunning && proxyManager) {
+      // 加载最新配置（确保使用最新值）
+      const latestConfig = await configManager.loadConfig();
+
+      // 尝试热更新（仅服务器切换时不重启）
+      if (proxyManager.canHotReload(latestConfig)) {
+        logManager.addLog('info', 'Configuration changed, hot reloading...', 'Main');
+        try {
+          const success = await proxyManager.hotReloadConfig(latestConfig);
+          if (success) {
+            logManager.addLog('info', 'Proxy config hot reloaded successfully', 'Main');
+            updateTrayMenuState(true);
+            return;
+          }
+          logManager.addLog('warn', 'Hot reload failed, falling back to restart', 'Main');
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('warn', `Hot reload error: ${errorMessage}, falling back to restart`, 'Main');
+        }
+      }
+
+      // 热更新不可用或失败，执行完整重启
       logManager.addLog('info', 'Configuration changed, restarting proxy...', 'Main');
       try {
-        await proxyManager.stop();
-        // 重新加载配置以确保使用最新值
-        const latestConfig = await configManager.loadConfig();
-        await proxyManager.start(latestConfig);
+        await proxyManager.restart(latestConfig);
         logManager.addLog('info', 'Proxy restarted successfully with new configuration', 'Main');
 
         // 重启后再次更新托盘（以防状态有变）

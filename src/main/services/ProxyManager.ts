@@ -55,6 +55,11 @@ const PRIVATE_IP_PATTERNS = [
 ];
 
 /**
+ * sing-box clash_api 热更新端口
+ */
+const CLASH_API_PORT = 9091;
+
+/**
  * sing-box 1.12.x 配置类型定义
  */
 
@@ -201,6 +206,10 @@ interface SingBoxExperimental {
     enabled: boolean;
     path: string;
   };
+  clash_api?: {
+    external_controller: string;
+    secret?: string;
+  };
 }
 
 interface SingBoxConfig {
@@ -218,6 +227,8 @@ export interface IProxyManager {
   restart(config: UserConfig): Promise<void>;
   getStatus(): ProxyStatus;
   generateSingBoxConfig(config: UserConfig): SingBoxConfig;
+  hotReloadConfig(newConfig: UserConfig): Promise<boolean>;
+  canHotReload(newConfig: UserConfig): boolean;
   on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
   off(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
 }
@@ -374,10 +385,269 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   /**
    * 重启代理
+   * TUN 模式下将停止和启动合并为单次提权操作，避免两次弹框
    */
   async restart(config: UserConfig): Promise<void> {
-    await this.stop();
-    await this.start(config);
+    const modeTypeChanged = this.currentConfig?.proxyModeType !== config.proxyModeType;
+
+    // 模式类型发生变化（TUN ↔ 系统代理）：使用 stop + start
+    // stop 可能需要提权（旧进程是 root），start 根据新模式决定是否提权
+    if (modeTypeChanged) {
+      await this.stop();
+      await this.start(config);
+      return;
+    }
+
+    // 系统代理模式：直接 stop + start，无需提权
+    if (!this.needsPrivilegedWrapper()) {
+      await this.stop();
+      await this.start(config);
+      return;
+    }
+
+    // TUN 模式内重启（如切换服务器、改端口、改规则）：合并为单次提权操作
+    await this.restartWithElevation(config);
+  }
+
+  /**
+   * TUN 模式下通过单次提权完成重启
+   * 生成一个 wrapper 脚本，在同一个提权上下文中完成：杀旧进程 → 启动新进程
+   */
+  private async restartWithElevation(config: UserConfig): Promise<void> {
+    // 先生成新配置并写入文件（提权脚本直接读取）
+    const singboxConfig = this.generateSingBoxConfig(config);
+    await this.writeSingBoxConfig(singboxConfig);
+    this.currentConfig = config;
+
+    const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+    const exitInfoFile = path.join(getUserDataPath(), 'singbox_exit.log');
+    const wrapperScriptFile = path.join(getUserDataPath(), 'singbox_wrapper.sh');
+
+    // 通用的 wrapper 脚本逻辑（macOS / Linux）
+    const wrapperContent = [
+      '#!/bin/bash',
+      `SINGBOX_PATH=${shellQuote(this.singboxPath)}`,
+      `CONFIG_PATH=${shellQuote(this.configPath)}`,
+      `PID_FILE=${shellQuote(pidFile)}`,
+      `EXIT_LOG=${shellQuote(exitInfoFile)}`,
+      '',
+      'echo "[$(date)] restart wrapper started" > "$EXIT_LOG"',
+      '',
+      '# 停止旧 sing-box 进程',
+      'if [ -f "$PID_FILE" ]; then',
+      '  OLD_PID=$(cat "$PID_FILE" 2>/dev/null)',
+      '  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then',
+      '    echo "[$(date)] killing old sing-box PID=$OLD_PID" >> "$EXIT_LOG"',
+      '    kill -TERM "$OLD_PID" 2>/dev/null',
+      '    for i in $(seq 1 15); do',
+      '      if ! kill -0 "$OLD_PID" 2>/dev/null; then break; fi',
+      '      sleep 0.2',
+      '    done',
+      '    if kill -0 "$OLD_PID" 2>/dev/null; then',
+      '      echo "[$(date)] old process not responding, force killing" >> "$EXIT_LOG"',
+      '      kill -9 "$OLD_PID" 2>/dev/null',
+      '      sleep 0.5',
+      '    fi',
+      '    echo "[$(date)] old sing-box stopped" >> "$EXIT_LOG"',
+      '  else',
+      '    echo "[$(date)] old process already gone" >> "$EXIT_LOG"',
+      '  fi',
+      'fi',
+      '',
+      '# 启动新 sing-box',
+      '"$SINGBOX_PATH" run -c "$CONFIG_PATH" &',
+      'SBPID=$!',
+      'echo $SBPID > "$PID_FILE"',
+      'chmod 644 "$PID_FILE" 2>/dev/null || true',
+      'echo "[$(date)] new sing-box started PID=$SBPID" >> "$EXIT_LOG"',
+      '',
+      '# trap 信号：转发给 sing-box',
+      'trap \'kill -TERM $SBPID 2>/dev/null\' TERM INT',
+      '',
+      'wait $SBPID',
+      'EXIT_CODE=$?',
+      'echo "[$(date)] sing-box exited code=$EXIT_CODE" >> "$EXIT_LOG"',
+    ].join('\n');
+
+    const fsSync = require('fs');
+    fsSync.writeFileSync(wrapperScriptFile, wrapperContent, { mode: 0o755 });
+
+    // 删除旧 PID 文件，避免读到残留值
+    await this.deletePidFile();
+
+    this.logToManager('info', 'TUN 模式重启：正在请求管理员权限...');
+
+    let command: string;
+    let args: string[];
+
+    if (this.needsOsascript()) {
+      command = '/usr/bin/osascript';
+      args = [
+        '-e',
+        `do shell script "/bin/bash '${wrapperScriptFile}'" with administrator privileges`,
+      ];
+    } else if (this.needsLinuxPkexec()) {
+      command = '/usr/bin/pkexec';
+      args = ['/bin/bash', wrapperScriptFile];
+    } else {
+      // Windows TUN 模式：使用 PowerShell 合并 stop + start
+      await this.restartWithUAC(config);
+      return;
+    }
+
+    // 启动提权进程
+    this.singboxProcess = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    this.pid = this.singboxProcess.pid || null;
+    this.startTime = new Date();
+
+    // 监听进程输出
+    if (this.singboxProcess.stdout) {
+      this.singboxProcess.stdout.on('data', (data: Buffer) => {
+        this.handleProcessOutput(data.toString());
+      });
+    }
+    if (this.singboxProcess.stderr) {
+      this.singboxProcess.stderr.on('data', (data: Buffer) => {
+        this.handleProcessOutput(data.toString());
+      });
+    }
+
+    // 监听退出事件
+    this.singboxProcess.on('exit', (code) => {
+      // macOS: exit code 0 = 成功（wrapper 正常退出）
+      // 用户取消密码弹框 = exit code 1，但 sing-box 可能已在后台启动
+      if (this.needsOsascript() && code === 1) {
+        // 检查 PID 文件是否已写入（用户可能已输入密码，sing-box 已启动）
+        this.waitForPidFile().then(() => {
+          if (!this.singboxPid) {
+            this.logToManager('warn', '用户取消了管理员权限授权');
+            this.cleanup();
+            this.emit('stopped');
+            this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+          }
+        });
+        return;
+      }
+
+      if (code !== 0) {
+        this.logToManager('warn', `提权进程退出码: ${code}`);
+      }
+    });
+
+    this.singboxProcess.on('error', (error) => {
+      this.logToManager('error', `提权进程启动失败: ${error.message}`);
+      this.cleanup();
+      this.emit('error', error);
+    });
+
+    // 等待 PID 文件写入（新 sing-box 的实际 PID）
+    await this.waitForPidFile();
+
+    // 启动日志监控和健康检查
+    this.startLogFileWatcher();
+    this.startHealthCheck();
+
+    this.logToManager('info', 'TUN 模式重启完成');
+    this.emit('started');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STARTED, {});
+  }
+
+  /**
+   * Windows TUN 模式下通过单次 UAC 完成重启
+   */
+  private async restartWithUAC(_config: UserConfig): Promise<void> {
+    const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+    const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+    const singboxPathEsc = this.singboxPath.replace(/'/g, "''");
+    const configPathEsc = this.configPath.replace(/'/g, "''");
+    const pidFileEsc = pidFile.replace(/'/g, "''");
+    const logFileEsc = startupLogFile.replace(/'/g, "''");
+
+    // 读取旧 PID
+    let oldPid = 0;
+    try {
+      const pidContent = require('fs').readFileSync(pidFile, 'utf-8').trim();
+      oldPid = parseInt(pidContent, 10) || 0;
+    } catch { /* ignore */ }
+
+    const psScript = [
+      "$ErrorActionPreference = 'Stop'",
+      "$logFile = '" + logFileEsc + "'",
+      "$pidFile = '" + pidFileEsc + "'",
+      "$singboxPath = '" + singboxPathEsc + "'",
+      "$configPath = '" + configPathEsc + "'",
+      "'Restarting sing-box...' | Out-File -FilePath $logFile -Encoding UTF8",
+      // 停止旧进程
+      "if (" + oldPid + " -gt 0) {",
+      "  try {",
+      "    $proc = Get-Process -Id " + oldPid + " -ErrorAction SilentlyContinue",
+      "    if ($proc) {",
+      "      Stop-Process -Id " + oldPid + " -Force -ErrorAction SilentlyContinue",
+      "      Start-Sleep -Seconds 2",
+      "      'Stopped old process PID " + oldPid + "' | Out-File -FilePath $logFile -Append -Encoding UTF8",
+      "    }",
+      "  } catch { }",
+      "}",
+      // 启动新进程
+      "try {",
+      "  $process = Start-Process -FilePath $singboxPath -ArgumentList 'run','-c',$configPath -Verb RunAs -PassThru -WindowStyle Hidden",
+      "  if ($process -and $process.Id) {",
+      "    'New process started PID: ' + $process.Id | Out-File -FilePath $logFile -Append -Encoding UTF8",
+      "    $process.Id | Out-File -FilePath $pidFile -Encoding ASCII -NoNewline",
+      "    exit 0",
+      "  }",
+      "} catch {",
+      "  'ERROR: ' + $_.Exception.Message | Out-File -FilePath $logFile -Append -Encoding UTF8",
+      "  exit 1",
+      "}",
+    ].join('; ');
+
+    const command = 'powershell.exe';
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
+
+    this.singboxProcess = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    this.pid = this.singboxProcess.pid || null;
+    this.startTime = new Date();
+
+    if (this.singboxProcess.stdout) {
+      this.singboxProcess.stdout.on('data', (data: Buffer) => {
+        this.handleProcessOutput(data.toString());
+      });
+    }
+    if (this.singboxProcess.stderr) {
+      this.singboxProcess.stderr.on('data', (data: Buffer) => {
+        this.handleProcessOutput(data.toString());
+      });
+    }
+
+    this.singboxProcess.on('exit', (code) => {
+      if (code === 1) {
+        this.logToManager('warn', '用户取消了 UAC 授权');
+        this.cleanup();
+        this.emit('stopped');
+        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+      }
+    });
+
+    this.singboxProcess.on('error', (error) => {
+      this.logToManager('error', `UAC 重启失败: ${error.message}`);
+      this.cleanup();
+      this.emit('error', error);
+    });
+
+    await this.waitForPidFile();
+    this.startLogFileWatcher();
+    this.startHealthCheck();
+
+    this.logToManager('info', 'Windows TUN 模式重启完成');
+    this.emit('started');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STARTED, {});
   }
 
   /**
@@ -459,6 +729,84 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 判断是否可以通过热更新应用配置变更
+   * 仅当代理正在运行时才允许热更新
+   * 系统代理模式和 TUN 模式均支持（clash_api 绑定在 127.0.0.1，localhost 连接不受 TUN 影响）
+   *
+   * 支持热更新的变更：服务器切换、模式切换（global/smart/direct）、自定义规则变更
+   * 不支持热更新的变更：proxyModeType（TUN ↔ 系统代理）、端口、TUN 配置
+   */
+  canHotReload(newConfig: UserConfig): boolean {
+    if (!this.currentConfig || !this.singboxProcess) {
+      return false;
+    }
+
+    // 以下变更影响底层基础设施，需要重启：
+    // - proxyModeType（TUN ↔ 系统代理）
+    // - socksPort / httpPort（inbound 监听端口）
+    // - tunConfig（TUN 接口参数）
+    if (
+      this.currentConfig.proxyModeType !== newConfig.proxyModeType ||
+      this.currentConfig.socksPort !== newConfig.socksPort ||
+      this.currentConfig.httpPort !== newConfig.httpPort
+    ) {
+      return false;
+    }
+
+    // TUN 配置变更需要重启
+    if (newConfig.proxyModeType === 'tun') {
+      const oldTun = this.currentConfig.tunConfig;
+      const newTun = newConfig.tunConfig;
+      if (
+        oldTun.mtu !== newTun.mtu ||
+        oldTun.stack !== newTun.stack ||
+        oldTun.autoRoute !== newTun.autoRoute ||
+        oldTun.strictRoute !== newTun.strictRoute
+      ) {
+        return false;
+      }
+    }
+
+    // 其他变更（服务器、模式、规则）均可通过 clash_api 热更新
+    return true;
+  }
+
+  /**
+   * 通过 sing-box clash_api 热更新配置
+   * 重新生成 sing-box 配置并通知进程重新加载，无需重启
+   */
+  async hotReloadConfig(newConfig: UserConfig): Promise<boolean> {
+    try {
+      // 生成新的 sing-box 配置并写入文件
+      const singboxConfig = this.generateSingBoxConfig(newConfig);
+      await this.writeSingBoxConfig(singboxConfig);
+      this.currentConfig = newConfig;
+
+      // 通过 clash_api 通知 sing-box 重新加载配置
+      // sing-box clash_api 使用 PUT /configs?path=<config_path>
+      const configUrl = `http://127.0.0.1:${CLASH_API_PORT}/configs`;
+      const params = new URLSearchParams({ path: this.configPath });
+      const response = await fetch(`${configUrl}?${params.toString()}`, {
+        method: 'PUT',
+      });
+
+      if (response.ok) {
+        this.logToManager('info', '配置热更新成功，无需重启代理');
+        return true;
+      }
+
+      // 读取响应体获取详细错误信息
+      const body = await response.text().catch(() => '');
+      this.logToManager('warn', `热更新 API 返回错误: ${response.status} ${body}`);
+      return false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logToManager('warn', `热更新失败: ${message}，将回退到重启`);
+      return false;
+    }
+  }
+
+  /**
    * 获取代理状态
    */
   getStatus(): ProxyStatus {
@@ -528,6 +876,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         cache_file: {
           enabled: true,
           path: cachePath,
+        },
+        clash_api: {
+          external_controller: `127.0.0.1:${CLASH_API_PORT}`,
         },
       },
     };
