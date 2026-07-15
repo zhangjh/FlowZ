@@ -955,16 +955,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
     const isTunMode = modeType !== 'systemproxy';
 
-    // 在 Linux 上，检测系统上游 DNS 服务器（绕过 systemd-resolved 等本地 stub）
-    // 避免 TUN 模式下 DNS 查询因路由拦截而超时
-    const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
+    // 在 Windows/Linux 上检测系统上游 DNS 服务器
+    // 避免 TUN 模式下 DNS 查询因路由拦截而产生死循环
+    const systemDnsServers = getSystemDnsServers();
     const useExplicitDns = systemDnsServers.length > 0;
 
     const dnsServers: SingBoxDnsServer[] = [];
 
     if (useExplicitDns) {
-      // Linux（Ubuntu）上使用检测到的上游 DNS 服务器，直接发送 DNS 查询
-      // 配合路由规则中的 DNS IP 直连规则，避免 TUN 拦截
+      // Windows/Linux 上使用检测到的上游 DNS 服务器，直接发送 DNS 查询
+      // 配合路由规则中的 DNS IP 直连规则，避免 TUN 拦截导致 DNS 死循环
       for (const server of systemDnsServers) {
         dnsServers.push({
           tag: 'dns-local',
@@ -1134,9 +1134,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 在系统路由层面排除本地地址和 DNS 服务器，确保本地代理端口和 DNS 可访问
         route_exclude_address: [
           '127.0.0.0/8', '::1/128',
-          ...process.platform === 'linux' ? getSystemDnsServers().map(ip =>
+          ...getSystemDnsServers().map(ip =>
             ip.includes(':') ? `${ip}/128` : `${ip}/32`
-          ) : [],
+          ),
         ],
       };
 
@@ -1358,9 +1358,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     });
 
     // DNS 服务器 IP 直连：确保上游 DNS 查询不经过 TUN
-    // 解决 Ubuntu systemd-resolved 在 TUN 模式下 DNS 超时的问题
-    const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
-    for (const dnsIp of systemDnsServers) {
+    // 解决 TUN 模式下 DNS 查询因路由拦截而死循环的问题 (Windows/Linux)
+    const dnsServersForRoute = getSystemDnsServers();
+    for (const dnsIp of dnsServersForRoute) {
       if (dnsIp.includes(':')) {
         rules.push({
           ip_cidr: [`${dnsIp}/128`],
