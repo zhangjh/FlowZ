@@ -20,8 +20,7 @@ function App() {
   useNativeEventListeners();
 
   useEffect(() => {
-    loadConfig();
-    refreshConnectionStatus();
+    loadConfig().then(() => refreshConnectionStatus());
   }, [loadConfig, refreshConnectionStatus]);
 
   // Listen to navigate events from main process (tray menu)

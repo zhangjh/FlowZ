@@ -25,8 +25,7 @@ export function ConnectionStatusCard() {
   const selectedServer = servers.find((s) => s.id === selectedServerId);
 
   const getStatusInfo = () => {
-    // Use proxyModeType from connectionStatus if available, otherwise fall back to config
-    const proxyModeType = connectionStatus?.proxyModeType || config?.proxyModeType || 'systemProxy';
+    const proxyModeType = config?.proxyModeType || connectionStatus?.proxyModeType || 'systemProxy';
     const isTunMode = proxyModeType === 'tun';
     const modeText = isTunMode ? 'TUN模式' : '系统代理模式';
 

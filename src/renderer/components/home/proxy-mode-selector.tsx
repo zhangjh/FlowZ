@@ -18,7 +18,7 @@ export function ProxyModeSelector() {
   const currentMode = config?.proxyMode || 'smart';
 
   // Check connection status based on proxy mode type
-  const proxyModeType = connectionStatus?.proxyModeType || config?.proxyModeType || 'systemProxy';
+  const proxyModeType = config?.proxyModeType || connectionStatus?.proxyModeType || 'systemProxy';
   const isTunMode = proxyModeType === 'tun';
   const isConnected = isTunMode
     ? connectionStatus?.proxyCore?.running === true // TUN mode: only check proxy core
