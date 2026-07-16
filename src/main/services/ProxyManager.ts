@@ -3317,6 +3317,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       'dns: cached', // DNS 缓存
       'resolved', // DNS 解析完成
       'udp packet', // UDP 包
+      'outbound packet connection', // 无目标的 UDP 广播包（mDNS/LLMNR 等）
       'inbound/tun[tun-in]', // TUN 入站细节
       'inbound/http[http-in]', // HTTP 入站细节
       'inbound/socks[socks-in]', // SOCKS 入站细节
