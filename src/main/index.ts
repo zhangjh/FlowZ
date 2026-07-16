@@ -15,6 +15,8 @@ import { TrayManager } from './services/TrayManager';
 import { ProxyManager } from './services/ProxyManager';
 import { createSystemProxyManager } from './services/SystemProxyManager';
 import { resourceManager } from './services/ResourceManager';
+import { AutoSelectService } from './services/AutoSelectService';
+import { SpeedTester } from './services/SpeedTester';
 import {
   registerConfigHandlers,
   registerServerHandlers,
@@ -25,6 +27,7 @@ import {
   registerUpdateHandlers,
   registerRulesHandlers,
   registerAutoStartHandlers,
+  registerAutoSelectHandlers,
   setUpdateService,
   setTrayStateCallback,
 } from './ipc/handlers';
@@ -33,7 +36,6 @@ import { UpdateService } from './services/UpdateService';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
-import { getSystemDnsServers } from './utils/dns';
 
 let mainWindow: BrowserWindow | null = null;
 let trayManager: TrayManager | null = null;
@@ -48,6 +50,7 @@ const configManager = new ConfigManager();
 const protocolParser = new ProtocolParser();
 const logManager = new LogManager();
 let proxyManager: ProxyManager | null = null;
+let autoSelectService: AutoSelectService | null = null;
 const systemProxyManager = createSystemProxyManager();
 const updateService = new UpdateService(logManager);
 
@@ -398,6 +401,28 @@ app.whenReady().then(async () => {
   // 初始化 ProxyManager（需要在窗口创建后）
   proxyManager = new ProxyManager(logManager, mainWindow || undefined);
 
+  // 初始化 AutoSelectService
+  autoSelectService = new AutoSelectService(
+    proxyManager,
+    configManager,
+    logManager,
+    ipcEventEmitter
+  );
+
+  // 初始化 SpeedTester（复用同一实例）
+  const speedTester = new SpeedTester();
+
+  // 监听自动选择故障转移事件
+  autoSelectService.on('failover', (data: any) => {
+    logManager.addLog(
+      'info',
+      `Auto-select failover: switched to ${data.server.name} (latency: ${data.latency}ms)`,
+      'Main'
+    );
+    // 更新托盘菜单状态
+    updateTrayMenuState(proxyManager?.getStatus().running ?? false);
+  });
+
   // 监听代理管理器事件，更新托盘状态
   proxyManager.on('error', async (error: Error) => {
     logManager.addLog('error', `Proxy error: ${error.message}`, 'Main');
@@ -439,10 +464,15 @@ app.whenReady().then(async () => {
   registerConfigHandlers(configManager);
   registerServerHandlers(protocolParser, configManager);
   registerLogHandlers(logManager, proxyManager);
-  registerProxyHandlers(proxyManager, systemProxyManager);
+  registerProxyHandlers(proxyManager, systemProxyManager, autoSelectService || undefined, configManager);
   registerVersionHandlers();
   registerAdminHandlers();
   registerRulesHandlers(configManager);
+
+  // 注册自动选择处理器
+  if (autoSelectService) {
+    registerAutoSelectHandlers(autoSelectService, configManager);
+  }
 
   // 注册自启动处理器
   registerAutoStartHandlers();
@@ -604,333 +634,7 @@ app.whenReady().then(async () => {
 
         logManager.addLog('info', `Starting speed test for ${config.servers.length} servers`, 'Main');
 
-        const { isIP } = require('net');
-        const http = require('http');
-        const fs = require('fs/promises');
-        const { spawn } = require('child_process');
-
-        const BASE_PORT = 65401;
-        const TEST_TIMEOUT = 12000;
-        const SINGBOX_STARTUP_TIMEOUT = 20000;
-
-        // 收集 stderr/stdout 用于调试
-        const stderrChunks: string[] = [];
-        const stdoutChunks: string[] = [];
-        const logOutput = (source: string, chunks: string[]) => {
-          if (chunks.length > 0) {
-            const lines = chunks.join('').split('\n').filter(l => l.trim());
-            lines.forEach(l => logManager.addLog('info', `[sing-box ${source}] ${l}`, 'SpeedTest'));
-            chunks.length = 0;
-          }
-        };
-
-        // 为单个服务器生成 sing-box outbound 配置
-        const buildOutbound = (server: typeof config.servers[0], tag: string) => {
-          const protocol = server.protocol.toLowerCase();
-          const outbound: any = {
-            type: protocol,
-            tag,
-            server: server.address,
-            server_port: server.port,
-          };
-
-          if (protocol === 'vless') {
-            outbound.uuid = server.uuid;
-            if (server.flow) outbound.flow = server.flow;
-            outbound.packet_encoding = 'xudp';
-          }
-          if (protocol === 'trojan') {
-            outbound.password = server.password;
-          }
-          if (protocol === 'hysteria2') {
-            outbound.password = server.password;
-            if (server.hysteria2Settings?.upMbps) outbound.up_mbps = server.hysteria2Settings.upMbps;
-            if (server.hysteria2Settings?.downMbps) outbound.down_mbps = server.hysteria2Settings.downMbps;
-            if (server.hysteria2Settings?.obfs?.type && server.hysteria2Settings?.obfs?.password) {
-              outbound.obfs = {
-                type: server.hysteria2Settings.obfs.type,
-                password: server.hysteria2Settings.obfs.password,
-              };
-            }
-            if (server.hysteria2Settings?.network) outbound.network = server.hysteria2Settings.network;
-          }
-
-          // TLS / Reality
-          if (server.security === 'reality' && server.realitySettings) {
-            outbound.tls = {
-              enabled: true,
-              server_name: server.tlsSettings?.serverName || server.address,
-              utls: { enabled: true, fingerprint: server.tlsSettings?.fingerprint || 'chrome' },
-              reality: {
-                enabled: true,
-                public_key: server.realitySettings.publicKey,
-                short_id: server.realitySettings.shortId || '',
-              },
-            };
-          } else if (server.security === 'tls' || server.tlsSettings) {
-            outbound.tls = {
-              enabled: true,
-              server_name: server.tlsSettings?.serverName || server.address,
-              insecure: server.tlsSettings?.allowInsecure || false,
-            };
-            if (protocol !== 'hysteria2') {
-              outbound.tls.utls = {
-                enabled: true,
-                fingerprint: server.tlsSettings?.fingerprint || 'chrome',
-              };
-            }
-            if (server.tlsSettings?.alpn) outbound.tls.alpn = server.tlsSettings.alpn;
-          }
-
-          // 传输层 (WS/gRPC)
-          const network = server.network?.toLowerCase();
-          if (protocol !== 'hysteria2' && network && network !== 'tcp') {
-            outbound.transport = { type: network };
-            if (network === 'ws' && server.wsSettings) {
-              outbound.transport.path = server.wsSettings.path || '/';
-              if (server.wsSettings.headers) outbound.transport.headers = server.wsSettings.headers;
-            }
-            if (network === 'grpc' && server.grpcSettings) {
-              outbound.transport.service_name = server.grpcSettings.serviceName || '';
-            }
-          }
-
-          return outbound;
-        };
-
-        // 构建测试用的 sing-box 配置
-        const servers = config.servers;
-        const inbounds: any[] = [];
-        const outbounds: any[] = [];
-        const routeRules: any[] = [];
-        const serverDomains: string[] = [];
-        const serverIPs: string[] = [];
-
-        servers.forEach((server, i) => {
-          const outboundTag = `proxy-${i}`;
-          const inboundTag = `speed-in-${i}`;
-
-          inbounds.push({
-            type: 'http',
-            tag: inboundTag,
-            listen: '127.0.0.1',
-            listen_port: BASE_PORT + i,
-          });
-
-          outbounds.push(buildOutbound(server, outboundTag));
-
-          routeRules.push({
-            inbound: [inboundTag],
-            outbound: outboundTag,
-          });
-
-          if (isIP(server.address)) {
-            const cidr = isIP(server.address) === 6
-              ? `${server.address}/128`
-              : `${server.address}/32`;
-            if (!serverIPs.includes(cidr)) serverIPs.push(cidr);
-          } else {
-            if (!serverDomains.includes(server.address)) {
-              serverDomains.push(server.address);
-            }
-          }
-        });
-
-        outbounds.push({ type: 'direct', tag: 'direct' });
-        outbounds.push({ type: 'block', tag: 'block' });
-
-        if (serverDomains.length > 0) {
-          routeRules.unshift({ domain: serverDomains, outbound: 'direct' });
-        }
-        if (serverIPs.length > 0) {
-          routeRules.unshift({ ip_cidr: serverIPs, outbound: 'direct' });
-        }
-
-        const systemDnsServers = process.platform === 'linux' ? getSystemDnsServers() : [];
-        for (const dnsIp of systemDnsServers) {
-          const cidr = dnsIp.includes(':') ? `${dnsIp}/128` : `${dnsIp}/32`;
-          routeRules.unshift({ ip_cidr: [cidr], outbound: 'direct' });
-        }
-
-        const dnsServers: any[] = systemDnsServers.length > 0
-          ? systemDnsServers.map(ip => ({ tag: 'dns-local', type: 'udp', server: ip }))
-          : [{ tag: 'dns-local', type: 'local' }];
-
-        const dnsConfig: any = {
-          servers: dnsServers,
-          rules: [] as any[],
-          final: 'dns-local',
-        };
-        if (serverDomains.length > 0) {
-          dnsConfig.rules.push({ domain: serverDomains, server: 'dns-local' });
-        }
-
-        const testConfig = {
-          log: { level: 'info', timestamp: true },
-          dns: dnsConfig,
-          inbounds,
-          outbounds,
-          route: {
-            rules: routeRules,
-            auto_detect_interface: true,
-            default_domain_resolver: 'dns-local',
-            final: 'direct',
-          },
-        };
-
-        // 写入并记录配置摘要
-        const { getUserDataPath } = require('./utils/paths');
-        const userDataPath = getUserDataPath();
-        const testConfigPath = path.join(userDataPath, 'speedtest_config.json');
-        await fs.writeFile(testConfigPath, JSON.stringify(testConfig, null, 2));
-
-        logManager.addLog('info', `Config: ${servers.length} inbounds, ${outbounds.length} outbounds, path=${testConfigPath}`, 'SpeedTest');
-
-        // 验证配置
-        const { execSync } = require('child_process');
-        const singboxPath = resourceManager.getSingBoxPath();
-        try {
-          const checkResult = execSync(`"${singboxPath}" check -c "${testConfigPath}"`, {
-            encoding: 'utf-8',
-            timeout: 10000,
-          });
-          logManager.addLog('info', `Config check passed: ${checkResult.trim()}`, 'SpeedTest');
-        } catch (e: any) {
-          logManager.addLog('error', `Config check FAILED: ${e.stderr || e.message}`, 'SpeedTest');
-          try { await fs.unlink(testConfigPath); } catch { /* ignore */ }
-          if (trayManager) trayManager.updateSpeedTestResults(new Map(), config.servers);
-          return;
-        }
-
-        // 启动测试用 sing-box 进程
-        logManager.addLog('info', `Starting sing-box: "${singboxPath}" run -c "${testConfigPath}"`, 'SpeedTest');
-
-        const testProc = spawn(singboxPath, ['run', '-c', testConfigPath], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-
-        testProc.stdout?.on('data', (chunk: Buffer) => {
-          stdoutChunks.push(chunk.toString());
-        });
-        testProc.stderr?.on('data', (chunk: Buffer) => {
-          stderrChunks.push(chunk.toString());
-        });
-
-        let processExited = false;
-        let exitCode: number | null = null;
-        testProc.on('exit', (code: number | null, signal: string | null) => {
-          processExited = true;
-          exitCode = code;
-          logManager.addLog('info', `sing-box exited code=${code} signal=${signal}`, 'SpeedTest');
-        });
-        testProc.on('error', (err: Error) => {
-          logManager.addLog('error', `sing-box spawn error: ${err.message}`, 'SpeedTest');
-        });
-
-        // 等待 sing-box 就绪
-        const startupOk = await new Promise<boolean>((resolve) => {
-          const startTime = Date.now();
-          const check = () => {
-            if (processExited) {
-              logOutput('stdout', stdoutChunks);
-              logOutput('stderr', stderrChunks);
-              logManager.addLog('error', `sing-box exited before ready (code=${exitCode})`, 'SpeedTest');
-              resolve(false);
-              return;
-            }
-            if (Date.now() - startTime > SINGBOX_STARTUP_TIMEOUT) {
-              logOutput('stdout', stdoutChunks);
-              logOutput('stderr', stderrChunks);
-              logManager.addLog('error', 'sing-box startup timeout', 'SpeedTest');
-              resolve(false);
-              return;
-            }
-            const sock = new (require('net').Socket)();
-            sock.setTimeout(500);
-            sock.on('connect', () => { sock.destroy(); resolve(true); });
-            sock.on('error', () => { sock.destroy(); setTimeout(check, 500); });
-            sock.on('timeout', () => { sock.destroy(); setTimeout(check, 500); });
-            sock.connect(BASE_PORT, '127.0.0.1');
-          };
-          setTimeout(check, 1000);
-        });
-
-        if (!startupOk) {
-          testProc.kill();
-          try { await fs.unlink(testConfigPath); } catch { /* ignore */ }
-          if (trayManager) trayManager.updateSpeedTestResults(new Map(), config.servers);
-          return;
-        }
-
-        logOutput('stdout', stdoutChunks);
-        logManager.addLog('info', 'sing-box started, running tests...', 'SpeedTest');
-
-        // 发起测试请求（带预热，先发一个请求建立连接/DNS缓存，再测第二个）
-        const testUrl = 'http://www.gstatic.com/generate_204';
-        const results = new Map<string, number | null>();
-
-        // 发送单个请求，返回 { ok, latency, statusCode, error }
-        const doOneRequest = (port: number, timeout: number): Promise<{ ok: boolean; latency: number; statusCode?: number; error?: string }> => {
-          return new Promise((resolve) => {
-            const startTime = Date.now();
-            const req = http.request(
-              {
-                hostname: '127.0.0.1',
-                port,
-                path: testUrl,
-                method: 'GET',
-                timeout,
-                headers: { Host: 'www.gstatic.com', 'User-Agent': 'FlowZ-SpeedTest/1.0' },
-              },
-              (res: any) => {
-                const latency = Date.now() - startTime;
-                res.resume();
-                res.on('end', () => resolve({ ok: true, latency, statusCode: res.statusCode }));
-              }
-            );
-            req.on('error', (err: Error) => resolve({ ok: false, latency: Date.now() - startTime, error: err.message }));
-            req.on('timeout', () => { req.destroy(); resolve({ ok: false, latency: Date.now() - startTime, error: 'TIMEOUT' }); });
-            req.end();
-          });
-        };
-
-        const testOneServer = async (server: typeof servers[0], index: number): Promise<void> => {
-          const port = BASE_PORT + index;
-          const label = server.name || server.address;
-
-          // 预热请求：建立 DNS 缓存和连接
-          const warmResult = await doOneRequest(port, TEST_TIMEOUT);
-          if (!warmResult.ok) {
-            logManager.addLog('warn', `${label}: FAILED - ${warmResult.error}`, 'SpeedTest');
-            results.set(server.id, null);
-            return;
-          }
-
-          // 实测请求
-          const measuredResult = await doOneRequest(port, TEST_TIMEOUT);
-          if (measuredResult.ok) {
-            logManager.addLog('info', `${label}: ${measuredResult.latency}ms (HTTP ${measuredResult.statusCode})`, 'SpeedTest');
-            results.set(server.id, measuredResult.latency);
-          } else {
-            logManager.addLog('warn', `${label}: FAILED - ${measuredResult.error}`, 'SpeedTest');
-            results.set(server.id, null);
-          }
-        };
-
-        // 并发测试（每个服务器预热一次后实测）
-        await Promise.all(servers.map((s, i) => testOneServer(s, i)));
-
-        // 收集剩余输出
-        logOutput('stdout', stdoutChunks);
-        logOutput('stderr', stderrChunks);
-
-        // 清理
-        testProc.kill();
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(() => resolve(), 3000);
-          testProc.on('close', () => { clearTimeout(t); resolve(); });
-        });
-        try { await fs.unlink(testConfigPath); } catch { /* ignore */ }
+        const results = await speedTester.testMultipleServersLatency(config.servers);
 
         logManager.addLog('info', 'Speed test completed for all servers', 'Main');
         if (trayManager) trayManager.updateSpeedTestResults(results, config.servers);
@@ -950,6 +654,13 @@ app.whenReady().then(async () => {
   setTimeout(async () => {
     try {
       const config = await configManager.loadConfig();
+
+      // 启动自动选择服务（如果已启用）
+      if (autoSelectService && config.autoSelect?.enabled) {
+        autoSelectService.start(config);
+        logManager.addLog('info', 'Auto-select service started', 'Main');
+      }
+
       // 检查是否启用了启动时自动连接
       if (config.autoConnect && config.selectedServerId) {
         logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');

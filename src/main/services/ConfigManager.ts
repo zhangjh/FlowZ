@@ -263,6 +263,29 @@ export class ConfigManager implements IConfigManager {
     if (!['debug', 'info', 'warn', 'error', 'fatal'].includes(config.logLevel)) {
       throw new Error('logLevel must be debug, info, warn, error, or fatal');
     }
+
+    // 验证 autoSelect 配置（可选字段，兼容旧配置）
+    if (config.autoSelect === undefined) {
+      config.autoSelect = {
+        enabled: false,
+        mode: 'latency',
+        interval: 60,
+        failoverEnabled: true,
+      };
+    } else {
+      if (typeof config.autoSelect.enabled !== 'boolean') {
+        throw new Error('autoSelect.enabled must be a boolean');
+      }
+      if (!['latency', 'speed'].includes(config.autoSelect.mode)) {
+        throw new Error('autoSelect.mode must be latency or speed');
+      }
+      if (typeof config.autoSelect.interval !== 'number' || config.autoSelect.interval < 10) {
+        throw new Error('autoSelect.interval must be a number >= 10');
+      }
+      if (typeof config.autoSelect.failoverEnabled !== 'boolean') {
+        throw new Error('autoSelect.failoverEnabled must be a boolean');
+      }
+    }
   }
 
   /**
@@ -288,6 +311,12 @@ export class ConfigManager implements IConfigManager {
       socksPort: 65534,
       httpPort: 65533,
       logLevel: 'info',
+      autoSelect: {
+        enabled: false,
+        mode: 'latency',
+        interval: 60,
+        failoverEnabled: true,
+      },
     };
   }
 }

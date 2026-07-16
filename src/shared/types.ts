@@ -132,6 +132,37 @@ export interface TunModeConfig {
 }
 
 // ============================================================================
+// 自动选择配置
+// ============================================================================
+
+export type AutoSelectMode = 'latency' | 'speed';
+
+export interface AutoSelectConfig {
+  enabled: boolean;
+  mode: AutoSelectMode;
+  interval: number;
+  failoverEnabled: boolean;
+}
+
+// 服务器测速结果
+export interface ServerSpeedResult {
+  serverId: string;
+  latency: number | null;
+  downloadSpeed: number | null;
+  lastTestTime: string;
+  error?: string;
+}
+
+// 自动选择状态
+export interface AutoSelectStatus {
+  enabled: boolean;
+  currentBestServerId: string | null;
+  lastTestResults: ServerSpeedResult[];
+  lastTestTime: string | null;
+  failoverCount: number;
+}
+
+// ============================================================================
 // 用户配置
 // ============================================================================
 
@@ -162,6 +193,9 @@ export interface UserConfig {
 
   // 日志设置
   logLevel: LogLevel;
+
+  // 自动选择配置
+  autoSelect: AutoSelectConfig;
 }
 
 // ============================================================================

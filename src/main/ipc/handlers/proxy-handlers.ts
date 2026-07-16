@@ -9,6 +9,9 @@ import type { UserConfig, ProxyStatus } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { ProxyManager } from '../../services/ProxyManager';
 import { ISystemProxyManager } from '../../services/SystemProxyManager';
+import type { AutoSelectService } from '../../services/AutoSelectService';
+import type { ConfigManager } from '../../services/ConfigManager';
+import { ipcEventEmitter } from '../../ipc/ipc-events';
 
 /**
  * 托盘状态更新回调
@@ -29,35 +32,68 @@ export function setTrayStateCallback(callback: TrayStateUpdateCallback): void {
  */
 export function registerProxyHandlers(
   proxyManager: ProxyManager,
-  systemProxyManager?: ISystemProxyManager
+  systemProxyManager?: ISystemProxyManager,
+  autoSelectService?: AutoSelectService,
+  configManager?: ConfigManager
 ): void {
   // 启动代理
   registerIpcHandler<UserConfig, void>(
     IPC_CHANNELS.PROXY_START,
     async (_event: IpcMainInvokeEvent, config: UserConfig) => {
       console.log('[Proxy Handlers] PROXY_START received config:', JSON.stringify(config, null, 2));
-      console.log('[Proxy Handlers] config type:', typeof config);
-      console.log('[Proxy Handlers] config selectedServerId:', config?.selectedServerId);
-      console.log('[Proxy Handlers] config proxyModeType:', config?.proxyModeType);
-      console.log('[Proxy Handlers] config proxyMode:', config?.proxyMode);
 
       if (!config) {
         throw new Error('配置参数未传递');
       }
 
+      let finalConfig = config;
+
+      // 自动选择模式：启动前先测速选最佳服务器
+      if (autoSelectService && config.autoSelect?.enabled && config.servers.length > 0) {
+        console.log('[Proxy Handlers] Auto-select enabled, testing servers before start...');
+        try {
+          const results = await autoSelectService.testAllServers(config.servers);
+
+          // 找到延迟最低的服务器
+          const available = results.filter((r) => r.latency !== null);
+          if (available.length > 0) {
+            const best = available.reduce((a, b) => (a.latency! < b.latency! ? a : b));
+            if (best.serverId !== config.selectedServerId) {
+              console.log(`[Proxy Handlers] Auto-select: switching from ${config.selectedServerId} to ${best.serverId} (latency: ${best.latency}ms)`);
+              finalConfig = { ...config, selectedServerId: best.serverId };
+
+              // 保存新配置
+              if (configManager) {
+                await configManager.saveConfig(finalConfig);
+              }
+
+              // 通知渲染进程配置已变更
+              ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CONFIG_CHANGED, { newValue: finalConfig });
+            }
+          }
+        } catch (error) {
+          console.error('[Proxy Handlers] Auto-select test failed, using original config:', error);
+        }
+      }
+
       // 启动 sing-box 进程
-      await proxyManager.start(config);
+      await proxyManager.start(finalConfig);
 
       // 系统代理模式：设置系统代理
-      const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+      const modeType = (finalConfig.proxyModeType || 'systemProxy').toLowerCase();
       if (modeType === 'systemproxy' && systemProxyManager) {
         console.log('[Proxy Handlers] Setting system proxy...');
         await systemProxyManager.enableProxy(
           '127.0.0.1',
-          config.httpPort || 65533,
-          config.socksPort || 65534
+          finalConfig.httpPort || 65533,
+          finalConfig.socksPort || 65534
         );
         console.log('[Proxy Handlers] System proxy enabled');
+      }
+
+      // 启动自动选择健康检查（后续持续监控）
+      if (autoSelectService) {
+        autoSelectService.updateConfig(finalConfig);
       }
 
       // 更新托盘状态
@@ -69,6 +105,11 @@ export function registerProxyHandlers(
 
   // 停止代理
   registerIpcHandler<void, void>(IPC_CHANNELS.PROXY_STOP, async (_event: IpcMainInvokeEvent) => {
+    // 停止自动选择服务
+    if (autoSelectService) {
+      autoSelectService.stop();
+    }
+
     // 先禁用系统代理（不管当前状态如何，都尝试禁用）
     if (systemProxyManager) {
       try {

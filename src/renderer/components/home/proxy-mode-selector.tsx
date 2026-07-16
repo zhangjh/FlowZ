@@ -11,6 +11,7 @@ export function ProxyModeSelector() {
   const connectionStatus = useAppStore((state) => state.connectionStatus);
   const updateProxyMode = useAppStore((state) => state.updateProxyMode);
   const isLoading = useAppStore((state) => state.isLoading);
+  const proxyPhase = useAppStore((state) => state.proxyPhase);
   const startProxy = useAppStore((state) => state.startProxy);
   const stopProxy = useAppStore((state) => state.stopProxy);
 
@@ -114,7 +115,7 @@ export function ProxyModeSelector() {
             {isLoading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                {isConnected ? '断开中...' : '连接中...'}
+                {proxyPhase === 'testing' ? '测速中...' : isConnected ? '断开中...' : '连接中...'}
               </>
             ) : isConnected ? (
               <>

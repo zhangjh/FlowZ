@@ -11,6 +11,9 @@ export function ServerPage() {
   const config = useAppStore((state) => state.config);
   const saveConfig = useAppStore((state) => state.saveConfig);
   const deleteServer = useAppStore((state) => state.deleteServer);
+  const testAllServers = useAppStore((state) => state.testAllServers);
+  const speedTestResults = useAppStore((state) => state.speedTestResults);
+  const isSpeedTesting = useAppStore((state) => state.isSpeedTesting);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerConfigWithId | undefined>();
 
@@ -117,23 +120,37 @@ export function ServerPage() {
     toast.success('服务器导入成功');
   };
 
+  const handleSpeedTest = async () => {
+    try {
+      await testAllServers();
+      toast.success('服务器测试完成');
+    } catch (error) {
+      toast.error('测试失败', {
+        description: error instanceof Error ? error.message : '测试服务器时发生错误',
+      });
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold">服务器配置</h2>
         <p className="text-muted-foreground mt-1">
-          管理您的代理服务器配置，支持 VLESS 和 Trojan 协议
+          管理您的代理服务器配置，支持 VLESS、Trojan 和 Hysteria2 协议
         </p>
       </div>
 
       <ServerList
         servers={servers}
         selectedServerId={selectedServerId ?? undefined}
+        speedTestResults={speedTestResults}
+        isSpeedTesting={isSpeedTesting}
         onAddServer={handleAddServer}
         onEditServer={handleEditServer}
         onDeleteServer={handleDeleteServer}
         onSelectServer={handleSelectServer}
         onImportSuccess={handleImportSuccess}
+        onSpeedTest={handleSpeedTest}
       />
 
       <ServerConfigDialog

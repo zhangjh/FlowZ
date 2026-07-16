@@ -5,6 +5,7 @@ import {
   AboutSettings,
   ProxyModeSettings,
 } from '@/components/settings';
+import { AutoSelectSettings } from '@/components/settings/auto-select-settings';
 
 export function SettingsPage() {
   return (
@@ -17,6 +18,7 @@ export function SettingsPage() {
       <div className="space-y-6">
         <GeneralSettings />
         <ProxyModeSettings />
+        <AutoSelectSettings />
         <AppearanceSettings />
         <AdvancedSettings />
         <AboutSettings />

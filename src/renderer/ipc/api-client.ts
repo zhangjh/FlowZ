@@ -15,6 +15,8 @@ import type {
   DomainRule,
   AutoStartStatus,
   ConnectionStateInfo,
+  AutoSelectStatus,
+  ServerSpeedResult,
 } from '../../shared/types';
 
 /**
@@ -473,6 +475,61 @@ export const updateApi = {
 };
 
 /**
+ * 自动选择 API
+ */
+export const autoSelectApi = {
+  /**
+   * 获取自动选择状态
+   */
+  async getStatus(): Promise<AutoSelectStatus> {
+    return ipcClient.invoke(IPC_CHANNELS.AUTO_SELECT_GET_STATUS);
+  },
+
+  /**
+   * 测试服务器速度
+   */
+  async testServers(serverIds?: string[]): Promise<ServerSpeedResult[]> {
+    return ipcClient.invoke(IPC_CHANNELS.AUTO_SELECT_TEST_SERVERS, { serverIds });
+  },
+
+  /**
+   * 获取最佳服务器
+   */
+  async getBestServer(): Promise<ServerConfig | null> {
+    return ipcClient.invoke(IPC_CHANNELS.AUTO_SELECT_GET_BEST_SERVER);
+  },
+
+  /**
+   * 立即触发故障转移（检测到请求失败时调用）
+   */
+  async triggerFailover(): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.AUTO_SELECT_TRIGGER_FAILOVER);
+  },
+
+  /**
+   * 监听故障转移事件
+   */
+  onFailover(
+    listener: (data: {
+      from: string;
+      to: string;
+      server: ServerConfig;
+      latency: number;
+      failoverCount: number;
+    }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_AUTO_SELECT_FAILOVER, listener);
+  },
+
+  /**
+   * 监听测试完成事件
+   */
+  onTestCompleted(listener: (results: ServerSpeedResult[]) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_AUTO_SELECT_TEST_COMPLETED, listener);
+  },
+};
+
+/**
  * 统一的 API 客户端
  */
 export const api = {
@@ -488,6 +545,7 @@ export const api = {
   version: versionApi,
   admin: adminApi,
   update: updateApi,
+  autoSelect: autoSelectApi,
 };
 
 /**

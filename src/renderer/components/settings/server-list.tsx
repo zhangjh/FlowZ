@@ -19,31 +19,38 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { Plus, Edit, Trash2, Server, ChevronDown, Link, Share2 } from 'lucide-react';
+import { Plus, Edit, Trash2, Server, ChevronDown, Link, Share2, Zap } from 'lucide-react';
 import { ImportUrlDialog } from './import-url-dialog';
 import { ShareServerDialog } from './share-server-dialog';
-import type { ServerConfig } from '@/bridge/types';
+import { ServerSpeedBadge } from '@/components/server/server-speed-badge';
+import type { ServerConfig, ServerSpeedResult } from '@/bridge/types';
 
 type ServerConfigWithId = ServerConfig;
 
 interface ServerListProps {
   servers: ServerConfigWithId[];
   selectedServerId?: string;
+  speedTestResults?: ServerSpeedResult[];
+  isSpeedTesting?: boolean;
   onAddServer: () => void;
   onEditServer: (server: ServerConfigWithId) => void;
   onDeleteServer: (serverId: string) => void;
   onSelectServer: (serverId: string) => void;
   onImportSuccess?: () => void;
+  onSpeedTest?: () => void;
 }
 
 export function ServerList({
   servers,
   selectedServerId,
+  speedTestResults = [],
+  isSpeedTesting = false,
   onAddServer,
   onEditServer,
   onDeleteServer,
   onSelectServer,
   onImportSuccess,
+  onSpeedTest,
 }: ServerListProps) {
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
   const [sharingServer, setSharingServer] = useState<ServerConfigWithId | null>(null);
@@ -68,6 +75,10 @@ export function ServerList({
     return protocol === 'Vless' ? 'default' : 'secondary';
   };
 
+  const getSpeedResult = (serverId: string): ServerSpeedResult | undefined => {
+    return speedTestResults.find((r) => r.serverId === serverId);
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -75,25 +86,38 @@ export function ServerList({
           <h3 className="text-lg font-medium">服务器列表</h3>
           <p className="text-sm text-muted-foreground">管理您的代理服务器配置</p>
         </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button className="flex items-center gap-2">
-              <Plus className="h-4 w-4" />
-              添加服务器
-              <ChevronDown className="h-4 w-4" />
+        <div className="flex items-center gap-2">
+          {onSpeedTest && servers.length > 0 && (
+            <Button
+              variant="outline"
+              onClick={onSpeedTest}
+              disabled={isSpeedTesting}
+              className="flex items-center gap-2"
+            >
+              <Zap className={`h-4 w-4 ${isSpeedTesting ? 'animate-pulse' : ''}`} />
+              {isSpeedTesting ? '测试中...' : '测速'}
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={onAddServer}>
-              <Plus className="h-4 w-4 mr-2" />
-              手动添加
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => setIsImportDialogOpen(true)}>
-              <Link className="h-4 w-4 mr-2" />
-              从URL导入
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button className="flex items-center gap-2">
+                <Plus className="h-4 w-4" />
+                添加服务器
+                <ChevronDown className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={onAddServer}>
+                <Plus className="h-4 w-4 mr-2" />
+                手动添加
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setIsImportDialogOpen(true)}>
+                <Link className="h-4 w-4 mr-2" />
+                从URL导入
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </div>
 
       {servers.length === 0 ? (
@@ -144,6 +168,10 @@ export function ServerList({
                         当前选中
                       </Badge>
                     )}
+                    <ServerSpeedBadge
+                      result={getSpeedResult(server.id)}
+                      isLoading={isSpeedTesting}
+                    />
                   </div>
                   <div className="flex items-center gap-2">
                     <Button

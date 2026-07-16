@@ -65,6 +65,12 @@ export const IPC_CHANNELS = {
   // Shell 操作
   SHELL_OPEN_EXTERNAL: 'shell:openExternal',
 
+  // 自动选择
+  AUTO_SELECT_GET_STATUS: 'autoSelect:getStatus',
+  AUTO_SELECT_TEST_SERVERS: 'autoSelect:testServers',
+  AUTO_SELECT_GET_BEST_SERVER: 'autoSelect:getBestServer',
+  AUTO_SELECT_TRIGGER_FAILOVER: 'autoSelect:triggerFailover',
+
   // 更新事件 (主进程 -> 渲染进程)
   EVENT_UPDATE_PROGRESS: 'update:progress',
 
@@ -75,10 +81,14 @@ export const IPC_CHANNELS = {
   EVENT_PROXY_STARTED: 'event:proxyStarted',
   EVENT_PROXY_STOPPED: 'event:proxyStopped',
   EVENT_PROXY_ERROR: 'event:proxyError',
+  EVENT_PROXY_TESTING_STARTED: 'event:proxyTestingStarted',
+  EVENT_PROXY_TESTING_COMPLETED: 'event:proxyTestingCompleted',
   EVENT_CONFIG_CHANGED: 'event:configChanged',
   EVENT_LOG_RECEIVED: 'event:logReceived',
   EVENT_STATS_UPDATED: 'event:statsUpdated',
   EVENT_CONNECTION_STATE_CHANGED: 'event:connectionStateChanged',
+  EVENT_AUTO_SELECT_FAILOVER: 'event:autoSelectFailover',
+  EVENT_AUTO_SELECT_TEST_COMPLETED: 'event:autoSelectTestCompleted',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

@@ -11,6 +11,9 @@ export type {
   TrafficStats,
   LogEntry,
   ApiResponse,
+  AutoSelectStatus,
+  ServerSpeedResult,
+  AutoSelectConfig,
 } from '../../shared/types';
 export type ProxyMode = 'global' | 'smart' | 'direct';
 export type ProxyModeType = 'systemProxy' | 'tun';

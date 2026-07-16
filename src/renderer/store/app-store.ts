@@ -3,11 +3,14 @@
  */
 
 import { create } from 'zustand';
-import type { UserConfig, DomainRule, TrafficStats } from '../../shared/types';
+import type { UserConfig, DomainRule, TrafficStats, AutoSelectStatus, ServerSpeedResult } from '../../shared/types';
 import { api } from '../ipc';
 
 // 兼容旧的类型定义
 type ProxyMode = UserConfig['proxyMode'];
+
+// 连接监控定时器
+let connectionMonitorTimer: ReturnType<typeof setInterval> | null = null;
 
 interface ConnectionStatus {
   proxyCore: {
@@ -28,6 +31,7 @@ interface AppState {
   currentView: string;
   isLoading: boolean;
   error: string | null;
+  proxyPhase: 'idle' | 'testing' | 'connecting';
 
   // Connection State
   connectionStatus: ConnectionStatus | null;
@@ -38,14 +42,24 @@ interface AppState {
   // Statistics
   stats: TrafficStats | null;
 
+  // Auto-select State
+  autoSelectStatus: AutoSelectStatus | null;
+  speedTestResults: ServerSpeedResult[];
+  isSpeedTesting: boolean;
+
   // Actions
   setCurrentView: (view: string) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+  setProxyPhase: (phase: 'idle' | 'testing' | 'connecting') => void;
 
   // Proxy Control Actions
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
+
+  // Connection Monitor Actions
+  startConnectionMonitor: () => void;
+  stopConnectionMonitor: () => void;
 
   // Configuration Actions
   loadConfig: () => Promise<void>;
@@ -65,6 +79,11 @@ interface AppState {
   addCustomRule: (rule: DomainRule) => Promise<void>;
   updateCustomRule: (rule: DomainRule) => Promise<void>;
   deleteCustomRule: (ruleId: string) => Promise<void>;
+
+  // Auto-select Actions
+  loadAutoSelectStatus: () => Promise<void>;
+  testAllServers: (serverIds?: string[]) => Promise<ServerSpeedResult[]>;
+  updateAutoSelectConfig: (autoSelect: UserConfig['autoSelect']) => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -72,18 +91,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentView: 'home',
   isLoading: false,
   error: null,
+  proxyPhase: 'idle',
   connectionStatus: null,
   config: null,
   stats: null,
+  autoSelectStatus: null,
+  speedTestResults: [],
+  isSpeedTesting: false,
 
   // UI Actions
   setCurrentView: (view) => set({ currentView: view }),
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
+  setProxyPhase: (phase) => set({ proxyPhase: phase }),
 
   // Proxy Control Actions
   startProxy: async () => {
-    set({ isLoading: true, error: null });
+    set({ isLoading: true, error: null, proxyPhase: 'testing' });
     try {
       // 获取当前配置
       const currentConfig = get().config;
@@ -106,6 +130,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       await api.proxy.start(currentConfig);
+      // 测试完成，进入连接阶段
+      set({ proxyPhase: 'connecting' });
       // 启动成功后不立即设置 isLoading = false，而是等待状态轮询完成
 
       // Poll connection status until connected or timeout
@@ -136,16 +162,26 @@ export const useAppStore = create<AppState>((set, get) => ({
           console.log('[StartProxy] Connection successful!', { mode: status?.proxyModeType });
           // Ensure final status update before completing
           await get().refreshConnectionStatus();
-          set({ isLoading: false });
+          set({ isLoading: false, proxyPhase: 'idle' });
+          // 启动连接监控（自动选择模式下检测故障并触发转移）
+          get().startConnectionMonitor();
           return;
         }
 
         // Check for proxy core errors
         if (status?.proxyCore?.error) {
           console.log('[StartProxy] Proxy core error detected:', status.proxyCore.error);
+          // 自动选择模式下，触发立即故障转移
+          if (get().config?.autoSelect?.enabled) {
+            console.log('[StartProxy] Auto-select enabled, triggering immediate failover...');
+            api.autoSelect.triggerFailover().catch((err) => {
+              console.error('[StartProxy] Failover trigger failed:', err);
+            });
+          }
           set({
             error: status.proxyCore.error,
             isLoading: false,
+            proxyPhase: 'idle',
           });
           return;
         }
@@ -153,9 +189,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         // Check if proxy core failed to start (not running and no error means startup failed)
         if (attempts > 3 && !status?.proxyCore?.running) {
           console.log('[StartProxy] Proxy core failed to start');
+          // 自动选择模式下，触发立即故障转移
+          if (get().config?.autoSelect?.enabled) {
+            console.log('[StartProxy] Auto-select enabled, triggering immediate failover...');
+            api.autoSelect.triggerFailover().catch((err) => {
+              console.error('[StartProxy] Failover trigger failed:', err);
+            });
+          }
           set({
             error: 'sing-box 启动失败：进程无法正常启动，请检查服务器配置',
             isLoading: false,
+            proxyPhase: 'idle',
           });
           return;
         }
@@ -166,6 +210,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           set({
             error: '连接超时：无法在预期时间内建立连接，请检查服务器配置',
             isLoading: false,
+            proxyPhase: 'idle',
           });
           return;
         }
@@ -177,14 +222,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Start polling immediately
       await pollStatus();
     } catch (error) {
-      set({ error: String(error), isLoading: false });
+      set({ error: String(error), isLoading: false, proxyPhase: 'idle' });
       // Refresh status to ensure UI reflects actual state
       await get().refreshConnectionStatus();
     }
   },
 
   stopProxy: async () => {
-    set({ isLoading: true, error: null });
+    set({ isLoading: true, error: null, proxyPhase: 'idle' });
+    // 停止连接监控
+    get().stopConnectionMonitor();
     try {
       await api.proxy.stop();
       // Refresh status after stopping
@@ -192,7 +239,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (error) {
       set({ error: String(error) });
     } finally {
-      set({ isLoading: false });
+      set({ isLoading: false, proxyPhase: 'idle' });
+    }
+  },
+
+  // Connection Monitor - 检测到故障时立即触发故障转移
+  startConnectionMonitor: () => {
+    // 先停止已有的监控
+    get().stopConnectionMonitor();
+
+    // 每 10 秒检查一次连接状态
+    connectionMonitorTimer = setInterval(async () => {
+      const state = get();
+      // 只在自动选择启用且代理已连接时监控
+      if (!state.config?.autoSelect?.enabled) return;
+
+      const status = state.connectionStatus;
+      if (!status?.proxyCore?.running) return;
+
+      // 检测到错误，触发立即故障转移
+      if (status.proxyCore?.error) {
+        console.log('[ConnectionMonitor] Error detected:', status.proxyCore.error);
+        api.autoSelect.triggerFailover().catch((err) => {
+          console.error('[ConnectionMonitor] Failover trigger failed:', err);
+        });
+      }
+    }, 10000);
+  },
+
+  stopConnectionMonitor: () => {
+    if (connectionMonitorTimer) {
+      clearInterval(connectionMonitorTimer);
+      connectionMonitorTimer = null;
     }
   },
 
@@ -400,6 +478,49 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ error: String(error) });
     } finally {
       set({ isLoading: false });
+    }
+  },
+
+  // Auto-select Actions
+  loadAutoSelectStatus: async () => {
+    try {
+      const status = await api.autoSelect.getStatus();
+      set({ autoSelectStatus: status });
+    } catch (error) {
+      console.error('Failed to load auto-select status:', error);
+    }
+  },
+
+  testAllServers: async (serverIds?: string[]) => {
+    set({ isSpeedTesting: true, error: null });
+    try {
+      const results = await api.autoSelect.testServers(serverIds);
+      set({ speedTestResults: results });
+      // Also refresh auto-select status
+      await get().loadAutoSelectStatus();
+      return results;
+    } catch (error) {
+      set({ error: String(error) });
+      return [];
+    } finally {
+      set({ isSpeedTesting: false });
+    }
+  },
+
+  updateAutoSelectConfig: async (autoSelect) => {
+    const currentConfig = get().config;
+    if (!currentConfig) return;
+
+    try {
+      const updatedConfig = {
+        ...currentConfig,
+        autoSelect,
+      };
+      await get().saveConfig(updatedConfig);
+      // Refresh auto-select status
+      await get().loadAutoSelectStatus();
+    } catch (error) {
+      set({ error: String(error) });
     }
   },
 }));
