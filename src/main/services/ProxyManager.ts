@@ -3299,6 +3299,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 检查是否为内网IP的直连连接（这些太频繁，需要过滤）
     if (lowerLine.includes('outbound/direct')) {
+      // 先过滤无信息量的 UDP 广播包日志（这些也包含 outbound/direct）
+      if (lowerLine.includes('outbound packet connection')) {
+        return true; // 过滤无信息量的 UDP 广播包
+      }
       // 检查是否连接到私有IP地址
       for (const pattern of PRIVATE_IP_PATTERNS) {
         if (pattern.test(line)) {
