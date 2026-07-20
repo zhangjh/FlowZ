@@ -1,15 +1,24 @@
-import { useEffect, useRef, useState, useCallback, useLayoutEffect } from 'react';
+import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAppStore } from '@/store/app-store';
-import { Trash2, ArrowDown, ArrowDownToLine } from 'lucide-react';
+import { Trash2, ArrowDown, ArrowDownToLine, Filter } from 'lucide-react';
 import { getLogs, clearLogs, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
-import type { LogEntry } from '@/bridge/types';
+import type { LogEntry, LogLevel } from '@/bridge/types';
 
 const LOG_ENTRY_HEIGHT = 20;
 const MAX_LOGS = 500;
+const LOG_LEVELS: { value: LogLevel | 'all'; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'fatal', label: 'FATAL' },
+  { value: 'error', label: 'ERROR' },
+  { value: 'warn', label: 'WARN' },
+  { value: 'info', label: 'INFO' },
+  { value: 'debug', label: 'DEBUG' },
+];
 
 function LogRow({ log }: { log: LogEntry }) {
   const timestamp = new Date(log.timestamp).toLocaleTimeString('zh-CN');
@@ -37,16 +46,22 @@ function LogRow({ log }: { log: LogEntry }) {
 export function RealTimeLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isAutoScroll, setIsAutoScroll] = useState(false);
+  const [levelFilter, setLevelFilter] = useState<LogLevel | 'all'>('all');
   const isAutoScrollRef = useRef(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const connectionStatus = useAppStore((state) => state.connectionStatus);
+
+  const filteredLogs = useMemo(() => {
+    if (levelFilter === 'all') return logs;
+    return logs.filter((log) => log.level === levelFilter);
+  }, [logs, levelFilter]);
 
   const getScrollElement = useCallback((): HTMLElement | null => {
     return scrollAreaRef.current?.querySelector('[data-radix-scroll-area-viewport]') ?? null;
   }, []);
 
   const virtualizer = useVirtualizer({
-    count: logs.length,
+    count: filteredLogs.length,
     getScrollElement,
     estimateSize: () => LOG_ENTRY_HEIGHT,
     overscan: 10,
@@ -80,12 +95,12 @@ export function RealTimeLogs() {
   const prevTotalSize = useRef(0);
   useLayoutEffect(() => {
     const el = getScrollElement();
-    if (!el || logs.length === 0) return;
+    if (!el || filteredLogs.length === 0) return;
 
     if (isAutoScrollRef.current) {
       el.scrollTop = el.scrollHeight;
     } else {
-      const totalSize = logs.length * LOG_ENTRY_HEIGHT;
+      const totalSize = filteredLogs.length * LOG_ENTRY_HEIGHT;
       const removed = totalSize - prevTotalSize.current;
       if (removed > 0) {
         const overflow = totalSize - el.scrollTop - el.clientHeight;
@@ -94,8 +109,8 @@ export function RealTimeLogs() {
         }
       }
     }
-    prevTotalSize.current = logs.length * LOG_ENTRY_HEIGHT;
-  }, [logs, getScrollElement]);
+    prevTotalSize.current = filteredLogs.length * LOG_ENTRY_HEIGHT;
+  }, [filteredLogs, getScrollElement]);
 
   const handleToggleAutoScroll = () => {
     const next = !isAutoScrollRef.current;
@@ -127,6 +142,19 @@ export function RealTimeLogs() {
         <div className="flex items-center justify-between">
           <CardTitle>实时日志</CardTitle>
           <div className="flex items-center gap-2">
+            <Select value={levelFilter} onValueChange={(v) => setLevelFilter(v as LogLevel | 'all')}>
+              <SelectTrigger className="w-[110px] h-8 text-xs">
+                <Filter className="h-3 w-3 mr-1" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LOG_LEVELS.map((level) => (
+                  <SelectItem key={level.value} value={level.value} className="text-xs">
+                    {level.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Button
               variant={isAutoScroll ? 'default' : 'outline'}
               size="sm"
@@ -152,7 +180,7 @@ export function RealTimeLogs() {
           ref={scrollAreaRef}
           className="h-64 w-full rounded border bg-muted/30"
         >
-          {logs.length === 0 ? (
+          {filteredLogs.length === 0 ? (
             <div className="flex items-center justify-center h-full text-muted-foreground text-sm p-3">
               {connectionStatus?.proxyCore?.running ? '等待日志输出...' : '请先启动代理服务'}
             </div>
@@ -176,7 +204,7 @@ export function RealTimeLogs() {
                     transform: `translateY(${virtualItem.start}px)`,
                   }}
                 >
-                  <LogRow log={logs[virtualItem.index]} />
+                  <LogRow log={filteredLogs[virtualItem.index]} />
                 </div>
               ))}
             </div>

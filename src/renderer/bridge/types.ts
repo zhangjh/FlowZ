@@ -10,6 +10,7 @@ export type {
   ProxyStatus,
   TrafficStats,
   LogEntry,
+  LogLevel,
   ApiResponse,
   AutoSelectStatus,
   ServerSpeedResult,

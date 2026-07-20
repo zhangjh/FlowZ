@@ -962,9 +962,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const dnsServers: SingBoxDnsServer[] = [];
 
-    if (useExplicitDns) {
-      // Windows/Linux 上使用检测到的上游 DNS 服务器，直接发送 DNS 查询
-      // 配合路由规则中的 DNS IP 直连规则，避免 TUN 拦截导致 DNS 死循环
+    if (isTunMode && useExplicitDns) {
+      // TUN 模式：必须使用 type:'udp' + 显式 DNS 服务器，避免 DNS 死循环
+      // 原因：TUN 会拦截所有网络流量，如果使用 type:'local'（系统 DNS 解析器），
+      // DNS 查询会经过 TUN → 被 hijack-dns 捕获 → 再次查询 → 死循环
+      // 使用 type:'udp' 直接发送 DNS 查询到上游服务器，配合 route_exclude_address 绕过 TUN
       for (const server of systemDnsServers) {
         dnsServers.push({
           tag: 'dns-local',
@@ -974,6 +976,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         break;
       }
     } else {
+      // 系统代理模式：使用 OS 本地 DNS 解析器（type:'local'）
+      // 比 type:'udp' + 显式 DNS 服务器更可靠，原因：
+      // - Windows: 通过 DNS Client Service API 解析，正确处理企业内网 DNS、VPN DNS、
+      //   多网卡 DNS 路由等复杂场景，与浏览器等应用使用完全相同的 DNS 解析路径
+      // - macOS/Linux: 使用系统解析器（/etc/resolv.conf 等）
+      // 系统代理模式下不存在 TUN DNS 死循环问题，可以安全使用 type:'local'
       dnsServers.push({
         tag: 'dns-local',
         type: 'local',
