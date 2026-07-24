@@ -550,9 +550,8 @@ app.whenReady().then(async () => {
         const config = await configManager.loadConfig();
         config.selectedServerId = serverId;
         await configManager.saveConfig(config);
+        mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
         logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
-
-        // saveConfig 已触发 CONFIG_CHANGED，自动处理热更新或重启
 
         // 更新托盘菜单
         updateTrayMenuState(proxyManager?.getStatus().running ?? false);
@@ -569,9 +568,8 @@ app.whenReady().then(async () => {
         const config = await configManager.loadConfig();
         config.proxyMode = mode;
         await configManager.saveConfig(config);
+        mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
         logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
-
-        // saveConfig 已触发 CONFIG_CHANGED，自动处理重启
 
         // 更新托盘菜单
         updateTrayMenuState(proxyManager?.getStatus().running ?? false);

@@ -172,6 +172,10 @@ interface SingBoxOutbound {
   };
   // DNS resolver for outbound server domain
   domain_resolver?: string;
+  // Selector
+  outbounds?: string[];
+  default?: string;
+  interrupt_exist_connections?: boolean;
 }
 
 interface SingBoxRouteRule {
@@ -369,6 +373,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         this.logToManager('warn', `启动失败，正在进行第 ${attempt} 次重试: ${error.message}`);
       },
     });
+
+    try {
+      await this.updateClashApi('/proxies/proxy', {
+        name: this.getServerOutboundTag(selectedServer.id),
+      });
+      await this.updateModeSelectors(config.proxyMode);
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
   }
 
   /**
@@ -729,80 +743,86 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 判断是否可以通过热更新应用配置变更
-   * 仅当代理正在运行时才允许热更新
-   * 系统代理模式和 TUN 模式均支持（clash_api 绑定在 127.0.0.1，localhost 连接不受 TUN 影响）
-   *
-   * 支持热更新的变更：服务器切换、模式切换（global/smart/direct）、自定义规则变更
-   * 不支持热更新的变更：proxyModeType（TUN ↔ 系统代理）、端口、TUN 配置
+
+  * 判断配置变更是否仅包含运行时可切换的代理模式和服务器
    */
   canHotReload(newConfig: UserConfig): boolean {
-    if (!this.currentConfig || !this.singboxProcess) {
+    if (!this.currentConfig || !this.getStatus().running) {
       return false;
     }
 
-    // 以下变更影响底层基础设施，需要重启：
-    // - proxyModeType（TUN ↔ 系统代理）
-    // - socksPort / httpPort（inbound 监听端口）
-    // - tunConfig（TUN 接口参数）
-    if (
-      this.currentConfig.proxyModeType !== newConfig.proxyModeType ||
-      this.currentConfig.socksPort !== newConfig.socksPort ||
-      this.currentConfig.httpPort !== newConfig.httpPort
-    ) {
-      return false;
-    }
+    const currentStaticConfig = JSON.stringify({
+      ...this.currentConfig,
+      proxyMode: 'smart',
+      selectedServerId: null,
+    });
+    const newStaticConfig = JSON.stringify({
+      ...newConfig,
+      proxyMode: 'smart',
+      selectedServerId: null,
+    });
 
-    // TUN 配置变更需要重启
-    if (newConfig.proxyModeType === 'tun') {
-      const oldTun = this.currentConfig.tunConfig;
-      const newTun = newConfig.tunConfig;
-      if (
-        oldTun.mtu !== newTun.mtu ||
-        oldTun.stack !== newTun.stack ||
-        oldTun.autoRoute !== newTun.autoRoute ||
-        oldTun.strictRoute !== newTun.strictRoute
-      ) {
-        return false;
-      }
-    }
-
-    // 其他变更（服务器、模式、规则）均可通过 clash_api 热更新
-    return true;
+    return currentStaticConfig === newStaticConfig;
   }
 
   /**
-   * 通过 sing-box clash_api 热更新配置
-   * 重新生成 sing-box 配置并通知进程重新加载，无需重启
+   * 通过 sing-box Clash API 切换运行时代理模式和服务器
    */
   async hotReloadConfig(newConfig: UserConfig): Promise<boolean> {
+    const currentConfig = this.currentConfig;
+    if (!currentConfig) {
+      return false;
+    }
+
     try {
-      // 生成新的 sing-box 配置并写入文件
+      const modeChanged = currentConfig.proxyMode !== newConfig.proxyMode;
+      const serverChanged = currentConfig.selectedServerId !== newConfig.selectedServerId;
+
       const singboxConfig = this.generateSingBoxConfig(newConfig);
       await this.writeSingBoxConfig(singboxConfig);
-      this.currentConfig = newConfig;
 
-      // 通过 clash_api 通知 sing-box 重新加载配置
-      // sing-box clash_api 使用 PUT /configs?path=<config_path>
-      const configUrl = `http://127.0.0.1:${CLASH_API_PORT}/configs`;
-      const params = new URLSearchParams({ path: this.configPath });
-      const response = await fetch(`${configUrl}?${params.toString()}`, {
-        method: 'PUT',
-      });
-
-      if (response.ok) {
-        this.logToManager('info', '配置热更新成功，无需重启代理');
-        return true;
+      if (serverChanged) {
+        await this.updateClashApi('/proxies/proxy', {
+          name: this.getServerOutboundTag(newConfig.selectedServerId!),
+        });
       }
 
-      // 读取响应体获取详细错误信息
-      const body = await response.text().catch(() => '');
-      this.logToManager('warn', `热更新 API 返回错误: ${response.status} ${body}`);
-      return false;
+      if (modeChanged) {
+        await this.updateModeSelectors(newConfig.proxyMode);
+      }
+
+      this.currentConfig = newConfig;
+      this.logToManager('info', '运行时代理配置切换成功，无需重启代理');
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logToManager('warn', `热更新失败: ${message}，将回退到重启`);
+      this.logToManager('warn', `运行时代理配置切换失败: ${message}，将回退到重启`);
       return false;
+    }
+  }
+
+  private async updateModeSelectors(mode: UserConfig['proxyMode']): Promise<void> {
+    const selections = this.getModeSelections(mode);
+    await Promise.all([
+      this.updateClashApi('/proxies/mode-cn', { name: selections.cn }),
+      this.updateClashApi('/proxies/mode-non-cn', { name: selections.nonCn }),
+      this.updateClashApi('/proxies/mode-fallback', { name: selections.fallback }),
+    ]);
+  }
+
+  private async updateClashApi(
+    pathname: string,
+    body: Record<string, string>
+  ): Promise<void> {
+    const response = await fetch(`http://127.0.0.1:${CLASH_API_PORT}${pathname}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const responseBody = await response.text();
+      throw new Error(`Clash API 返回 ${response.status}: ${responseBody}`);
     }
   }
 
@@ -868,9 +888,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const singboxConfig: SingBoxConfig = {
       log: this.generateLogConfig(config),
-      dns: this.generateDnsConfig(config, selectedServer),
+      dns: this.generateDnsConfig(config),
       inbounds: this.generateInbounds(config),
-      outbounds: this.generateOutbounds(selectedServer),
+      outbounds: this.generateOutbounds(config),
       route: this.generateRouteConfig(config),
       experimental: {
         cache_file: {
@@ -950,8 +970,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 统一使用 FakeIP 模式：DNS 查询直接返回虚假 IP，由 sniff 识别真实域名后路由
    * 这避免了 DNS 污染和超时问题，TUN 和系统代理模式都使用相同的逻辑
    */
-  private generateDnsConfig(config: UserConfig, selectedServer: ServerConfig): SingBoxDnsConfig {
-    const proxyMode = (config.proxyMode || 'smart').toLowerCase();
+  private generateDnsConfig(config: UserConfig): SingBoxDnsConfig {
     const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
     const isTunMode = modeType !== 'systemproxy';
 
@@ -1005,10 +1024,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const dnsRules: SingBoxDnsRule[] = [];
 
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）
-    // IP 地址不需要 DNS 规则
-    if (selectedServer?.address && !isIP(selectedServer.address)) {
+    const proxyServerDomains = Array.from(
+      new Set(
+        config.servers
+          .filter((server) => !isIP(server.address))
+          .map((server) => server.address)
+      )
+    );
+    if (proxyServerDomains.length > 0) {
       dnsRules.push({
-        domain: [selectedServer.address],
+        domain: proxyServerDomains,
         server: 'dns-local',
       } as SingBoxDnsRule);
     }
@@ -1023,34 +1048,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } as SingBoxDnsRule);
     }
 
-    // TUN 模式下所有普通 A/AAAA 查询都走 FakeIP。
-    // Ubuntu 的系统 DNS 在 TUN 接管路由后容易对海外域名或 AAAA 查询超时；
-    // FakeIP 避免把客户端 DNS 查询交给本地 DNS，再由路由规则决定直连/代理。
-    if (isTunMode && proxyMode !== 'direct') {
-      dnsRules.push({
-        query_type: ['A', 'AAAA'],
-        server: 'fakeip',
-      } as SingBoxDnsRule);
-    }
-
-    // 根据代理模式配置 FakeIP 规则
-    if (proxyMode === 'global') {
-      // 全局代理：所有 A/AAAA 查询走 FakeIP
-      if (!isTunMode) {
-        dnsRules.push({
-          query_type: ['A', 'AAAA'],
-          server: 'fakeip',
-        } as SingBoxDnsRule);
-      }
-    } else if (proxyMode === 'smart' && !isTunMode) {
-      // 智能分流：仅非中国域名走 FakeIP
-      // 中国域名使用本地 DNS 解析真实 IP，即使代理不可达也能直连访问
-      dnsRules.push({
-        rule_set: 'geosite-geolocation-!cn',
-        server: 'fakeip',
-      } as SingBoxDnsRule);
-    }
-    // 直连模式不使用 FakeIP，全部走本地 DNS
+    // 所有普通 A/AAAA 查询使用 FakeIP，确保运行时切换模式后仍能按域名路由。
+    // direct 出站会使用 FakeIP 的反向映射连接真实域名，不会经过代理。
+    dnsRules.push({
+      query_type: ['A', 'AAAA'],
+      server: 'fakeip',
+    } as SingBoxDnsRule);
 
     dnsConfig.rules = dnsRules;
 
@@ -1167,13 +1170,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   /**
    * 生成 Outbound 配置（sing-box 1.12.x 格式）
-   * 包含 proxy, direct, block 三个出站
+   * 包含 selector、服务器、direct、block 出站
    */
-  private generateOutbounds(selectedServer: ServerConfig): SingBoxOutbound[] {
-    const outbounds: SingBoxOutbound[] = [];
-
-    // 代理出站
-    outbounds.push(this.generateProxyOutbound(selectedServer));
+  private generateOutbounds(config: UserConfig): SingBoxOutbound[] {
+    const proxyOutbounds = config.servers.map((server) =>
+      this.generateProxyOutbound(server, this.getServerOutboundTag(server.id))
+    );
+    const modeSelections = this.getModeSelections(config.proxyMode);
+    const outbounds: SingBoxOutbound[] = [
+      this.generateSelectorOutbound('mode-cn', modeSelections.cn),
+      this.generateSelectorOutbound('mode-non-cn', modeSelections.nonCn),
+      this.generateSelectorOutbound('mode-fallback', modeSelections.fallback),
+      {
+        type: 'selector',
+        tag: 'proxy',
+        outbounds: proxyOutbounds.map((outbound) => outbound.tag),
+        default: this.getServerOutboundTag(config.selectedServerId!),
+        interrupt_exist_connections: true,
+      },
+      ...proxyOutbounds,
+    ];
 
     // 直连出站
     outbounds.push({
@@ -1190,16 +1206,44 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return outbounds;
   }
 
+  private getServerOutboundTag(serverId: string): string {
+    return `proxy-${serverId}`;
+  }
+
+  private getModeSelections(mode: UserConfig['proxyMode']): {
+    cn: string;
+    nonCn: string;
+    fallback: string;
+  } {
+    if (mode.toLowerCase() === 'global') {
+      return { cn: 'proxy', nonCn: 'proxy', fallback: 'proxy' };
+    }
+    if (mode.toLowerCase() === 'direct') {
+      return { cn: 'direct', nonCn: 'direct', fallback: 'direct' };
+    }
+    return { cn: 'direct', nonCn: 'proxy', fallback: 'direct' };
+  }
+
+  private generateSelectorOutbound(tag: string, selected: string): SingBoxOutbound {
+    return {
+      type: 'selector',
+      tag,
+      outbounds: ['direct', 'proxy'],
+      default: selected,
+      interrupt_exist_connections: true,
+    };
+  }
+
   /**
    * 生成代理 Outbound 配置（sing-box 1.12.x 格式）
    */
-  private generateProxyOutbound(server: ServerConfig): SingBoxOutbound {
+  private generateProxyOutbound(server: ServerConfig, tag: string): SingBoxOutbound {
     // sing-box 要求协议类型必须是小写
     const protocol = server.protocol.toLowerCase();
 
     const outbound: SingBoxOutbound = {
       type: protocol,
-      tag: 'proxy',
+      tag,
       server: server.address,
       server_port: server.port,
       // 代理服务器域名使用本地 DNS 解析
@@ -1320,37 +1364,42 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private generateRouteConfig(config: UserConfig): SingBoxRouteConfig {
     const rules: SingBoxRouteRule[] = [];
 
-    // 使用小写比较代理模式
-    const proxyMode = (config.proxyMode || 'smart').toLowerCase();
-
-    // 获取当前选中的服务器，用于排除代理服务器域名
-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
-
     // DNS 劫持规则（必须）
     rules.push({
       protocol: 'dns',
       action: 'hijack-dns',
     });
 
-    // 排除代理服务器域名/IP，确保代理服务器的连接走直连
+    // 排除所有代理服务器域名/IP，确保 selector 切换后服务器连接仍走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
-    if (selectedServer?.address) {
-      if (isIP(selectedServer.address)) {
-        const cidr = isIP(selectedServer.address) === 6
-          ? `${selectedServer.address}/128`
-          : `${selectedServer.address}/32`;
-        rules.push({
-          ip_cidr: [cidr],
-          action: 'route',
-          outbound: 'direct',
-        });
-      } else {
-        rules.push({
-          domain: [selectedServer.address],
-          action: 'route',
-          outbound: 'direct',
-        });
-      }
+    const proxyServerDomains = Array.from(
+      new Set(
+        config.servers
+          .filter((server) => !isIP(server.address))
+          .map((server) => server.address)
+      )
+    );
+    if (proxyServerDomains.length > 0) {
+      rules.push({
+        domain: proxyServerDomains,
+        action: 'route',
+        outbound: 'direct',
+      });
+    }
+
+    const proxyServerCidrs = Array.from(
+      new Set(
+        config.servers
+          .filter((server) => isIP(server.address))
+          .map((server) => `${server.address}/${isIP(server.address) === 6 ? 128 : 32}`)
+      )
+    );
+    if (proxyServerCidrs.length > 0) {
+      rules.push({
+        ip_cidr: proxyServerCidrs,
+        action: 'route',
+        outbound: 'direct',
+      });
     }
 
     // 自定义规则（优先级最高，必须放在智能分流规则之前）
@@ -1384,40 +1433,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     }
 
-    // 智能分流规则（默认启用，除非是直连模式）
-    if (proxyMode !== 'direct') {
-      // 中国域名直连（优先匹配）
-      rules.push({
-        rule_set: 'geosite-cn',
-        action: 'route',
-        outbound: 'direct',
-      });
-      // 中国 IP 直连
-      rules.push({
-        rule_set: 'geoip-cn',
-        action: 'route',
-        outbound: 'direct',
-      });
-      // 国外域名走代理
-      rules.push({
-        rule_set: 'geosite-geolocation-!cn',
-        action: 'route',
-        outbound: 'proxy',
-      });
-    }
+    // 智能分流匹配结果交给模式 selector 决定直连或代理
+    rules.push({
+      rule_set: 'geosite-cn',
+      action: 'route',
+      outbound: 'mode-cn',
+    });
+    rules.push({
+      rule_set: 'geoip-cn',
+      action: 'route',
+      outbound: 'mode-cn',
+    });
+    rules.push({
+      rule_set: 'geosite-geolocation-!cn',
+      action: 'route',
+      outbound: 'mode-non-cn',
+    });
+    rules.push({
+      action: 'route',
+      outbound: 'mode-fallback',
+    });
 
-    // 始终添加 rule_set 配置（除非是直连模式）
     // 统一使用 dns-local 作为默认解析器
     const routeConfig: SingBoxRouteConfig = {
       rules,
       default_domain_resolver: 'dns-local',
       auto_detect_interface: true,
-      final: proxyMode === 'global' ? 'proxy' : 'direct',
-    };
-
-    // 添加 rule_set（除非是直连模式）
-    if (proxyMode !== 'direct') {
-      routeConfig.rule_set = [
+      final: 'direct',
+      rule_set: [
         {
           tag: 'geosite-cn',
           type: 'local',
@@ -1436,8 +1479,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           format: 'binary',
           path: resourceManager.getGeoIPPath(),
         },
-      ];
-    }
+      ],
+    };
 
     return routeConfig;
   }
