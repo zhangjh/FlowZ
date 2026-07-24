@@ -36,6 +36,7 @@ import { UpdateService } from './services/UpdateService';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
+import { IPC_CHANNELS } from '../shared/ipc-channels';
 
 let mainWindow: BrowserWindow | null = null;
 let trayManager: TrayManager | null = null;
@@ -498,23 +499,11 @@ app.whenReady().then(async () => {
   trayManager = new TrayManager(mainWindow, logManager, {
     onStartProxy: async () => {
       try {
-        const config = await configManager.loadConfig();
         if (proxyManager) {
-          await proxyManager.start(config);
-
-          // 系统代理模式：设置系统代理
-          const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-          if (modeType === 'systemproxy') {
-            await systemProxyManager.enableProxy(
-              '127.0.0.1',
-              config.httpPort || 65533,
-              config.socksPort || 65534
-            );
-          }
+          // 通知渲染进程执行代理启动（渲染进程会通过 IPC 调用统一的启动逻辑，含测速）
+          ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_AUTO_CONNECT, {});
 
           logManager.addLog('info', 'Proxy started from tray', 'Main');
-          // 更新托盘菜单状态
-          updateTrayMenuState(true);
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -662,23 +651,10 @@ app.whenReady().then(async () => {
       // 检查是否启用了启动时自动连接
       if (config.autoConnect && config.selectedServerId) {
         logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
-        
+
         if (proxyManager) {
-          await proxyManager.start(config);
-          
-          // 系统代理模式：设置系统代理
-          const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-          if (modeType === 'systemproxy') {
-            await systemProxyManager.enableProxy(
-              '127.0.0.1',
-              config.httpPort || 65533,
-              config.socksPort || 65534
-            );
-          }
-          
-          logManager.addLog('info', '启动时自动连接成功', 'Main');
-          // 更新托盘菜单状态
-          updateTrayMenuState(true);
+          // 通知渲染进程执行代理启动（渲染进程会通过 IPC 调用统一的启动逻辑，含测速）
+          ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_AUTO_CONNECT, {});
         }
       } else if (config.autoConnect && !config.selectedServerId) {
         logManager.addLog('warn', '启动时自动连接已启用，但未选择服务器', 'Main');
@@ -755,6 +731,9 @@ app.whenReady().then(async () => {
       // 热更新不可用或失败，执行完整重启
       logManager.addLog('info', 'Configuration changed, restarting proxy...', 'Main');
       try {
+        // 通知渲染进程代理正在重启
+        ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_PROXY_RESTARTING, {});
+
         await proxyManager.restart(latestConfig);
         logManager.addLog('info', 'Proxy restarted successfully with new configuration', 'Main');
 

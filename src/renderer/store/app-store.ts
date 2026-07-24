@@ -31,7 +31,7 @@ interface AppState {
   currentView: string;
   isLoading: boolean;
   error: string | null;
-  proxyPhase: 'idle' | 'testing' | 'connecting';
+  proxyPhase: 'idle' | 'testing' | 'connecting' | 'restarting';
 
   // Connection State
   connectionStatus: ConnectionStatus | null;
@@ -51,7 +51,7 @@ interface AppState {
   setCurrentView: (view: string) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
-  setProxyPhase: (phase: 'idle' | 'testing' | 'connecting') => void;
+  setProxyPhase: (phase: 'idle' | 'testing' | 'connecting' | 'restarting') => void;
 
   // Proxy Control Actions
   startProxy: () => Promise<void>;

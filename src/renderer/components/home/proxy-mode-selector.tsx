@@ -115,7 +115,7 @@ export function ProxyModeSelector() {
             {isLoading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                {proxyPhase === 'testing' ? '测速中...' : isConnected ? '断开中...' : '连接中...'}
+                {proxyPhase === 'restarting' ? '重启中...' : proxyPhase === 'testing' ? '测速中...' : isConnected ? '断开中...' : '连接中...'}
               </>
             ) : isConnected ? (
               <>

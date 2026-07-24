@@ -72,6 +72,20 @@ export const proxyApi = {
   onError(listener: (data: { error: string; timestamp: string }) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_ERROR, listener);
   },
+
+  /**
+   * 监听自动连接事件（主进程请求渲染进程执行代理启动）
+   */
+  onAutoConnect(listener: () => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_AUTO_CONNECT, listener);
+  },
+
+  /**
+   * 监听代理重启事件（主进程正在重启代理）
+   */
+  onProxyRestarting(listener: () => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_RESTARTING, listener);
+  },
 };
 
 /**

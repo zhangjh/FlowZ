@@ -89,6 +89,8 @@ export const IPC_CHANNELS = {
   EVENT_CONNECTION_STATE_CHANGED: 'event:connectionStateChanged',
   EVENT_AUTO_SELECT_FAILOVER: 'event:autoSelectFailover',
   EVENT_AUTO_SELECT_TEST_COMPLETED: 'event:autoSelectTestCompleted',
+  EVENT_AUTO_CONNECT: 'event:autoConnect',
+  EVENT_PROXY_RESTARTING: 'event:proxyRestarting',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

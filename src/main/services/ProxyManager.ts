@@ -374,6 +374,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       },
     });
 
+    // 等待 Clash API 就绪（sing-box 进程启动后 Clash API 需要约1秒才开始监听）
+    await this.waitForClashApi();
+
     try {
       await this.updateClashApi('/proxies/proxy', {
         name: this.getServerOutboundTag(selectedServer.id),
@@ -778,9 +781,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const modeChanged = currentConfig.proxyMode !== newConfig.proxyMode;
       const serverChanged = currentConfig.selectedServerId !== newConfig.selectedServerId;
 
-      const singboxConfig = this.generateSingBoxConfig(newConfig);
-      await this.writeSingBoxConfig(singboxConfig);
+      this.logToManager('info', `热更新: modeChanged=${modeChanged} (${currentConfig.proxyMode}→${newConfig.proxyMode}), serverChanged=${serverChanged}`);
 
+      // 先通过 Clash API 切换运行时状态，再写入磁盘（sing-box 不监听文件变化）
       if (serverChanged) {
         await this.updateClashApi('/proxies/proxy', {
           name: this.getServerOutboundTag(newConfig.selectedServerId!),
@@ -790,6 +793,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (modeChanged) {
         await this.updateModeSelectors(newConfig.proxyMode);
       }
+
+      // 验证切换结果
+      if (modeChanged) {
+        await this.verifyModeSelectors(newConfig.proxyMode);
+      }
+
+      // 写入磁盘（仅用于持久化，下次启动时使用）
+      const singboxConfig = this.generateSingBoxConfig(newConfig);
+      await this.writeSingBoxConfig(singboxConfig);
 
       this.currentConfig = newConfig;
       this.logToManager('info', '运行时代理配置切换成功，无需重启代理');
@@ -803,27 +815,102 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   private async updateModeSelectors(mode: UserConfig['proxyMode']): Promise<void> {
     const selections = this.getModeSelections(mode);
-    await Promise.all([
-      this.updateClashApi('/proxies/mode-cn', { name: selections.cn }),
-      this.updateClashApi('/proxies/mode-non-cn', { name: selections.nonCn }),
-      this.updateClashApi('/proxies/mode-fallback', { name: selections.fallback }),
-    ]);
+    this.logToManager('info', `更新模式选择器: mode-cn→${selections.cn}, mode-non-cn→${selections.nonCn}, mode-fallback→${selections.fallback}`);
+
+    // 逐个更新，避免并行请求导致 sing-box Clash API 竞态
+    await this.updateClashApi('/proxies/mode-cn', { name: selections.cn });
+    await this.updateClashApi('/proxies/mode-non-cn', { name: selections.nonCn });
+    await this.updateClashApi('/proxies/mode-fallback', { name: selections.fallback });
+  }
+
+  /**
+   * 验证模式选择器是否已正确切换
+   */
+  private async verifyModeSelectors(mode: UserConfig['proxyMode']): Promise<void> {
+    const expected = this.getModeSelections(mode);
+    const selectors = ['mode-cn', 'mode-non-cn', 'mode-fallback'] as const;
+    const expectedValues = [expected.cn, expected.nonCn, expected.fallback];
+
+    for (let i = 0; i < selectors.length; i++) {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:${CLASH_API_PORT}/proxies/${selectors[i]}`
+        );
+        if (response.ok) {
+          const data = await response.json() as { now?: string };
+          const actual = data.now;
+          if (actual !== expectedValues[i]) {
+            this.logToManager('warn', `选择器 ${selectors[i]} 验证失败: 期望=${expectedValues[i]}, 实际=${actual}`);
+          } else {
+            this.logToManager('info', `选择器 ${selectors[i]} 已切换到 ${actual}`);
+          }
+        }
+      } catch (e) {
+        this.logToManager('warn', `验证选择器 ${selectors[i]} 状态失败: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
   }
 
   private async updateClashApi(
     pathname: string,
     body: Record<string, string>
   ): Promise<void> {
-    const response = await fetch(`http://127.0.0.1:${CLASH_API_PORT}${pathname}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const url = `http://127.0.0.1:${CLASH_API_PORT}${pathname}`;
+    this.logToManager('info', `Clash API PUT ${url} ${JSON.stringify(body)}`);
 
-    if (!response.ok) {
-      const responseBody = await response.text();
-      throw new Error(`Clash API 返回 ${response.status}: ${responseBody}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      const responseBody = await response.text().catch(() => '');
+
+      if (!response.ok) {
+        throw new Error(`Clash API 返回 ${response.status}: ${responseBody}`);
+      }
+
+      this.logToManager('info', `Clash API PUT 成功: ${pathname} → ${response.status} ${responseBody}`);
+    } finally {
+      clearTimeout(timeout);
     }
+  }
+
+  /**
+   * 等待 sing-box Clash API 就绪（进程启动后 API 需要时间初始化）
+   */
+  private async waitForClashApi(maxWaitMs = 10000): Promise<void> {
+    const startTime = Date.now();
+    const pollInterval = 300;
+
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1000);
+        try {
+          const response = await fetch(`http://127.0.0.1:${CLASH_API_PORT}/proxies`, {
+            method: 'GET',
+            signal: controller.signal,
+          });
+          if (response.ok) {
+            this.logToManager('info', 'Clash API 已就绪');
+            return;
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch {
+        // API 尚未就绪，继续等待
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+
+    this.logToManager('warn', `Clash API 在 ${maxWaitMs}ms 内未就绪，继续执行`);
   }
 
   /**
@@ -3273,6 +3360,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 解析并记录日志行
    */
   private parseAndLogLine(line: string): void {
+    // 简化服务器 outbound tag：proxy-<uuid> → proxy，让用户只看到 proxy/direct
+    line = line.replace(/\bproxy-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, 'proxy');
+
     // 过滤重复日志
     if (this.isDuplicateLog(line)) {
       return;
@@ -3322,7 +3412,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       'match rule', // 匹配规则
       'final rule', // 最终规则
       'rule-set', // 规则集匹配
-      'outbound/proxy', // 代理出站 - 用户关心的
+      '[proxy]', // 代理出站（简化后的 tag）
     ];
 
     for (const pattern of keepPatterns) {

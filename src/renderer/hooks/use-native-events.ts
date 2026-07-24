@@ -16,6 +16,8 @@ interface NativeEventData {
   navigateToPage: string;
   proxyModeSwitched: { success: boolean; newMode: string };
   proxyModeSwitchFailed: { success: boolean; error: string };
+  autoConnect: Record<string, never>;
+  proxyRestarting: Record<string, never>;
 }
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
@@ -44,6 +46,12 @@ export function useNativeEvent<K extends keyof NativeEventData>(
       case 'statsUpdated':
         unsubscribe = api.stats.onUpdated(callback as any);
         break;
+      case 'autoConnect':
+        unsubscribe = api.proxy.onAutoConnect(callback as any);
+        break;
+      case 'proxyRestarting':
+        unsubscribe = api.proxy.onProxyRestarting(callback as any);
+        break;
       default:
         console.warn(`Unknown event: ${eventName}`);
     }
@@ -64,8 +72,12 @@ export function useNativeEventListeners() {
     console.log('Process started:', data);
     // Refresh connection status when process starts
     import('../store/app-store').then(({ useAppStore }) => {
-      const refreshConnectionStatus = useAppStore.getState().refreshConnectionStatus;
-      refreshConnectionStatus();
+      const state = useAppStore.getState();
+      state.refreshConnectionStatus();
+      // 如果处于重启状态，清除加载状态（重启完成）
+      if (state.proxyPhase === 'restarting') {
+        useAppStore.setState({ proxyPhase: 'idle', isLoading: false });
+      }
     });
   };
 
@@ -73,8 +85,12 @@ export function useNativeEventListeners() {
     console.log('Process stopped:', data);
     // Refresh connection status when process stops
     import('../store/app-store').then(({ useAppStore }) => {
-      const refreshConnectionStatus = useAppStore.getState().refreshConnectionStatus;
-      refreshConnectionStatus();
+      const state = useAppStore.getState();
+      state.refreshConnectionStatus();
+      // 如果处于重启状态，清除加载状态（重启失败或被取消）
+      if (state.proxyPhase === 'restarting') {
+        useAppStore.setState({ proxyPhase: 'idle', isLoading: false });
+      }
     });
   };
 
@@ -159,4 +175,24 @@ export function useNativeEventListeners() {
   useNativeEvent('processError', handleProcessError);
   useNativeEvent('configChanged', handleConfigChanged);
   useNativeEvent('statsUpdated', handleStatsUpdated);
+
+  // 自动连接事件：主进程请求渲染进程执行代理启动（含测速）
+  useNativeEvent('autoConnect', () => {
+    console.log('[NativeEvent] Auto-connect requested by main process');
+    import('../store/app-store').then(({ useAppStore }) => {
+      const state = useAppStore.getState();
+      // 仅在未连接且未加载时响应，避免重复触发
+      if (!state.isLoading && !state.connectionStatus?.proxyCore?.running) {
+        state.startProxy();
+      }
+    });
+  });
+
+  // 代理重启事件：主进程正在重启代理
+  useNativeEvent('proxyRestarting', () => {
+    console.log('[NativeEvent] Proxy restarting');
+    import('../store/app-store').then(({ useAppStore }) => {
+      useAppStore.setState({ proxyPhase: 'restarting', isLoading: true, error: null });
+    });
+  });
 }
