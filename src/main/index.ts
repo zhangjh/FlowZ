@@ -294,6 +294,14 @@ async function cleanupResources(): Promise<void> {
         await proxyManager.stop();
         logManager.addLog('info', 'Proxy process stopped', 'Main');
       }
+
+      // 关闭常驻特权守护进程（TUN 模式无弹窗；未运行则自动跳过）
+      try {
+        await proxyManager.shutdown();
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logManager.addLog('warn', `Failed to stop privileged supervisor: ${errorMessage}`, 'Main');
+      }
     }
 
     // 2. 清理系统代理设置

@@ -17,6 +17,7 @@ import { retry } from '../utils/retry';
 import { getUserDataPath } from '../utils/paths';
 import { getSystemDnsServers } from '../utils/dns';
 import { isRunningAsAdmin } from './AdminPrivilege';
+import { PrivilegedSupervisor } from './PrivilegedSupervisor';
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -232,6 +233,7 @@ export interface IProxyManager {
   start(config: UserConfig): Promise<void>;
   stop(): Promise<void>;
   restart(config: UserConfig): Promise<void>;
+  shutdown(): Promise<void>;
   getStatus(): ProxyStatus;
   generateSingBoxConfig(config: UserConfig): SingBoxConfig;
   hotReloadConfig(newConfig: UserConfig): Promise<boolean>;
@@ -248,6 +250,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private currentConfig: UserConfig | null = null;
   private configPath: string;
   private singboxPath: string;
+  private supervisor: PrivilegedSupervisor;
   private logManager: ILogManager | null = null;
   private lastLogMessage: string = '';
   private lastLogCount: number = 0;
@@ -292,6 +295,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } else {
       this.singboxPath = this.getSingBoxPath();
     }
+
+    // 特权守护进程：TUN 模式下用一次授权接管 sing-box 生命周期，避免反复弹窗
+    const userDataPath = path.dirname(this.configPath);
+    const pidFilePath = path.join(userDataPath, 'singbox.pid');
+    this.supervisor = new PrivilegedSupervisor(
+      this.singboxPath,
+      this.configPath,
+      userDataPath,
+      pidFilePath,
+      (level, message) => this.logToManager(level, message)
+    );
   }
 
   /**
@@ -311,12 +325,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 先保存当前配置（needsRootPrivilege 等方法需要用到）
     this.currentConfig = config;
 
-    // 仅在 TUN 模式下清理可能残留的 sing-box 进程
-    // 系统代理模式不需要管理员权限，也不会有残留的 TUN 进程问题
-    const isTunMode = config.proxyModeType === 'tun';
-    if (isTunMode) {
-      await this.killOrphanedSingBoxProcesses();
-    }
+    // TUN 模式的残留清理由特权守护进程在"start"命令内部统一完成（单次授权内清理再启动）。
+    // 仅在回退到旧的"临时提权启动"路径时才需要在这里单独清理（见 startTunViaSupervisor 的回退分支）。
 
     // 修复可能被 root 创建的文件权限（从 TUN 模式切换到系统代理模式时）
     await this.fixFilePermissions();
@@ -355,7 +365,40 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await this.deletePidFile();
     }
 
-    // 使用重试机制启动 sing-box 进程
+    // TUN 模式：优先通过特权守护进程启动（常驻进程复用，无需再次授权）
+    if (this.needsPrivilegedWrapper()) {
+      await this.startTunViaSupervisor();
+    } else {
+      // 系统代理模式：直接运行，无需提权
+      await this.startWithRetry();
+    }
+
+    // 等待 Clash API 就绪（sing-box 进程启动后 Clash API 需要约1秒才开始监听）
+    await this.waitForClashApi();
+
+    try {
+      // 同步 proxy selector 默认指向（分组模式下指向 urltest 分组）
+      const activeServers = this.getActiveServers(config);
+      const isGroup = !!config.selectedGroupId && activeServers.length > 0;
+      const defaultTag = isGroup
+        ? `group-${config.selectedGroupId}`
+        : config.selectedServerId
+          ? this.getServerOutboundTag(config.selectedServerId)
+          : 'direct';
+      await this.updateClashApi('/proxies/proxy', {
+        name: defaultTag,
+      });
+      await this.updateModeSelectors(config.proxyMode);
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  /**
+   * 以重试机制启动 sing-box（系统代理模式，无需提权）
+   */
+  private async startWithRetry(): Promise<void> {
     await retry(() => this.startSingBoxProcess(), {
       maxRetries: 2,
       delay: 2000,
@@ -388,27 +431,48 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         this.logToManager('warn', `启动失败，正在进行第 ${attempt} 次重试: ${error.message}`);
       },
     });
+  }
 
-    // 等待 Clash API 就绪（sing-box 进程启动后 Clash API 需要约1秒才开始监听）
-    await this.waitForClashApi();
-
-    try {
-      // 同步 proxy selector 默认指向（分组模式下指向 urltest 分组）
-      const activeServers = this.getActiveServers(config);
-      const isGroup = !!config.selectedGroupId && activeServers.length > 0;
-      const defaultTag = isGroup
-        ? `group-${config.selectedGroupId}`
-        : config.selectedServerId
-          ? this.getServerOutboundTag(config.selectedServerId)
-          : 'direct';
-      await this.updateClashApi('/proxies/proxy', {
-        name: defaultTag,
-      });
-      await this.updateModeSelectors(config.proxyMode);
-    } catch (error) {
-      await this.stop();
-      throw error;
+  /**
+   * TUN 模式：通过常驻特权守护进程启动 sing-box
+   * - 守护进程已存活（本会话或此前会话复用）时无需再次授权；
+   * - 守护进程不存在时首次请求一次管理员授权拉起；
+   * - 守护进程无法建立（用户取消授权等）时回退到旧的"临时提权启动"方式。
+   */
+  private async startTunViaSupervisor(): Promise<void> {
+    const ok = await this.supervisor.ensureStarted();
+    if (!ok) {
+      this.logToManager('warn', '特权守护进程启动失败，回退到旧的单次提权方式启动');
+      await this.killOrphanedSingBoxProcesses();
+      await this.startWithRetry();
+      return;
     }
+
+    this.logToManager('info', '特权守护进程就绪，正在启动 sing-box...');
+    this.startTime = new Date();
+    this.supervisor.sendCommand('start');
+    await this.waitForPidFile();
+
+    // 守护进程可能恰好在此刻退出（极少数竞态），重试一次
+    if (!this.singboxPid) {
+      this.logToManager('warn', '首次启动未检测到 sing-box，重试一次');
+      this.supervisor.sendCommand('start');
+      await this.waitForPidFile();
+    }
+
+    if (!this.singboxPid) {
+      throw new Error('启动 sing-box 进程失败：进程未能正常启动');
+    }
+
+    this.startLogFileWatcher();
+    this.startHealthCheck();
+
+    this.emit('started');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STARTED, {
+      pid: this.singboxPid,
+      startTime: this.startTime,
+    });
+    this.logToManager('info', `sing-box 已通过特权守护进程启动 (PID: ${this.singboxPid})`);
   }
 
   /**
@@ -424,8 +488,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 关闭并退出特权守护进程（App 退出前调用）
+   */
+  async shutdown(): Promise<void> {
+    await this.supervisor.shutdown();
+  }
+
+  /**
    * 重启代理
-   * TUN 模式下将停止和启动合并为单次提权操作，避免两次弹框
+   * TUN 模式下通过常驻特权守护进程完成"停止 + 启动"，避免授权弹窗；
+   * 守护进程不可用时回退到旧的"单次提权合并操作"。
    */
   async restart(config: UserConfig): Promise<void> {
     const modeTypeChanged = this.currentConfig?.proxyModeType !== config.proxyModeType;
@@ -445,8 +517,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    // TUN 模式内重启（如切换服务器、改端口、改规则）：合并为单次提权操作
-    await this.restartWithElevation(config);
+    // TUN 模式内重启（如切换服务器、改端口、改规则）
+    // 先生成新配置并写入文件（守护进程直接读取）
+    const singboxConfig = this.generateSingBoxConfig(config);
+    await this.writeSingBoxConfig(singboxConfig);
+    this.currentConfig = config;
+
+    const ok = await this.supervisor.ensureStarted();
+    if (!ok) {
+      // 回退：旧的"单次提权合并 stop + start"方式
+      await this.restartWithElevation(config);
+      return;
+    }
+
+    await this.deletePidFile();
+    this.startTime = new Date();
+    this.supervisor.sendCommand('restart');
+    await this.waitForPidFile();
+
+    if (!this.singboxPid) {
+      throw new Error('sing-box 重启失败：进程未能正常启动');
+    }
+
+    this.startLogFileWatcher();
+    this.startHealthCheck();
+    this.emit('started');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STARTED, {
+      pid: this.singboxPid,
+      startTime: this.startTime,
+    });
+    this.logToManager('info', `sing-box 已通过特权守护进程重启 (PID: ${this.singboxPid})`);
   }
 
   /**
@@ -2217,19 +2317,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 停止 sing-box 进程
    */
   private async stopSingBoxProcess(): Promise<void> {
-    // macOS TUN 模式：sing-box 以 root 权限在后台运行，需要用 osascript 终止
-    if (this.singboxPid && process.platform === 'darwin') {
-      return this.stopSingBoxWithSudo();
-    }
-
-    // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止
-    if (this.singboxPid && process.platform === 'win32') {
-      return this.stopSingBoxOnWindows();
-    }
-
-    // Linux TUN 模式：sing-box 以 root 权限在后台运行，需要用 pkexec 终止
-    if (this.singboxPid && process.platform === 'linux') {
-      return this.stopSingBoxOnLinux();
+    // TUN 模式（各平台）：sing-box 以管理员权限运行，优先通过常驻特权守护进程停止
+    // （守护进程复用时不弹授权弹窗；不可用时回退到各平台的旧提权方式）
+    if (
+      this.singboxPid &&
+      (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux')
+    ) {
+      return this.stopSingBoxViaSupervisor();
     }
 
     if (!this.singboxProcess) {
@@ -2257,6 +2351,83 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 发送 SIGTERM 信号优雅终止
       proc.kill('SIGTERM');
     });
+  }
+
+  /**
+   * 通过常驻特权守护进程停止 sing-box（TUN 模式，所有平台）
+   * 守护进程已存活时无需再次授权；不可用时回退到各平台的旧提权方式。
+   */
+  private async stopSingBoxViaSupervisor(): Promise<void> {
+    const pidToKill = this.singboxPid;
+
+    if (pidToKill === null) {
+      this.cleanup();
+      return;
+    }
+
+    // 进程已不存在，直接清理
+    if (!(await this.isProcessAlive(pidToKill))) {
+      this.logToManager('info', `sing-box 进程 (PID: ${pidToKill}) 已不存在，跳过终止`);
+      try { require('fs').unlinkSync(this.getPidFilePath()); } catch { /* ignore */ }
+      this.cleanup();
+      this.emit('stopped');
+      this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+      return;
+    }
+
+    this.logToManager('info', `正在通过特权守护进程停止 sing-box (PID: ${pidToKill})...`);
+
+    const ok = await this.supervisor.ensureStarted();
+    if (!ok) {
+      this.logToManager('warn', '特权守护进程不可用，回退到旧的单次提权方式停止');
+      if (process.platform === 'darwin') {
+        return this.stopSingBoxWithSudo();
+      }
+      if (process.platform === 'win32') {
+        return this.stopSingBoxOnWindows();
+      }
+      if (process.platform === 'linux') {
+        return this.stopSingBoxOnLinux();
+      }
+      throw new Error('无法停止 sing-box 进程');
+    }
+
+    this.supervisor.sendCommand('stop');
+    let exited = await this.waitForProcessExit(pidToKill, 10000);
+
+    if (!exited && (await this.isProcessAlive(pidToKill))) {
+      this.logToManager('warn', 'sing-box 未响应停止命令，再次下发停止命令');
+      this.supervisor.sendCommand('stop');
+      exited = await this.waitForProcessExit(pidToKill, 5000);
+    }
+
+    if (!exited && (await this.isProcessAlive(pidToKill))) {
+      this.logToManager('warn', '守护进程未能停止 sing-box，回退到旧的单次提权方式');
+      if (process.platform === 'darwin') {
+        return this.stopSingBoxWithSudo();
+      }
+      if (process.platform === 'win32') {
+        return this.stopSingBoxOnWindows();
+      }
+      if (process.platform === 'linux') {
+        return this.stopSingBoxOnLinux();
+      }
+    }
+
+    // 清理 PID 文件
+    const fsSync = require('fs');
+    try {
+      fsSync.unlinkSync(this.getPidFilePath());
+    } catch {
+      // 忽略错误
+    }
+
+    this.cleanup();
+
+    // 触发停止事件
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+    this.logToManager('info', 'sing-box 进程已停止');
   }
 
   /**
