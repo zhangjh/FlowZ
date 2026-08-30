@@ -6,6 +6,7 @@
 export type {
   UserConfig,
   ServerConfig,
+  ServerGroup,
   DomainRule,
   ProxyStatus,
   TrafficStats,

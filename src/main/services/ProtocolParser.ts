@@ -33,6 +33,14 @@ export interface IProtocolParser {
    * 将服务器配置生成为分享 URL
    */
   generateUrl(config: ServerConfig): string;
+
+  /**
+   * 批量解析订阅文本（多行协议链接）
+   * 会自动过滤空行、注释行和无法识别的行，单行失败不会影响其他行
+   * @param text 订阅文本，每行一个协议链接
+   * @returns 解析出的服务器配置数组
+   */
+  parseMany(text: string): ServerConfig[];
 }
 
 export class ProtocolParser implements IProtocolParser {
@@ -40,7 +48,41 @@ export class ProtocolParser implements IProtocolParser {
    * 检查 URL 是否为支持的协议
    */
   isSupported(url: string): boolean {
-    return url.startsWith('vless://') || url.startsWith('trojan://') || url.startsWith('hysteria2://') || url.startsWith('hy2://');
+    return (
+      url.startsWith('vless://') ||
+      url.startsWith('trojan://') ||
+      url.startsWith('hysteria2://') ||
+      url.startsWith('hy2://')
+    );
+  }
+
+  /**
+   * 批量解析订阅文本（多行协议链接）
+   */
+  parseMany(text: string): ServerConfig[] {
+    if (!text) return [];
+
+    // 按行拆分，兼容 \r\n 和 \n
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      // 过滤空行、注释行（# 开头）、非协议行
+      .filter((line) => line && !line.startsWith('#') && this.isSupported(line));
+
+    const servers: ServerConfig[] = [];
+
+    for (const line of lines) {
+      try {
+        servers.push(this.parseUrl(line));
+      } catch (error) {
+        // 单行解析失败不影响其他行，记录日志并跳过
+        console.warn(
+          `[订阅解析] 跳过无效链接: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    return servers;
   }
 
   /**
@@ -54,7 +96,7 @@ export class ProtocolParser implements IProtocolParser {
     try {
       const urlObj = new URL(url);
       let protocolStr = urlObj.protocol.replace(':', '');
-      
+
       // hy2 是 hysteria2 的别名
       if (protocolStr === 'hy2') {
         protocolStr = 'hysteria2';
@@ -236,7 +278,7 @@ export class ProtocolParser implements IProtocolParser {
 
     // 解析 TLS 配置
     const tlsSettings: TlsSettings = {};
-    
+
     const sni = params.get('sni') || params.get('peer');
     if (sni) {
       tlsSettings.serverName = sni;
@@ -417,7 +459,7 @@ export class ProtocolParser implements IProtocolParser {
   generateUrl(config: ServerConfig): string {
     // 统一转换为小写进行比较，因为存储的协议值可能是大写或小写
     const protocol = config.protocol?.toLowerCase();
-    
+
     if (protocol === 'vless') {
       return this.generateVlessUrl(config);
     } else if (protocol === 'trojan') {

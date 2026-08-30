@@ -175,6 +175,61 @@ export class ConfigManager implements IConfigManager {
       }
     }
 
+    // 兼容旧配置：serverGroups 缺失时初始化为空数组
+    if (!Array.isArray(config.serverGroups)) {
+      config.serverGroups = [];
+    }
+
+    // 验证 serverGroups
+    for (const group of config.serverGroups) {
+      if (!group.id || typeof group.id !== 'string') {
+        throw new Error('Group id is required and must be a string');
+      }
+      if (!group.name || typeof group.name !== 'string') {
+        throw new Error('Group name is required and must be a string');
+      }
+      if (!Array.isArray(group.serverIds)) {
+        throw new Error('Group serverIds must be an array');
+      }
+
+      // 兼容已有订阅分组：历史成员全部视为订阅成员；无订阅 URL 的
+      // 手动分组则视为手动成员。后续刷新可据此保留手动添加的节点。
+      if (!Array.isArray(group.subscriptionServerIds)) {
+        group.subscriptionServerIds = group.url ? [...group.serverIds] : [];
+      }
+      if (!Array.isArray(group.manualServerIds)) {
+        group.manualServerIds = group.url ? [] : [...group.serverIds];
+      }
+      if (!Array.isArray(group.excludedSubscriptionKeys)) {
+        group.excludedSubscriptionKeys = [];
+      }
+
+      group.serverIds = Array.from(
+        new Set([...group.subscriptionServerIds, ...group.manualServerIds])
+      );
+    }
+
+    // 验证 selectedGroupId
+    if (config.selectedGroupId !== undefined && config.selectedGroupId !== null) {
+      if (typeof config.selectedGroupId !== 'string') {
+        throw new Error('selectedGroupId must be a string or null');
+      }
+      const groupExists = config.serverGroups.some((g) => g.id === config.selectedGroupId);
+      if (!groupExists) {
+        throw new Error('selectedGroupId references a non-existent group');
+      }
+    }
+    // 兼容旧配置：selectedGroupId 缺失时初始化为 null
+    if (config.selectedGroupId === undefined) {
+      config.selectedGroupId = null;
+    }
+
+    // 分组和单节点是互斥出站。兼容早期分组实现曾可能保存两者的配置，
+    // 沿用代理侧原有的分组优先级，避免加载后出现歧义。
+    if (config.selectedGroupId && config.selectedServerId) {
+      config.selectedServerId = null;
+    }
+
     // 验证 proxyMode（不区分大小写）
     const proxyModeLower = config.proxyMode?.toLowerCase();
     if (!proxyModeLower || !['global', 'smart', 'direct'].includes(proxyModeLower)) {
@@ -295,6 +350,8 @@ export class ConfigManager implements IConfigManager {
     return {
       servers: [],
       selectedServerId: null,
+      serverGroups: [],
+      selectedGroupId: null,
       proxyMode: 'global',
       proxyModeType: 'systemProxy', // 默认使用系统代理模式，不需要管理员权限
       tunConfig: {

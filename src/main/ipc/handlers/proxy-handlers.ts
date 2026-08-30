@@ -41,7 +41,12 @@ export async function executeProxyStart(
   let finalConfig = config;
 
   // 自动选择模式：启动前先测速选最佳服务器
-  if (autoSelectService && config.autoSelect?.enabled && config.servers.length > 0) {
+  if (
+    autoSelectService &&
+    config.autoSelect?.enabled &&
+    !config.selectedGroupId &&
+    config.servers.length > 0
+  ) {
     console.log('[Proxy] Auto-select enabled, testing servers before start...');
     try {
       const results = await autoSelectService.testAllServers(config.servers);

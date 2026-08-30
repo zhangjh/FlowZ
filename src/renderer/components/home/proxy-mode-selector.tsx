@@ -26,26 +26,32 @@ export function ProxyModeSelector() {
 
   const hasError = connectionStatus?.proxyCore?.error;
 
-  // Check if server is configured and selected
+  // Check whether the selected outbound (a server or a group) is usable.
   const isServerConfigured = (() => {
-    if (!config?.selectedServerId) return false;
+    if (!config) return false;
 
-    const selectedServer = config.servers?.find((s) => s.id === config.selectedServerId);
-    if (!selectedServer) return false;
+    const isUsableServer = (server: (typeof config.servers)[number] | undefined) => {
+      if (!server?.address || server.address.trim() === '') return false;
+      if (!server.port || server.port <= 0) return false;
 
-    // Basic checks
-    if (!selectedServer.address || selectedServer.address.trim() === '') return false;
-    if (!selectedServer.port || selectedServer.port <= 0) return false;
+      const protocol = server.protocol?.toLowerCase();
+      if (protocol === 'vless') {
+        return !!(server.uuid && server.uuid.trim() !== '');
+      }
+      if (protocol === 'trojan' || protocol === 'hysteria2') {
+        return !!(server.password && server.password.trim() !== '');
+      }
+      return false;
+    };
 
-    // Protocol-specific checks (case-insensitive)
-    const protocol = selectedServer.protocol?.toLowerCase();
-    if (protocol === 'vless') {
-      return !!(selectedServer.uuid && selectedServer.uuid.trim() !== '');
-    } else if (protocol === 'trojan' || protocol === 'hysteria2') {
-      return !!(selectedServer.password && selectedServer.password.trim() !== '');
+    if (config.selectedGroupId) {
+      const group = config.serverGroups?.find((item) => item.id === config.selectedGroupId);
+      return !!group?.serverIds.some((id) =>
+        isUsableServer(config.servers.find((server) => server.id === id))
+      );
     }
 
-    return false;
+    return isUsableServer(config.servers.find((server) => server.id === config.selectedServerId));
   })();
 
   const handleModeChange = async (value: string) => {
@@ -110,7 +116,7 @@ export function ProxyModeSelector() {
             className="w-full"
             size="lg"
             variant={isConnected ? 'outline' : 'default'}
-            title={!isServerConfigured ? '请先配置服务器' : hasError ? hasError : ''}
+            title={!isServerConfigured ? '请先选择有效的服务器或分组' : hasError ? hasError : ''}
           >
             {isLoading ? (
               <>

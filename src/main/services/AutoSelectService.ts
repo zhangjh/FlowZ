@@ -80,10 +80,14 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
    */
   start(config: UserConfig): void {
     this.config = config;
-    this.enabled = config.autoSelect?.enabled ?? false;
+    // 分组使用 sing-box urltest 管理组内故障转移，不能同时由全局自动选择
+    // 改写 selectedServerId，否则会形成“分组和单节点同时选中”的无效状态。
+    this.enabled = (config.autoSelect?.enabled ?? false) && !config.selectedGroupId;
 
     if (this.enabled) {
       this.logToManager('info', '自动选择服务已初始化（等待代理启动后开始健康检查）');
+    } else {
+      this.stopHealthCheck();
     }
   }
 
@@ -102,7 +106,7 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
   updateConfig(config: UserConfig): void {
     const wasEnabled = this.enabled;
     this.config = config;
-    this.enabled = config.autoSelect?.enabled ?? false;
+    this.enabled = (config.autoSelect?.enabled ?? false) && !config.selectedGroupId;
 
     if (this.enabled && !wasEnabled) {
       this.startHealthCheck();

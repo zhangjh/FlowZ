@@ -272,12 +272,143 @@ export async function addServerFromUrl(
   }
 }
 
+/**
+ * 解析订阅内容（多行协议链接 或 订阅 URL），返回解析出的服务器（不保存）
+ */
+export async function parseSubscriptionUrl(input: {
+  content?: string;
+  url?: string;
+}): Promise<ApiResponse<ServerConfig[]>> {
+  try {
+    const servers = await api.server.parseSubscription(input);
+    return { success: true, data: servers };
+  } catch (error: any) {
+    ErrorHandler.handleApiError(error, '解析订阅');
+    return { success: false, error: error?.message };
+  }
+}
+
+/**
+ * 从订阅批量添加服务器到配置（自动归为一个分组，启用组内故障转移）
+ */
+export async function addSubscription(input: {
+  servers?: ServerConfig[];
+  content?: string;
+  url?: string;
+  groupName?: string;
+}): Promise<ApiResponse<{ servers: ServerConfig[]; group: import('./types').ServerGroup }>> {
+  try {
+    const result = await api.server.addSubscription(input);
+    ErrorHandler.showSuccess('订阅导入成功');
+    return { success: true, data: result };
+  } catch (error: any) {
+    ErrorHandler.handleApiError(error, '导入订阅');
+    return { success: false, error: error?.message };
+  }
+}
+
+/**
+ * 分组管理 API
+ */
+export const groupApi = {
+  async getAll(): Promise<ApiResponse<import('./types').ServerGroup[]>> {
+    try {
+      const groups = await api.group.getAll();
+      return { success: true, data: groups };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '获取分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async create(input: {
+    name: string;
+    serverIds?: string[];
+  }): Promise<ApiResponse<import('./types').ServerGroup>> {
+    try {
+      const group = await api.group.create(input);
+      ErrorHandler.showSuccess('分组已创建');
+      return { success: true, data: group };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '创建分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async update(input: {
+    groupId: string;
+    name?: string;
+    addServerIds?: string[];
+    removeServerIds?: string[];
+  }): Promise<ApiResponse<import('./types').ServerGroup>> {
+    try {
+      const group = await api.group.update(input);
+      ErrorHandler.showSuccess('分组已更新');
+      return { success: true, data: group };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '更新分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async delete(groupId: string): Promise<ApiResponse<void>> {
+    try {
+      await api.group.delete(groupId);
+      ErrorHandler.showSuccess('分组已删除');
+      return { success: true };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '删除分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async select(groupId: string | null): Promise<ApiResponse<void>> {
+    try {
+      await api.group.select(groupId);
+      return { success: true };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '选择分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async addServers(input: { serverIds: string[]; groupId: string }): Promise<ApiResponse<void>> {
+    try {
+      await api.group.addServers(input);
+      ErrorHandler.showSuccess('已添加到分组');
+      return { success: true };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '添加到分组');
+      return { success: false, error: error?.message };
+    }
+  },
+  async moveServer(input: { serverId: string; targetGroupId: string }): Promise<ApiResponse<void>> {
+    try {
+      await api.group.moveServer(input);
+      ErrorHandler.showSuccess('已移至分组');
+      return { success: true };
+    } catch (error: any) {
+      ErrorHandler.handleApiError(error, '移至分组');
+      return { success: false, error: error?.message };
+    }
+  },
+};
+
 export async function generateShareUrl(server: ServerConfig): Promise<ApiResponse<string>> {
   try {
     const url = await api.server.generateUrl(server);
     return { success: true, data: url };
   } catch (error: any) {
     ErrorHandler.handleApiError(error, '生成分享链接');
+    return { success: false, error: error?.message };
+  }
+}
+
+/**
+ * 生成分组分享文本：组内每个节点生成一个协议链接，换行拼接。
+ * 其他 FlowZ 客户端可粘贴到「订阅导入」中批量导入这些节点。
+ */
+export async function generateGroupShareUrl(groupId: string): Promise<ApiResponse<string>> {
+  try {
+    const text = await api.group.generateShareUrl(groupId);
+    return { success: true, data: text };
+  } catch (error: any) {
+    ErrorHandler.handleApiError(error, '生成分组分享');
     return { success: false, error: error?.message };
   }
 }

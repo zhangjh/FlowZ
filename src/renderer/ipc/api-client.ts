@@ -196,6 +196,64 @@ export const serverApi = {
   async generateUrl(server: ServerConfig): Promise<string> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_GENERATE_URL, { server });
   },
+
+  /**
+   * 解析订阅内容（多行协议链接 或 订阅 URL），返回解析出的服务器（不保存）
+   */
+  async parseSubscription(input: { content?: string; url?: string }): Promise<ServerConfig[]> {
+    return ipcClient.invoke(IPC_CHANNELS.SERVER_PARSE_SUBSCRIPTION, input);
+  },
+
+  /**
+   * 从订阅批量添加服务器到配置（自动归为一个分组，启用组内故障转移）
+   * 传入 servers 时复用调用方已解析的服务器，避免二次拉取/解析
+   */
+  async addSubscription(input: {
+    servers?: ServerConfig[];
+    content?: string;
+    url?: string;
+    groupName?: string;
+  }): Promise<{ servers: ServerConfig[]; group: import('../../shared/types').ServerGroup }> {
+    return ipcClient.invoke(IPC_CHANNELS.SERVER_ADD_SUBSCRIPTION, input);
+  },
+};
+
+/**
+ * 分组管理 API
+ */
+export const groupApi = {
+  async getAll(): Promise<import('../../shared/types').ServerGroup[]> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_GET_ALL);
+  },
+  async create(input: {
+    name: string;
+    serverIds?: string[];
+  }): Promise<import('../../shared/types').ServerGroup> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_CREATE, input);
+  },
+  async update(input: {
+    groupId: string;
+    name?: string;
+    addServerIds?: string[];
+    removeServerIds?: string[];
+  }): Promise<import('../../shared/types').ServerGroup> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_UPDATE, input);
+  },
+  async moveServer(input: { serverId: string; targetGroupId: string }): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_MOVE_SERVER, input);
+  },
+  async delete(groupId: string): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_DELETE, { groupId });
+  },
+  async generateShareUrl(groupId: string): Promise<string> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_SHARE, { groupId });
+  },
+  async select(groupId: string | null): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_SELECT, { groupId });
+  },
+  async addServers(input: { serverIds: string[]; groupId: string }): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.GROUP_ADD_SERVERS, input);
+  },
 };
 
 /**
@@ -427,13 +485,13 @@ export interface UpdateInfo {
  */
 export interface UpdateProgress {
   status:
-  | 'idle'
-  | 'checking'
-  | 'no-update'
-  | 'update-available'
-  | 'downloading'
-  | 'downloaded'
-  | 'error';
+    | 'idle'
+    | 'checking'
+    | 'no-update'
+    | 'update-available'
+    | 'downloading'
+    | 'downloaded'
+    | 'error';
   percentage: number;
   message: string;
   error?: string;
@@ -550,6 +608,7 @@ export const api = {
   proxy: proxyApi,
   config: configApi,
   server: serverApi,
+  group: groupApi,
   rules: rulesApi,
   logs: logsApi,
   systemProxy: systemProxyApi,

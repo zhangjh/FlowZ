@@ -3,7 +3,14 @@
  */
 
 import { create } from 'zustand';
-import type { UserConfig, DomainRule, TrafficStats, AutoSelectStatus, ServerSpeedResult } from '../../shared/types';
+import type {
+  UserConfig,
+  DomainRule,
+  TrafficStats,
+  AutoSelectStatus,
+  ServerSpeedResult,
+  ServerGroup,
+} from '../../shared/types';
 import { api } from '../ipc';
 
 // 兼容旧的类型定义
@@ -75,6 +82,15 @@ interface AppState {
   // Server Management Actions
   deleteServer: (serverId: string) => Promise<void>;
 
+  // Group Management Actions
+  createGroup: (name: string, serverIds?: string[]) => Promise<ServerGroup>;
+  updateGroup: (
+    groupId: string,
+    changes: { name?: string; addServerIds?: string[]; removeServerIds?: string[] }
+  ) => Promise<void>;
+  moveServerToGroup: (serverId: string, targetGroupId: string) => Promise<void>;
+  deleteGroup: (groupId: string) => Promise<void>;
+
   // Custom Rules Actions
   addCustomRule: (rule: DomainRule) => Promise<void>;
   updateCustomRule: (rule: DomainRule) => Promise<void>;
@@ -126,7 +142,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
 
       if (isTunMode) {
-        console.log('[StartProxy] TUN mode detected, sing-box will request admin privileges when needed');
+        console.log(
+          '[StartProxy] TUN mode detected, sing-box will request admin privileges when needed'
+        );
       }
 
       await api.proxy.start(currentConfig);
@@ -425,6 +443,72 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await api.server.delete(serverId);
       // Reload config to get updated server list
+      await get().loadConfig();
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  // Group Management Actions
+  createGroup: async (name, serverIds) => {
+    set({ isLoading: true, error: null });
+    try {
+      const group = await api.group.create({ name, serverIds });
+      // 从后端重新加载配置，避免与 configChanged 广播事件叠加导致重复渲染分组
+      await get().loadConfig();
+      return group;
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  updateGroup: async (groupId, changes) => {
+    set({ isLoading: true, error: null });
+    try {
+      const group = await api.group.update({ groupId, ...changes });
+      // 更新本地 config 中的分组
+      const currentConfig = get().config;
+      if (currentConfig) {
+        set({
+          config: {
+            ...currentConfig,
+            serverGroups: currentConfig.serverGroups.map((g: ServerGroup) =>
+              g.id === groupId ? group : g
+            ),
+          },
+        });
+      }
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  moveServerToGroup: async (serverId, targetGroupId) => {
+    set({ isLoading: true, error: null });
+    try {
+      await api.group.moveServer({ serverId, targetGroupId });
+      await get().loadConfig();
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  deleteGroup: async (groupId) => {
+    set({ isLoading: true, error: null });
+    try {
+      await api.group.delete(groupId);
       await get().loadConfig();
     } catch (error) {
       set({ error: String(error) });

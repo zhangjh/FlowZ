@@ -133,6 +133,13 @@ interface SingBoxOutbound {
   tag: string;
   server?: string;
   server_port?: number;
+  // urltest / selector 分组
+  outbounds?: string[];
+  url?: string;
+  interval?: string;
+  tolerance?: number;
+  interrupt_exist_connections?: boolean;
+  default?: string;
   // VLESS
   uuid?: string;
   flow?: string;
@@ -172,10 +179,6 @@ interface SingBoxOutbound {
   };
   // DNS resolver for outbound server domain
   domain_resolver?: string;
-  // Selector
-  outbounds?: string[];
-  default?: string;
-  interrupt_exist_connections?: boolean;
 }
 
 interface SingBoxRouteRule {
@@ -318,14 +321,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 修复可能被 root 创建的文件权限（从 TUN 模式切换到系统代理模式时）
     await this.fixFilePermissions();
 
-    // 检查是否选择了服务器
-    if (!config.selectedServerId) {
+    // 检查是否选择了服务器或分组
+    const hasActive =
+      !!config.selectedServerId ||
+      (!!config.selectedGroupId &&
+        config.serverGroups.some((g) => g.id === config.selectedGroupId && g.serverIds.length > 0));
+
+    if (!hasActive) {
       throw new Error('No server selected');
     }
 
-    // 查找选中的服务器
-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
-    if (!selectedServer) {
+    // 校验选中分组/服务器的成员确实存在
+    if (config.selectedGroupId) {
+      const group = config.serverGroups.find((g) => g.id === config.selectedGroupId);
+      const validMembers = (group?.serverIds || []).filter((id) =>
+        config.servers.some((s) => s.id === id)
+      );
+      if (!group || validMembers.length === 0) {
+        throw new Error('Selected group has no valid servers');
+      }
+    } else if (!config.servers.find((s) => s.id === config.selectedServerId)) {
       throw new Error('Selected server not found');
     }
 
@@ -378,8 +393,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     await this.waitForClashApi();
 
     try {
+      // 同步 proxy selector 默认指向（分组模式下指向 urltest 分组）
+      const activeServers = this.getActiveServers(config);
+      const isGroup = !!config.selectedGroupId && activeServers.length > 0;
+      const defaultTag = isGroup
+        ? `group-${config.selectedGroupId}`
+        : config.selectedServerId
+          ? this.getServerOutboundTag(config.selectedServerId)
+          : 'direct';
       await this.updateClashApi('/proxies/proxy', {
-        name: this.getServerOutboundTag(selectedServer.id),
+        name: defaultTag,
       });
       await this.updateModeSelectors(config.proxyMode);
     } catch (error) {
@@ -714,6 +737,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return true;
     }
 
+    // 检查选中的分组
+    if (this.currentConfig.selectedGroupId !== newConfig.selectedGroupId) {
+      return true;
+    }
+
     // 检查端口
     if (
       this.currentConfig.socksPort !== newConfig.socksPort ||
@@ -754,18 +782,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return false;
     }
 
-    const currentStaticConfig = JSON.stringify({
-      ...this.currentConfig,
-      proxyMode: 'smart',
-      selectedServerId: null,
-    });
-    const newStaticConfig = JSON.stringify({
-      ...newConfig,
-      proxyMode: 'smart',
-      selectedServerId: null,
-    });
+    return (
+      JSON.stringify(this.buildHotReloadFingerprint(this.currentConfig)) ===
+      JSON.stringify(this.buildHotReloadFingerprint(newConfig))
+    );
+  }
 
-    return currentStaticConfig === newStaticConfig;
+  /**
+   * 计算用于判断是否需要重启的“静态指纹”。
+   * 仅比较会影响运行中出站的内容：
+   * - 排除 selectedServerId / proxyMode（这两者由运行时 Clash API 热切换处理，无需重启）
+   * - 排除分组结构本身（名称/订阅 URL/非生效分组），仅保留当前生效分组的成员，
+   *   因此「修改非生效分组」不会触发重启
+   * - 排除 server 上派生的 group 归属（已由生效分组成员覆盖）
+   */
+  private buildHotReloadFingerprint(config: UserConfig): Record<string, unknown> {
+    const activeGroupMemberIds =
+      config.selectedGroupId != null
+        ? config.serverGroups.find((g) => g.id === config.selectedGroupId)?.serverIds
+        : undefined;
+
+    return {
+      ...config,
+      proxyMode: 'smart',
+      selectedServerId: null,
+      serverGroups: [],
+      activeGroupMemberIds: activeGroupMemberIds ?? [],
+      servers: config.servers.map(({ groupId: _groupId, ...rest }) => rest),
+    };
   }
 
   /**
@@ -953,20 +997,46 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 获取当前生效的出站服务器列表
+   * - 若选中了分组：返回该分组的所有成员服务器（用于 urltest 故障转移）
+   * - 否则返回单个选中的服务器
+   */
+  private getActiveServers(config: UserConfig): ServerConfig[] {
+    if (config.selectedGroupId) {
+      const group = config.serverGroups.find((g) => g.id === config.selectedGroupId);
+      if (group && group.serverIds.length > 0) {
+        const members = config.servers.filter((s) => group.serverIds.includes(s.id));
+        if (members.length > 0) {
+          return members;
+        }
+      }
+    }
+    const selected = config.servers.find((s) => s.id === config.selectedServerId);
+    return selected ? [selected] : [];
+  }
+
+  /**
    * 生成 sing-box 配置（sing-box 1.12.x 格式）
    */
   generateSingBoxConfig(config: UserConfig): SingBoxConfig {
-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
-    if (!selectedServer) {
-      throw new Error('Selected server not found');
+    const activeServers = this.getActiveServers(config);
+    if (activeServers.length === 0) {
+      throw new Error('未选择服务器或分组');
     }
+
+    const isGroup =
+      !!config.selectedGroupId &&
+      config.serverGroups.some((g) => g.id === config.selectedGroupId && g.serverIds.length > 0);
 
     // 调试日志
     console.log('[ProxyManager] Generating config with:', {
       proxyMode: config.proxyMode,
       proxyModeType: config.proxyModeType,
       selectedServerId: config.selectedServerId,
-      serverProtocol: selectedServer.protocol,
+      selectedGroupId: config.selectedGroupId,
+      activeServerCount: activeServers.length,
+      isGroup,
+      activeProtocols: activeServers.map((s) => s.protocol),
     });
 
     // 获取用户数据目录用于缓存文件
@@ -975,10 +1045,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const singboxConfig: SingBoxConfig = {
       log: this.generateLogConfig(config),
-      dns: this.generateDnsConfig(config),
+      // 保留全部节点的域名直连解析规则，保证已有的单节点热切换仍能切到
+      // 任意 proxy-<id>，并避免切换后代理服务器域名落入 FakeIP 路由。
+      dns: this.generateDnsConfig(config, config.servers),
       inbounds: this.generateInbounds(config),
-      outbounds: this.generateOutbounds(config),
-      route: this.generateRouteConfig(config),
+      outbounds: this.generateOutbounds(config, activeServers, isGroup),
+      route: this.generateRouteConfig(config, config.servers),
       experimental: {
         cache_file: {
           enabled: true,
@@ -1057,7 +1129,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 统一使用 FakeIP 模式：DNS 查询直接返回虚假 IP，由 sniff 识别真实域名后路由
    * 这避免了 DNS 污染和超时问题，TUN 和系统代理模式都使用相同的逻辑
    */
-  private generateDnsConfig(config: UserConfig): SingBoxDnsConfig {
+  private generateDnsConfig(config: UserConfig, activeServers: ServerConfig[]): SingBoxDnsConfig {
     const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
     const isTunMode = modeType !== 'systemproxy';
 
@@ -1111,18 +1183,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const dnsRules: SingBoxDnsRule[] = [];
 
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）
-    const proxyServerDomains = Array.from(
-      new Set(
-        config.servers
-          .filter((server) => !isIP(server.address))
-          .map((server) => server.address)
-      )
-    );
-    if (proxyServerDomains.length > 0) {
-      dnsRules.push({
-        domain: proxyServerDomains,
-        server: 'dns-local',
-      } as SingBoxDnsRule);
+    // 代理服务器域名必须使用本地 DNS 解析（避免死循环）。
+    // IP 地址不需要 DNS 规则。支持分组：为每个成员的域名添加规则
+    for (const server of activeServers) {
+      if (server?.address && !isIP(server.address)) {
+        dnsRules.push({
+          domain: [server.address],
+          server: 'dns-local',
+        } as SingBoxDnsRule);
+      }
     }
 
     // 绕过 FakeIP 的域名：使用本地 DNS 解析真实 IP
@@ -1257,12 +1326,42 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   /**
    * 生成 Outbound 配置（sing-box 1.12.x 格式）
-   * 包含 selector、服务器、direct、block 出站
+   * 包含 mode-* selector、服务器出站、direct、block 出站
+   * 分组模式额外生成 urltest 出站用于组内故障转移
    */
-  private generateOutbounds(config: UserConfig): SingBoxOutbound[] {
-    const proxyOutbounds = config.servers.map((server) =>
+  private generateOutbounds(
+    config: UserConfig,
+    activeServers: ServerConfig[],
+    isGroup: boolean
+  ): SingBoxOutbound[] {
+    // 保留所有服务器出站，维持主干既有的 Clash API 热切换能力。
+    const serverOutbounds: SingBoxOutbound[] = config.servers.map((server) =>
       this.generateProxyOutbound(server, this.getServerOutboundTag(server.id))
     );
+    const serverTags = serverOutbounds.map((outbound) => outbound.tag);
+    const memberTags = activeServers.map((server) => this.getServerOutboundTag(server.id));
+
+    // 分组模式：额外生成 urltest 故障转移出站
+    const groupTags: string[] = [];
+    let proxyDefault =
+      config.selectedServerId != null
+        ? this.getServerOutboundTag(config.selectedServerId)
+        : memberTags[0];
+    if (isGroup && activeServers.length > 0) {
+      const groupTag = `group-${config.selectedGroupId}`;
+      groupTags.push(groupTag);
+      serverOutbounds.push({
+        type: 'urltest',
+        tag: groupTag,
+        outbounds: memberTags,
+        url: 'http://www.gstatic.com/generate_204',
+        interval: '10m',
+        tolerance: 50,
+        interrupt_exist_connections: true,
+      } as SingBoxOutbound);
+      proxyDefault = groupTag;
+    }
+
     const modeSelections = this.getModeSelections(config.proxyMode);
     const outbounds: SingBoxOutbound[] = [
       this.generateSelectorOutbound('mode-cn', modeSelections.cn),
@@ -1271,11 +1370,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       {
         type: 'selector',
         tag: 'proxy',
-        outbounds: proxyOutbounds.map((outbound) => outbound.tag),
-        default: this.getServerOutboundTag(config.selectedServerId!),
+        outbounds: [...groupTags, ...serverTags],
+        default: proxyDefault,
         interrupt_exist_connections: true,
       },
-      ...proxyOutbounds,
+      ...serverOutbounds,
     ];
 
     // 直连出站
@@ -1322,10 +1421,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成代理 Outbound 配置（sing-box 1.12.x 格式）
+   * 生成单个服务器的协议 Outbound 配置（tag 可指定）
    */
   private generateProxyOutbound(server: ServerConfig, tag: string): SingBoxOutbound {
-    // sing-box 要求协议类型必须是小写
     const protocol = server.protocol.toLowerCase();
 
     const outbound: SingBoxOutbound = {
@@ -1355,23 +1453,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (protocol === 'hysteria2') {
       outbound.password = server.password;
 
-      // 带宽限制
       if (server.hysteria2Settings?.upMbps) {
         outbound.up_mbps = server.hysteria2Settings.upMbps;
       }
       if (server.hysteria2Settings?.downMbps) {
         outbound.down_mbps = server.hysteria2Settings.downMbps;
       }
-
-      // 混淆配置
       if (server.hysteria2Settings?.obfs?.type && server.hysteria2Settings?.obfs?.password) {
         outbound.obfs = {
           type: server.hysteria2Settings.obfs.type,
           password: server.hysteria2Settings.obfs.password,
         };
       }
-
-      // 网络类型 (tcp/udp)
       if (server.hysteria2Settings?.network) {
         outbound.network = server.hysteria2Settings.network;
       }
@@ -1385,7 +1478,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         insecure: server.tlsSettings?.allowInsecure || false,
       };
 
-      // uTLS 仅适用于基于 TCP 的协议，Hysteria2 使用 QUIC (UDP) 不支持 uTLS
       if (protocol !== 'hysteria2') {
         outbound.tls.utls = {
           enabled: true,
@@ -1448,8 +1540,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成路由配置（sing-box 1.12.x 格式）
    */
-  private generateRouteConfig(config: UserConfig): SingBoxRouteConfig {
+  private generateRouteConfig(config: UserConfig, activeServers?: ServerConfig[]): SingBoxRouteConfig {
     const rules: SingBoxRouteRule[] = [];
+
+    // 获取当前生效的服务器列表（用于排除代理服务器域名/IP）
+    // 调用方若未传则回退到按选中服务器推导（兼容旧调用）
+    const activeList =
+      activeServers && activeServers.length > 0
+        ? activeServers
+        : (() => {
+            const sel = config.servers.find((s) => s.id === config.selectedServerId);
+            return sel ? [sel] : [];
+          })();
 
     // DNS 劫持规则（必须）
     rules.push({
@@ -1459,34 +1561,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 排除所有代理服务器域名/IP，确保 selector 切换后服务器连接仍走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
-    const proxyServerDomains = Array.from(
-      new Set(
-        config.servers
-          .filter((server) => !isIP(server.address))
-          .map((server) => server.address)
-      )
-    );
-    if (proxyServerDomains.length > 0) {
-      rules.push({
-        domain: proxyServerDomains,
-        action: 'route',
-        outbound: 'direct',
-      });
-    }
-
-    const proxyServerCidrs = Array.from(
-      new Set(
-        config.servers
-          .filter((server) => isIP(server.address))
-          .map((server) => `${server.address}/${isIP(server.address) === 6 ? 128 : 32}`)
-      )
-    );
-    if (proxyServerCidrs.length > 0) {
-      rules.push({
-        ip_cidr: proxyServerCidrs,
-        action: 'route',
-        outbound: 'direct',
-      });
+    for (const server of activeList) {
+      if (server?.address) {
+        if (isIP(server.address)) {
+          const cidr =
+            isIP(server.address) === 6
+              ? `${server.address}/128`
+              : `${server.address}/32`;
+          rules.push({
+            ip_cidr: [cidr],
+            action: 'route',
+            outbound: 'direct',
+          });
+        } else {
+          rules.push({
+            domain: [server.address],
+            action: 'route',
+            outbound: 'direct',
+          });
+        }
+      }
     }
 
     // 自定义规则（优先级最高，必须放在智能分流规则之前）

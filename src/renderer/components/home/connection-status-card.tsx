@@ -11,6 +11,7 @@ import {
 import { useAppStore } from '@/store/app-store';
 import { Plus } from 'lucide-react';
 import { toast } from 'sonner';
+import type { ServerGroup } from '@/bridge/types';
 
 export function ConnectionStatusCard() {
   const connectionStatus = useAppStore((state) => state.connectionStatus);
@@ -23,6 +24,36 @@ export function ConnectionStatusCard() {
   const servers = config?.servers || [];
   const selectedServerId = config?.selectedServerId;
   const selectedServer = servers.find((s) => s.id === selectedServerId);
+
+  const groups = config?.serverGroups || [];
+  const selectedGroupId = config?.selectedGroupId;
+  const selectedGroup = selectedGroupId
+    ? groups.find((g) => g.id === selectedGroupId)
+    : undefined;
+
+  const groupNodeCount = (group: ServerGroup) =>
+    group.serverIds.filter((id) => servers.some((s) => s.id === id)).length;
+
+  // 已属于任何分组的节点 ID
+  const groupedIds = new Set<string>();
+  for (const g of groups) for (const id of g.serverIds) groupedIds.add(id);
+  // 出站下拉只展示分组 + 未分组节点（分组内的节点由分组统一管理）
+  const ungroupedServers = servers.filter((s) => !groupedIds.has(s.id));
+
+  const outboundOptions = (
+    <>
+      {groups.map((group) => (
+        <SelectItem key={`group:${group.id}`} value={`group:${group.id}`}>
+          分组 · {group.name}（{groupNodeCount(group)}节点）
+        </SelectItem>
+      ))}
+      {ungroupedServers.map((server) => (
+        <SelectItem key={server.id} value={server.id}>
+          {server.name} ({server.protocol})
+        </SelectItem>
+      ))}
+    </>
+  );
 
   const getStatusInfo = () => {
     const proxyModeType = config?.proxyModeType || connectionStatus?.proxyModeType || 'systemProxy';
@@ -141,20 +172,36 @@ export function ConnectionStatusCard() {
     };
   };
 
-  const handleServerChange = async (serverId: string) => {
+  const handleServerChange = async (value: string) => {
     if (!config) return;
 
     try {
-      const updatedConfig = {
-        ...config,
-        selectedServerId: serverId,
-      };
-
-      await saveConfig(updatedConfig);
-      toast.success('服务器已切换');
+      if (value.startsWith('group:')) {
+        const groupId = value.slice('group:'.length);
+        const group = groups.find((g) => g.id === groupId);
+        if (!group || group.serverIds.length === 0) {
+          toast.error('分组无效', { description: '分组不存在或没有成员服务器' });
+          return;
+        }
+        const updatedConfig = {
+          ...config,
+          selectedGroupId: groupId,
+          selectedServerId: null,
+        };
+        await saveConfig(updatedConfig);
+        toast.success('分组已切换，启用组内自动故障转移');
+      } else {
+        const updatedConfig = {
+          ...config,
+          selectedServerId: value,
+          selectedGroupId: null,
+        };
+        await saveConfig(updatedConfig);
+        toast.success('服务器已切换');
+      }
     } catch (error) {
       toast.error('切换失败', {
-        description: error instanceof Error ? error.message : '切换服务器时发生错误',
+        description: error instanceof Error ? error.message : '切换时发生错误',
       });
     }
   };
@@ -199,43 +246,67 @@ export function ConnectionStatusCard() {
               </div>
             </div>
           </div>
+        ) : selectedGroup ? (
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <span className="text-sm text-muted-foreground">当前出站</span>
+              <Select
+                value={selectedGroupId ? `group:${selectedGroupId}` : undefined}
+                onValueChange={handleServerChange}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="选择出站" />
+                </SelectTrigger>
+                <SelectContent>{outboundOptions}</SelectContent>
+              </Select>
+            </div>
+
+            {/* 分组详细信息 */}
+            <div className="space-y-2 pt-2 border-t">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">分组</span>
+                <Badge variant="outline" className="text-xs">
+                  {selectedGroup.name}
+                </Badge>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">节点数</span>
+                <span className="text-sm font-medium">{groupNodeCount(selectedGroup)}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">模式</span>
+                <span className="text-sm font-medium">自动故障转移（urltest）</span>
+              </div>
+            </div>
+          </div>
         ) : !selectedServer ? (
           <div className="space-y-3">
             <div className="p-4 border border-yellow-500/50 bg-yellow-500/10 rounded-lg">
               <p className="text-sm text-yellow-600 dark:text-yellow-400 mb-3">
-                ⚠️ 请选择一个服务器以启用代理
+                ⚠️ 请选择一个服务器或分组以启用代理
               </p>
               <Select onValueChange={handleServerChange}>
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择服务器" />
+                  <SelectValue placeholder="选择服务器或分组" />
                 </SelectTrigger>
-                <SelectContent>
-                  {servers.map((server) => (
-                    <SelectItem key={server.id} value={server.id}>
-                      {server.name} ({server.protocol})
-                    </SelectItem>
-                  ))}
-                </SelectContent>
+                <SelectContent>{outboundOptions}</SelectContent>
               </Select>
             </div>
           </div>
         ) : (
           <div className="space-y-3">
-            {/* 服务器切换 */}
+            {/* 出站切换 */}
             <div className="space-y-2">
               <div className="space-y-2">
                 <span className="text-sm text-muted-foreground">当前服务器</span>
-                <Select value={selectedServerId ?? undefined} onValueChange={handleServerChange}>
+                <Select
+                  value={selectedServerId ?? undefined}
+                  onValueChange={handleServerChange}
+                >
                   <SelectTrigger className="w-full">
-                    <SelectValue placeholder="选择服务器" />
+                    <SelectValue placeholder="选择服务器或分组" />
                   </SelectTrigger>
-                  <SelectContent>
-                    {servers.map((server) => (
-                      <SelectItem key={server.id} value={server.id}>
-                        {server.name} ({server.protocol})
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
+                  <SelectContent>{outboundOptions}</SelectContent>
                 </Select>
               </div>
             </div>

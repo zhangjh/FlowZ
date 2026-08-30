@@ -8,7 +8,7 @@ import {
   shell,
 } from 'electron';
 import { LogManager } from './LogManager';
-import { ServerConfig, ProxyMode } from '../../shared/types';
+import { ServerConfig, ServerGroup, ProxyMode } from '../../shared/types';
 
 /**
  * 托盘图标状态
@@ -23,6 +23,8 @@ export interface TrayMenuData {
   hasError?: boolean;
   servers: ServerConfig[];
   selectedServerId: string | null;
+  groups: ServerGroup[];
+  selectedGroupId: string | null;
   proxyMode: ProxyMode;
 }
 
@@ -68,6 +70,8 @@ export class TrayManager implements ITrayManager {
   private isProxyRunning: boolean = false;
   private servers: ServerConfig[] = [];
   private selectedServerId: string | null = null;
+  private groups: ServerGroup[] = [];
+  private selectedGroupId: string | null = null;
   private proxyMode: ProxyMode = 'smart';
 
   // 回调函数
@@ -76,6 +80,7 @@ export class TrayManager implements ITrayManager {
   private onShowWindow?: () => void;
   private onQuit?: () => void;
   private onSelectServer?: (serverId: string) => void;
+  private onSelectGroup?: (groupId: string) => void;
   private onChangeProxyMode?: (mode: ProxyMode) => void;
   private onOpenSettings?: () => void;
   private onCheckUpdate?: () => void;
@@ -95,6 +100,7 @@ export class TrayManager implements ITrayManager {
       onShowWindow?: () => void;
       onQuit?: () => void;
       onSelectServer?: (serverId: string) => void;
+      onSelectGroup?: (groupId: string) => void;
       onChangeProxyMode?: (mode: ProxyMode) => void;
       onOpenSettings?: () => void;
       onCheckUpdate?: () => void;
@@ -109,6 +115,7 @@ export class TrayManager implements ITrayManager {
     this.onShowWindow = callbacks?.onShowWindow;
     this.onQuit = callbacks?.onQuit;
     this.onSelectServer = callbacks?.onSelectServer;
+    this.onSelectGroup = callbacks?.onSelectGroup;
     this.onChangeProxyMode = callbacks?.onChangeProxyMode;
     this.onOpenSettings = callbacks?.onOpenSettings;
     this.onCheckUpdate = callbacks?.onCheckUpdate;
@@ -206,6 +213,8 @@ export class TrayManager implements ITrayManager {
       isProxyRunning,
       servers: this.servers,
       selectedServerId: this.selectedServerId,
+      groups: this.groups,
+      selectedGroupId: this.selectedGroupId,
       proxyMode: this.proxyMode,
     });
   }
@@ -222,6 +231,8 @@ export class TrayManager implements ITrayManager {
     this.isProxyRunning = data.isProxyRunning;
     this.servers = data.servers;
     this.selectedServerId = data.selectedServerId;
+    this.groups = data.groups || [];
+    this.selectedGroupId = data.selectedGroupId || null;
     this.proxyMode = data.proxyMode;
 
     // 状态显示：使用 emoji 区分不同状态
@@ -235,12 +246,40 @@ export class TrayManager implements ITrayManager {
       statusLabel = '⚪ 已断开';
     }
 
-    // 构建服务器子菜单
+    // 构建服务器子菜单：与首页出站列表保持一致，
+    // 只展示「分组 + 未分组节点」，分组内的节点由分组统一管理，不再单独列出。
     const serverSubmenu: MenuItemConstructorOptions[] = [];
     const maxLabelLength = 30;
 
-    if (data.servers.length > 0) {
-      data.servers.forEach((server) => {
+    // 已归入任何分组的节点 ID
+    const groupedIds = new Set<string>();
+    for (const group of this.groups) {
+      for (const id of group.serverIds || []) groupedIds.add(id);
+    }
+    const ungroupedServers = data.servers.filter((s) => !groupedIds.has(s.id));
+
+    // 分组出口（urltest 故障转移）
+    if (this.groups.length > 0) {
+      this.groups.forEach((group) => {
+        const memberCount = (group.serverIds || []).filter((id) =>
+          this.servers.some((s) => s.id === id)
+        ).length;
+        let label = `${group.name}（分组·${memberCount}节点）`;
+        if (label.length > maxLabelLength) {
+          label = label.substring(0, maxLabelLength - 3) + '...';
+        }
+        serverSubmenu.push({
+          label,
+          type: 'radio' as const,
+          checked: group.id === this.selectedGroupId,
+          click: () => this.handleSelectGroup(group.id),
+        });
+      });
+      serverSubmenu.push({ type: 'separator' });
+    }
+
+    if (ungroupedServers.length > 0) {
+      ungroupedServers.forEach((server) => {
         const name = server.name || server.address;
         const protocol = (server.protocol || '').toUpperCase();
         const latency = this.speedTestResults.get(server.id);
@@ -261,7 +300,7 @@ export class TrayManager implements ITrayManager {
         });
       });
       serverSubmenu.push({ type: 'separator' });
-    } else {
+    } else if (this.groups.length === 0) {
       serverSubmenu.push({ label: '未配置服务器', enabled: false });
       serverSubmenu.push({ type: 'separator' });
     }
@@ -459,6 +498,16 @@ export class TrayManager implements ITrayManager {
     this.logManager.addLog('info', `Server selected from tray: ${serverId}`, 'TrayManager');
     if (this.onSelectServer) {
       this.onSelectServer(serverId);
+    }
+  }
+
+  /**
+   * 处理选择分组
+   */
+  private handleSelectGroup(groupId: string): void {
+    this.logManager.addLog('info', `Group selected from tray: ${groupId}`, 'TrayManager');
+    if (this.onSelectGroup) {
+      this.onSelectGroup(groupId);
     }
   }
 

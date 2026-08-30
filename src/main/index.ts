@@ -341,6 +341,8 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
       hasError,
       servers: config.servers,
       selectedServerId: config.selectedServerId,
+      groups: config.serverGroups,
+      selectedGroupId: config.selectedGroupId,
       proxyMode: config.proxyMode,
     });
 
@@ -538,6 +540,7 @@ app.whenReady().then(async () => {
       try {
         const config = await configManager.loadConfig();
         config.selectedServerId = serverId;
+        config.selectedGroupId = null;
         await configManager.saveConfig(config);
         mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
         logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
@@ -550,6 +553,30 @@ app.whenReady().then(async () => {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         logManager.addLog('error', `Failed to select server: ${errorMessage}`, 'Main');
+      }
+    },
+    onSelectGroup: async (groupId: string) => {
+      try {
+        const config = await configManager.loadConfig();
+        const group = config.serverGroups.find((g) => g.id === groupId);
+        if (!group || group.serverIds.length === 0) {
+          logManager.addLog('error', `Failed to select group: group not found: ${groupId}`, 'Main');
+          return;
+        }
+        config.selectedGroupId = groupId;
+        config.selectedServerId = null;
+        await configManager.saveConfig(config);
+        mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
+        logManager.addLog('info', `Group selected from tray: ${groupId}`, 'Main');
+
+        // 更新托盘菜单
+        updateTrayMenuState(proxyManager?.getStatus().running ?? false);
+
+        // 通知渲染进程配置已更新
+        ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logManager.addLog('error', `Failed to select group: ${errorMessage}`, 'Main');
       }
     },
     onChangeProxyMode: async (mode) => {
@@ -648,16 +675,23 @@ app.whenReady().then(async () => {
         logManager.addLog('info', 'Auto-select service started', 'Main');
       }
 
-      // 检查是否启用了启动时自动连接
-      if (config.autoConnect && config.selectedServerId) {
+      // 检查是否启用了启动时自动连接。分组选中时同样可以启动。
+      const hasSelectedGroup =
+        !!config.selectedGroupId &&
+        config.serverGroups.some(
+          (group) =>
+            group.id === config.selectedGroupId &&
+            group.serverIds.some((id) => config.servers.some((server) => server.id === id))
+        );
+      if (config.autoConnect && (config.selectedServerId || hasSelectedGroup)) {
         logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
 
         if (proxyManager) {
           // 通知渲染进程执行代理启动（渲染进程会通过 IPC 调用统一的启动逻辑，含测速）
           ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_AUTO_CONNECT, {});
         }
-      } else if (config.autoConnect && !config.selectedServerId) {
-        logManager.addLog('warn', '启动时自动连接已启用，但未选择服务器', 'Main');
+      } else if (config.autoConnect) {
+        logManager.addLog('warn', '启动时自动连接已启用，但未选择有效的服务器或分组', 'Main');
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -710,6 +744,9 @@ app.whenReady().then(async () => {
     if (isRunning && proxyManager) {
       // 加载最新配置（确保使用最新值）
       const latestConfig = await configManager.loadConfig();
+
+      // urltest 分组自行负责成员间的选择，不能再让全局自动选择覆盖它。
+      autoSelectService?.updateConfig(latestConfig);
 
       // 尝试热更新（仅服务器切换时不重启）
       if (proxyManager.canHotReload(latestConfig)) {

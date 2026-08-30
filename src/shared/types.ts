@@ -99,7 +99,32 @@ export interface ServerConfig {
   grpcSettings?: GrpcSettings;
   httpSettings?: HttpSettings;
 
+  // 所属分组（订阅导入的分组）
+  groupId?: string;
+
   // 元数据
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+// ============================================================================
+// 服务器分组
+// ============================================================================
+
+export interface ServerGroup {
+  id: string;
+  /** 分组名称（通常来自订阅名称） */
+  name: string;
+  /** 订阅地址（若来自订阅 URL） */
+  url?: string;
+  /** 该组包含的服务器 ID 列表 */
+  serverIds: string[];
+  /** 由订阅同步的成员；刷新订阅时仅更新该列表 */
+  subscriptionServerIds?: string[];
+  /** 用户在分组管理中手动加入的成员；订阅刷新时保留 */
+  manualServerIds?: string[];
+  /** 用户从订阅分组中移除的节点特征，不会在下次刷新时自动加回 */
+  excludedSubscriptionKeys?: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -170,6 +195,11 @@ export interface UserConfig {
   // 服务器配置
   servers: ServerConfig[];
   selectedServerId: string | null;
+
+  // 服务器分组（订阅导入时自动创建）
+  serverGroups: ServerGroup[];
+  /** 当前选中的分组 ID（为 null 时退回单服务器模式） */
+  selectedGroupId: string | null;
 
   // 代理模式
   proxyMode: ProxyMode;

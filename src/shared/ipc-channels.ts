@@ -26,6 +26,18 @@ export const IPC_CHANNELS = {
   SERVER_UPDATE: 'server:update',
   SERVER_DELETE: 'server:delete',
   SERVER_GET_ALL: 'server:getAll',
+  SERVER_PARSE_SUBSCRIPTION: 'server:parseSubscription',
+  SERVER_ADD_SUBSCRIPTION: 'server:addSubscription',
+
+  // 分组管理
+  GROUP_CREATE: 'group:create',
+  GROUP_UPDATE: 'group:update',
+  GROUP_DELETE: 'group:delete',
+  GROUP_SELECT: 'group:select',
+  GROUP_ADD_SERVERS: 'group:addServers',
+  GROUP_MOVE_SERVER: 'group:moveServer',
+  GROUP_GET_ALL: 'group:getAll',
+  GROUP_SHARE: 'group:share',
 
   // 路由规则管理
   RULES_GET_ALL: 'rules:getAll',
