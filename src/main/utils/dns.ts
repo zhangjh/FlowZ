@@ -135,7 +135,7 @@ function getLinuxDnsServers(): string[] {
  *
  * - Linux: 解析 /etc/resolv.conf 或 systemd-resolved
  * - Windows: 通过 PowerShell / ipconfig 获取网卡 DNS 配置
- * - macOS: 返回空数组（macOS TUN 使用 gvisor stack + sniff_override_destination）
+ * - macOS: 返回空数组（macOS TUN 走嗅探出的域名做路由，不依赖显式上游 DNS）
  */
 export function getSystemDnsServers(): string[] {
   switch (process.platform) {

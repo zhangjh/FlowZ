@@ -61,7 +61,7 @@ const PRIVATE_IP_PATTERNS = [
 const CLASH_API_PORT = 9091;
 
 /**
- * sing-box 1.12.x 配置类型定义
+ * sing-box 1.14.x 配置类型定义
  */
 
 interface SingBoxLogConfig {
@@ -75,9 +75,6 @@ interface SingBoxDnsServer {
   type: string;
   server?: string;
   detour?: string;
-  // DoH 专用字段
-  address?: string;
-  address_resolver?: string;
   // FakeIP 专用字段
   inet4_range?: string;
   inet6_range?: string;
@@ -101,7 +98,6 @@ interface SingBoxDnsConfig {
   servers: SingBoxDnsServer[];
   rules?: SingBoxDnsRule[];
   final?: string;
-  strategy?: string;
   fakeip?: SingBoxFakeIPConfig;
 }
 
@@ -117,8 +113,6 @@ interface SingBoxInbound {
   auto_route?: boolean;
   strict_route?: boolean;
   stack?: string;
-  sniff?: boolean;
-  sniff_override_destination?: boolean;
   route_exclude_address?: string[];
   platform?: {
     http_proxy?: {
@@ -1116,7 +1110,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成 sing-box 配置（sing-box 1.12.x 格式）
+   * 生成 sing-box 配置（sing-box 1.14.x 格式）
    */
   generateSingBoxConfig(config: UserConfig): SingBoxConfig {
     const activeServers = this.getActiveServers(config);
@@ -1225,8 +1219,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成 DNS 配置（sing-box 1.12.x 格式）
-   * 统一使用 FakeIP 模式：DNS 查询直接返回虚假 IP，由 sniff 识别真实域名后路由
+   * 生成 DNS 配置（sing-box 1.14.x 格式）
+   * 统一使用 FakeIP 模式：DNS 查询直接返回虚假 IP，由路由规则 sniff 识别真实域名后路由
    * 这避免了 DNS 污染和超时问题，TUN 和系统代理模式都使用相同的逻辑
    */
   private generateDnsConfig(config: UserConfig, activeServers: ServerConfig[]): SingBoxDnsConfig {
@@ -1339,7 +1333,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成 Inbound 配置（sing-box 1.12.x 格式）
+   * 生成 Inbound 配置（sing-box 1.14.x 格式）
+   * 注意：协议嗅探（sniff）已迁移到路由规则 action:'sniff'（见 generateRouteConfig），
+   * sing-box 1.13.0 起已移除 inbound 上的 sniff / sniff_override_destination 字段
    */
   private generateInbounds(config: UserConfig): SingBoxInbound[] {
     const inbounds: SingBoxInbound[] = [];
@@ -1358,16 +1354,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         tag: 'http-in',
         listen: '127.0.0.1',
         listen_port: config.httpPort || 65533,
-        sniff: true,
-        sniff_override_destination: true,
       },
       {
         type: 'socks',
         tag: 'socks-in',
         listen: '127.0.0.1',
         listen_port: config.socksPort || 65534,
-        sniff: true,
-        sniff_override_destination: true,
       }
     );
 
@@ -1392,12 +1384,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           process.platform === 'win32' || process.platform === 'darwin'
             ? 'gvisor'
             : config.tunConfig?.stack || 'system',
-        sniff: true,
-        // macOS TUN + smart routing needs the sniffed domain as the destination
-        // so geosite rules can match foreign sites instead of falling through to direct.
-        // Windows keeps this disabled to preserve the FakeIP behavior fixed for
-        // SSH/QUIC-style traffic in a6f9cd8.
-        sniff_override_destination: process.platform === 'darwin',
         // 在系统路由层面排除本地地址和 DNS 服务器，确保本地代理端口和 DNS 可访问
         route_exclude_address: [
           '127.0.0.0/8', '::1/128',
@@ -1425,9 +1411,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成 Outbound 配置（sing-box 1.12.x 格式）
-   * 包含 mode-* selector、服务器出站、direct、block 出站
+   * 生成 Outbound 配置（sing-box 1.14.x 格式）
+   * 包含 mode-* selector、服务器出站、direct 出站
    * 分组模式额外生成 urltest 出站用于组内故障转移
+   * 注意：block 出站已废弃（1.11.0），拦截规则改用路由 action:'reject'
    */
   private generateOutbounds(
     config: UserConfig,
@@ -1481,12 +1468,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     outbounds.push({
       type: 'direct',
       tag: 'direct',
-    });
-
-    // 阻断出站
-    outbounds.push({
-      type: 'block',
-      tag: 'block',
     });
 
     return outbounds;
@@ -1638,7 +1619,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 生成路由配置（sing-box 1.12.x 格式）
+   * 生成路由配置（sing-box 1.14.x 格式）
    */
   private generateRouteConfig(config: UserConfig, activeServers?: ServerConfig[]): SingBoxRouteConfig {
     const rules: SingBoxRouteRule[] = [];
@@ -1652,6 +1633,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             const sel = config.servers.find((s) => s.id === config.selectedServerId);
             return sel ? [sel] : [];
           })();
+
+    // 协议嗅探（必须放在最前）：嗅探出的域名用于后续规则的域名匹配
+    // sing-box 1.13.0 起移除 inbound 上的 sniff 字段，改用路由规则 action:'sniff'
+    rules.push({
+      action: 'sniff',
+    } as SingBoxRouteRule);
 
     // DNS 劫持规则（必须）
     rules.push({
@@ -1793,7 +1780,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } else if (rule.action === 'direct') {
         singboxRule.outbound = 'direct';
       } else if (rule.action === 'block') {
-        singboxRule.outbound = 'block';
+        // sing-box 1.11.0 起 block 出站废弃，改用 reject 规则动作
+        singboxRule.action = 'reject';
       }
 
       rules.push(singboxRule);

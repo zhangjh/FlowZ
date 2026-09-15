@@ -152,7 +152,6 @@ function buildTestConfig(servers: ServerConfig[]): any {
   });
 
   outbounds.push({ type: 'direct', tag: 'direct' });
-  outbounds.push({ type: 'block', tag: 'block' });
 
   if (serverDomains.length > 0) {
     routeRules.unshift({ domain: serverDomains, outbound: 'direct' });

@@ -72,6 +72,6 @@ resources/
 
 ## sing-box 版本
 
-当前使用的 sing-box 版本：**1.12.12**
+当前使用的 sing-box 版本：**1.14.1**
 
 下载地址：https://github.com/SagerNet/sing-box/releases
