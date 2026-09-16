@@ -258,9 +258,9 @@ export class ProtocolParser implements IProtocolParser {
     // 解析混淆配置
     const obfs = params.get('obfs');
     const obfsPassword = params.get('obfs-password');
-    if (obfs === 'salamander' && obfsPassword) {
+    if ((obfs === 'salamander' || obfs === 'gecko') && obfsPassword) {
       hysteria2Settings.obfs = {
-        type: 'salamander',
+        type: obfs,
         password: obfsPassword,
       };
     }

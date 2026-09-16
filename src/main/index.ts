@@ -305,19 +305,7 @@ async function cleanupResources(): Promise<void> {
     }
 
     // 2. 清理系统代理设置
-    try {
-      const proxyStatus = await systemProxyManager.getProxyStatus();
-      if (proxyStatus.enabled) {
-        logManager.addLog('info', 'Disabling system proxy...', 'Main');
-        await systemProxyManager.disableProxy();
-        logManager.addLog('info', 'System proxy disabled', 'Main');
-      }
-    } catch (error) {
-      // 系统代理清理失败不应阻止应用退出
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logManager.addLog('warn', `Failed to disable system proxy: ${errorMessage}`, 'Main');
-      console.warn('Failed to disable system proxy:', error);
-    }
+    await disableSystemProxyQuietly('on exit');
 
     logManager.addLog('info', 'Resource cleanup completed', 'Main');
   } catch (error) {
@@ -332,6 +320,24 @@ async function cleanupResources(): Promise<void> {
  */
 export function getTrayManager(): TrayManager | null {
   return trayManager;
+}
+
+/**
+ * 停用系统代理（失败只记录日志，不抛出）
+ * @param reason 出现在日志中的原因后缀，如 'on stop'
+ */
+async function disableSystemProxyQuietly(reason: string): Promise<void> {
+  try {
+    const proxyStatus = await systemProxyManager.getProxyStatus();
+    if (!proxyStatus.enabled) {
+      return;
+    }
+    await systemProxyManager.disableProxy();
+    logManager.addLog('info', `System proxy disabled ${reason}`, 'Main');
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logManager.addLog('warn', `Failed to disable system proxy ${reason}: ${errorMessage}`, 'Main');
+  }
 }
 
 /**
@@ -441,34 +447,22 @@ app.whenReady().then(async () => {
     updateTrayMenuState(false, true);
 
     // 进程意外退出时，清理系统代理设置，避免网络不可用
-    try {
-      const proxyStatus = await systemProxyManager.getProxyStatus();
-      if (proxyStatus.enabled) {
-        logManager.addLog('info', 'Disabling system proxy due to proxy error...', 'Main');
-        await systemProxyManager.disableProxy();
-        logManager.addLog('info', 'System proxy disabled after error', 'Main');
-      }
-    } catch (cleanupError) {
-      const errorMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      logManager.addLog('warn', `Failed to disable system proxy after error: ${errorMessage}`, 'Main');
-    }
+    await disableSystemProxyQuietly('after error');
   });
 
   proxyManager.on('stopped', async () => {
     // 正常停止时，重置错误状态
     updateTrayMenuState(false, false);
 
-    // 确保系统代理被清理
-    try {
-      const proxyStatus = await systemProxyManager.getProxyStatus();
-      if (proxyStatus.enabled) {
-        await systemProxyManager.disableProxy();
-        logManager.addLog('info', 'System proxy disabled on stop', 'Main');
-      }
-    } catch (cleanupError) {
-      const errorMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      logManager.addLog('warn', `Failed to disable system proxy on stop: ${errorMessage}`, 'Main');
+    // 重启的中间态不清理系统代理：stop 之后紧接着 start，sing-box 会用同一端口重新起来，
+    // 而重启流程本身不设置系统代理，这里清理后再无人恢复 → 代理显示已连接但全部直连。
+    // 必须在任何 await 之前判断（restart 返回后标记即复位）。
+    if (proxyManager?.isRestartInProgress()) {
+      return;
     }
+
+    // 确保系统代理被清理
+    await disableSystemProxyQuietly('on stop');
   });
 
   // 注册 IPC 处理器（需要在 ProxyManager 创建后）
@@ -787,6 +781,9 @@ app.whenReady().then(async () => {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         logManager.addLog('error', `Failed to restart proxy after config change: ${errorMessage}`, 'Main');
+        // 重启失败：sing-box 已停止，此时必须清掉系统代理，
+        // 否则系统代理指向已失效的本机端口，整机网络不可用
+        await disableSystemProxyQuietly('after restart failure');
         // 重启失败，更新托盘状态为停止
         updateTrayMenuState(false, true);
       }
