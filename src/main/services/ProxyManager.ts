@@ -155,8 +155,15 @@ interface SingBoxOutbound {
   obfs?: {
     type: string;
     password: string;
+    min_packet_size?: number;
+    max_packet_size?: number;
   };
   network?: string;
+  server_ports?: string[];
+  hop_interval?: string;
+  hop_interval_max?: string;
+  bbr_profile?: string;
+  disable_chrome_parrot?: boolean;
   // TLS
   tls?: {
     enabled: boolean;
@@ -273,6 +280,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private static readonly RESTART_COOLDOWN = 60000; // 重启冷却时间（1分钟内最多重启3次）
   private isRestarting: boolean = false;
   private isHealthCheckRunning: boolean = false;
+  // 配置/模式变更引起的重启是否正在进行中（区别于上面崩溃自愈用的 isRestarting）
+  // restart = stop + start，stop 会 emit('stopped')，外部据此清理系统代理；
+  // 但重启流程不会重新设置系统代理，若不区分，系统代理会在重启后被永久关闭
+  // （表现为界面显示已连接、日志无异常，但所有流量实际直连）
+  private restartInProgress: boolean = false;
 
   constructor(
     logManager?: ILogManager,
@@ -392,15 +404,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     try {
       // 同步 proxy selector 默认指向（分组模式下指向 urltest 分组）
-      const activeServers = this.getActiveServers(config);
-      const isGroup = !!config.selectedGroupId && activeServers.length > 0;
-      const defaultTag = isGroup
-        ? `group-${config.selectedGroupId}`
-        : config.selectedServerId
-          ? this.getServerOutboundTag(config.selectedServerId)
-          : 'direct';
       await this.updateClashApi('/proxies/proxy', {
-        name: defaultTag,
+        name: this.getProxyTargetTag(config),
       });
       await this.updateModeSelectors(config.proxyMode);
     } catch (error) {
@@ -516,11 +521,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 当前是否处于「配置/模式变更引起的重启」中
+   * 用于让外部区分 'stopped' 是真正停止还是重启的中间态
+   */
+  isRestartInProgress(): boolean {
+    return this.restartInProgress;
+  }
+
+  /**
    * 重启代理
    * TUN 模式下通过常驻特权守护进程完成"停止 + 启动"，避免授权弹窗；
    * 守护进程不可用时回退到旧的"单次提权合并操作"。
    */
   async restart(config: UserConfig): Promise<void> {
+    this.restartInProgress = true;
+    try {
+      await this.performRestart(config);
+    } finally {
+      this.restartInProgress = false;
+    }
+  }
+
+  /**
+   * 重启的实际实现（restart = stop + start）
+   */
+  private async performRestart(config: UserConfig): Promise<void> {
     const modeTypeChanged = this.currentConfig?.proxyModeType !== config.proxyModeType;
 
     // 模式类型发生变化（TUN ↔ 系统代理）：使用 stop + start
@@ -944,24 +969,40 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     try {
       const modeChanged = currentConfig.proxyMode !== newConfig.proxyMode;
-      const serverChanged = currentConfig.selectedServerId !== newConfig.selectedServerId;
+      const currentTarget = this.getProxyTargetTag(currentConfig);
+      const newTarget = this.getProxyTargetTag(newConfig);
+      const targetChanged = currentTarget !== newTarget;
 
-      this.logToManager('info', `热更新: modeChanged=${modeChanged} (${currentConfig.proxyMode}→${newConfig.proxyMode}), serverChanged=${serverChanged}`);
+      this.logToManager('info', `热更新: modeChanged=${modeChanged} (${currentConfig.proxyMode}→${newConfig.proxyMode}), proxyTarget=${currentTarget}→${newTarget}`);
 
       // 先通过 Clash API 切换运行时状态，再写入磁盘（sing-box 不监听文件变化）
-      if (serverChanged) {
-        await this.updateClashApi('/proxies/proxy', {
-          name: this.getServerOutboundTag(newConfig.selectedServerId!),
-        });
+      const verifyTargets: Array<[string, string]> = [];
+
+      if (targetChanged) {
+        await this.updateClashApi('/proxies/proxy', { name: newTarget });
+        verifyTargets.push(['proxy', newTarget]);
       }
 
       if (modeChanged) {
         await this.updateModeSelectors(newConfig.proxyMode);
+        const selections = this.getModeSelections(newConfig.proxyMode);
+        verifyTargets.push(
+          ['mode-cn', selections.cn],
+          ['mode-non-cn', selections.nonCn],
+          ['mode-fallback', selections.fallback]
+        );
       }
 
       // 验证切换结果
-      if (modeChanged) {
-        await this.verifyModeSelectors(newConfig.proxyMode);
+      if (verifyTargets.length > 0) {
+        await this.verifySelectors(verifyTargets);
+      }
+
+      // 主动探测新节点是否真的可用（异步，不阻塞热更新）：
+      // 出站不可达时 sing-box 未必会打印错误（hysteria2 这类 QUIC 出站会静默等到握手超时），
+      // 因此 Clash API 切换成功不等于能上网，需要探测后才能对用户说"切换成功"。
+      if (targetChanged) {
+        void this.probeTargetAvailability(newTarget);
       }
 
       // 写入磁盘（仅用于持久化，下次启动时使用）
@@ -989,30 +1030,46 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 验证模式选择器是否已正确切换
+   * 验证选择器是否已正确切换（读回 Clash API 的实际选择）
    */
-  private async verifyModeSelectors(mode: UserConfig['proxyMode']): Promise<void> {
-    const expected = this.getModeSelections(mode);
-    const selectors = ['mode-cn', 'mode-non-cn', 'mode-fallback'] as const;
-    const expectedValues = [expected.cn, expected.nonCn, expected.fallback];
-
-    for (let i = 0; i < selectors.length; i++) {
+  private async verifySelectors(targets: Array<[string, string]>): Promise<void> {
+    for (const [tag, expected] of targets) {
       try {
-        const response = await fetch(
-          `http://127.0.0.1:${CLASH_API_PORT}/proxies/${selectors[i]}`
-        );
-        if (response.ok) {
-          const data = await response.json() as { now?: string };
-          const actual = data.now;
-          if (actual !== expectedValues[i]) {
-            this.logToManager('warn', `选择器 ${selectors[i]} 验证失败: 期望=${expectedValues[i]}, 实际=${actual}`);
-          } else {
-            this.logToManager('info', `选择器 ${selectors[i]} 已切换到 ${actual}`);
-          }
+        const response = await fetch(`http://127.0.0.1:${CLASH_API_PORT}/proxies/${tag}`);
+        if (!response.ok) {
+          this.logToManager('warn', `验证选择器 ${tag} 失败: Clash API 返回 ${response.status}`);
+          continue;
+        }
+        const data = await response.json() as { now?: string };
+        if (data.now !== expected) {
+          this.logToManager('warn', `选择器 ${tag} 验证失败: 期望=${expected}, 实际=${data.now}`);
+        } else {
+          this.logToManager('info', `选择器 ${tag} 已切换到 ${expected}`);
         }
       } catch (e) {
-        this.logToManager('warn', `验证选择器 ${selectors[i]} 状态失败: ${e instanceof Error ? e.message : String(e)}`);
+        this.logToManager('warn', `验证选择器 ${tag} 状态失败: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+  }
+
+  /**
+   * 探测出站是否真的可用（Clash API delay 接口）
+   * 用于避免"切换成功但上不了网"：目标节点不可达时不会有任何日志，
+   * 这里主动探测一次并给出结论，失败只告警、不影响切换结果。
+   */
+  private async probeTargetAvailability(tag: string): Promise<void> {
+    const url = `http://127.0.0.1:${CLASH_API_PORT}/proxies/${encodeURIComponent(tag)}/delay` +
+      '?timeout=3000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204';
+    try {
+      const response = await fetch(url);
+      const body = await response.text().catch(() => '');
+      if (response.ok) {
+        this.logToManager('info', `节点探测通过: ${tag} ${body}`);
+      } else {
+        this.logToManager('warn', `已切换到 ${tag}，但节点探测失败（${body || `HTTP ${response.status}`}），该节点可能不可用`);
+      }
+    } catch (e) {
+      this.logToManager('warn', `节点探测请求失败: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -1306,13 +1363,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）
     // 代理服务器域名必须使用本地 DNS 解析（避免死循环）。
     // IP 地址不需要 DNS 规则。支持分组：为每个成员的域名添加规则
+    const proxyDomains = new Set<string>();
     for (const server of activeServers) {
       if (server?.address && !isIP(server.address)) {
-        dnsRules.push({
-          domain: [server.address],
-          server: 'dns-local',
-        } as SingBoxDnsRule);
+        proxyDomains.add(server.address);
       }
+    }
+    if (proxyDomains.size > 0) {
+      dnsRules.push({
+        domain: [...proxyDomains],
+        server: 'dns-local',
+      } as SingBoxDnsRule);
     }
 
     // 绕过 FakeIP 的域名：使用本地 DNS 解析真实 IP
@@ -1508,6 +1569,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return `proxy-${serverId}`;
   }
 
+  /**
+   * 计算 proxy selector 应指向的出站 tag
+   * 分组模式指向分组 urltest 出站，单节点模式指向该节点，两者都没有则直连
+   * 注意：热切换必须走同一个函数，否则分组模式下会算出 proxy-null 这类无效 tag
+   */
+  private getProxyTargetTag(config: UserConfig): string {
+    const isGroup = !!config.selectedGroupId && this.getActiveServers(config).length > 0;
+    if (isGroup) {
+      return `group-${config.selectedGroupId}`;
+    }
+    return config.selectedServerId
+      ? this.getServerOutboundTag(config.selectedServerId)
+      : 'direct';
+  }
+
   private getModeSelections(mode: UserConfig['proxyMode']): {
     cn: string;
     nonCn: string;
@@ -1565,20 +1641,51 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (protocol === 'hysteria2') {
       outbound.password = server.password;
 
-      if (server.hysteria2Settings?.upMbps) {
-        outbound.up_mbps = server.hysteria2Settings.upMbps;
+      const hy2 = server.hysteria2Settings;
+
+      if (hy2?.upMbps) {
+        outbound.up_mbps = hy2.upMbps;
       }
-      if (server.hysteria2Settings?.downMbps) {
-        outbound.down_mbps = server.hysteria2Settings.downMbps;
+      if (hy2?.downMbps) {
+        outbound.down_mbps = hy2.downMbps;
       }
-      if (server.hysteria2Settings?.obfs?.type && server.hysteria2Settings?.obfs?.password) {
+      if (hy2?.obfs?.type && hy2.obfs.password) {
         outbound.obfs = {
-          type: server.hysteria2Settings.obfs.type,
-          password: server.hysteria2Settings.obfs.password,
+          type: hy2.obfs.type,
+          password: hy2.obfs.password,
         };
+        // 包大小仅 gecko 支持（sing-box 1.14.0+）
+        if (hy2.obfs.type === 'gecko') {
+          if (hy2.obfs.minPacketSize) {
+            outbound.obfs.min_packet_size = hy2.obfs.minPacketSize;
+          }
+          if (hy2.obfs.maxPacketSize) {
+            outbound.obfs.max_packet_size = hy2.obfs.maxPacketSize;
+          }
+        }
       }
-      if (server.hysteria2Settings?.network) {
-        outbound.network = server.hysteria2Settings.network;
+      if (hy2?.network) {
+        outbound.network = hy2.network;
+      }
+
+      // 端口跳跃（sing-box 1.11.0+）：server_ports 与 server_port 互斥
+      if (hy2?.serverPorts?.length) {
+        outbound.server_ports = hy2.serverPorts;
+        delete outbound.server_port;
+        if (hy2.hopInterval) {
+          outbound.hop_interval = hy2.hopInterval;
+        }
+        if (hy2.hopIntervalMax) {
+          outbound.hop_interval_max = hy2.hopIntervalMax;
+        }
+      }
+
+      // sing-box 1.14.0 新增
+      if (hy2?.bbrProfile) {
+        outbound.bbr_profile = hy2.bbrProfile;
+      }
+      if (hy2?.disableChromeParrot) {
+        outbound.disable_chrome_parrot = true;
       }
     }
 
@@ -1679,26 +1786,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 排除所有代理服务器域名/IP，确保 selector 切换后服务器连接仍走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
+    // 同一主机的多个节点（如某主机上的 vless/trojan/hysteria2）地址相同，用 Set 聚合，只生成一条规则
+    const directCidrs = new Set<string>();
+    const directDomains = new Set<string>();
     for (const server of activeList) {
-      if (server?.address) {
-        if (isIP(server.address)) {
-          const cidr =
-            isIP(server.address) === 6
-              ? `${server.address}/128`
-              : `${server.address}/32`;
-          rules.push({
-            ip_cidr: [cidr],
-            action: 'route',
-            outbound: 'direct',
-          });
-        } else {
-          rules.push({
-            domain: [server.address],
-            action: 'route',
-            outbound: 'direct',
-          });
-        }
+      if (!server?.address) continue;
+      const ipVersion = isIP(server.address);
+      if (ipVersion) {
+        directCidrs.add(ipVersion === 6 ? `${server.address}/128` : `${server.address}/32`);
+      } else {
+        directDomains.add(server.address);
       }
+    }
+    if (directCidrs.size > 0) {
+      rules.push({
+        ip_cidr: [...directCidrs],
+        action: 'route',
+        outbound: 'direct',
+      });
+    }
+    if (directDomains.size > 0) {
+      rules.push({
+        domain: [...directDomains],
+        action: 'route',
+        outbound: 'direct',
+      });
     }
 
     // 自定义规则（优先级最高，必须放在智能分流规则之前）
@@ -1715,21 +1827,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // DNS 服务器 IP 直连：确保上游 DNS 查询不经过 TUN
     // 解决 TUN 模式下 DNS 查询因路由拦截而死循环的问题 (Windows/Linux)
-    const dnsServersForRoute = getSystemDnsServers();
-    for (const dnsIp of dnsServersForRoute) {
-      if (dnsIp.includes(':')) {
-        rules.push({
-          ip_cidr: [`${dnsIp}/128`],
-          action: 'route',
-          outbound: 'direct',
-        });
-      } else {
-        rules.push({
-          ip_cidr: [`${dnsIp}/32`],
-          action: 'route',
-          outbound: 'direct',
-        });
-      }
+    const dnsCidrs = new Set<string>();
+    for (const dnsIp of getSystemDnsServers()) {
+      dnsCidrs.add(dnsIp.includes(':') ? `${dnsIp}/128` : `${dnsIp}/32`);
+    }
+    if (dnsCidrs.size > 0) {
+      rules.push({
+        ip_cidr: [...dnsCidrs],
+        action: 'route',
+        outbound: 'direct',
+      });
     }
 
     // 智能分流匹配结果交给模式 selector 决定直连或代理
@@ -1798,7 +1905,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 统一使用 domain_suffix，匹配域名及其所有子域名
       // 如 google.com 会匹配 google.com、www.google.com、mail.google.com 等
-      const domains = rule.domains.map((d) => (d.startsWith('*.') ? d.slice(2) : d));
+      const domains = [
+        ...new Set(rule.domains.map((d) => (d.startsWith('*.') ? d.slice(2) : d))),
+      ];
 
       const singboxRule: SingBoxRouteRule = {
         action: 'route',
@@ -3740,15 +3849,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private isLowValueLog(line: string): boolean {
     const lowerLine = line.toLowerCase();
 
+    // 级别与失败关键词按词边界匹配：
+    // 用子串匹配会让 DNS 日志里的 "NOERROR" 命中 'error'，导致大量 DNS 日志被当作
+    // 高价值日志保留，反而把真实的连接错误淹没
+    if (/\b(error|fatal|warn|warning|failed|failure)\b/.test(lowerLine)) {
+      return false; // 不过滤，保留这条日志
+    }
+
     // 高价值日志模式 - 这些日志应该优先保留，即使包含噪音关键词
     const keepPatterns = [
       'started', // 启动完成
       'stopped', // 停止
-      'sing-box started', // sing-box 启动
-      'error', // 错误
-      'fatal', // 致命错误
-      'warn', // 警告
-      'failed', // 失败
       'updated default interface', // 网络接口变化
       // 路由决策相关 - 关键日志
       'match rule', // 匹配规则
@@ -3907,10 +4018,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return target ? `连接超时: ${target}` : '连接超时：服务器响应超时';
     }
 
+    // 注意：不能用 'tls'/'ssl' 这类宽泛匹配，否则嗅探日志
+    // （如 "sniffed protocol: tls, domain: www.google.com"）会被误翻译成证书错误，
+    // 让日志面板充满假的"TLS 证书错误"
     if (
       lowerMessage.includes('certificate') ||
-      lowerMessage.includes('tls') ||
-      lowerMessage.includes('ssl')
+      lowerMessage.includes('x509') ||
+      lowerMessage.includes('unknown authority')
     ) {
       // 保留原始错误信息，帮助用户诊断具体的证书问题
       return `TLS 证书错误：服务器证书验证失败 [${message}]`;

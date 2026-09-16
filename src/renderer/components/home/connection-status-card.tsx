@@ -4,7 +4,9 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
@@ -37,21 +39,47 @@ export function ConnectionStatusCard() {
   // 已属于任何分组的节点 ID
   const groupedIds = new Set<string>();
   for (const g of groups) for (const id of g.serverIds) groupedIds.add(id);
-  // 出站下拉只展示分组 + 未分组节点（分组内的节点由分组统一管理）
   const ungroupedServers = servers.filter((s) => !groupedIds.has(s.id));
 
+  // 分组有效成员（serverIds 里可能残留已被删除的节点）
+  const groupMembers = (group: ServerGroup) =>
+    group.serverIds.map((id) => servers.find((s) => s.id === id)).filter((s) => !!s);
+
+  // 出站下拉：分组本身是一个可选项（组名 + 自动故障转移说明），其下缩进列出成员节点
+  // 选中成员 = 退出分组、只用该节点（与选中未分组节点走同一条路径）
+  // 组名必须放进 SelectItem 而不是 SelectLabel：否则触发器里只会显示「自动故障转移 4 节点」，
+  // 组名沦为灰色小标签，看起来像是「自动故障转移」才叫组名
   const outboundOptions = (
     <>
-      {groups.map((group) => (
-        <SelectItem key={`group:${group.id}`} value={`group:${group.id}`}>
-          分组 · {group.name}（{groupNodeCount(group)}节点）
-        </SelectItem>
-      ))}
-      {ungroupedServers.map((server) => (
-        <SelectItem key={server.id} value={server.id}>
-          {server.name} ({server.protocol})
-        </SelectItem>
-      ))}
+      {groups.map((group) => {
+        const members = groupMembers(group);
+        return (
+          <SelectGroup key={`group:${group.id}`}>
+            <SelectItem value={`group:${group.id}`}>
+              <span className="font-medium">{group.name}</span>
+              <span className="ml-1 text-xs text-muted-foreground">
+                （自动故障转移 · {members.length} 节点）
+              </span>
+            </SelectItem>
+            {members.map((server) => (
+              <SelectItem key={server.id} value={server.id} className="pl-10">
+                <span className="mr-1 text-muted-foreground">↳</span>
+                {server.name} ({server.protocol})
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        );
+      })}
+      {ungroupedServers.length > 0 && (
+        <SelectGroup>
+          <SelectLabel>未分组节点</SelectLabel>
+          {ungroupedServers.map((server) => (
+            <SelectItem key={server.id} value={server.id}>
+              {server.name} ({server.protocol})
+            </SelectItem>
+          ))}
+        </SelectGroup>
+      )}
     </>
   );
 
@@ -255,7 +283,7 @@ export function ConnectionStatusCard() {
                 onValueChange={handleServerChange}
               >
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择出站" />
+                  <SelectValue placeholder="选择出站">{selectedGroup.name}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>{outboundOptions}</SelectContent>
               </Select>
@@ -304,7 +332,9 @@ export function ConnectionStatusCard() {
                   onValueChange={handleServerChange}
                 >
                   <SelectTrigger className="w-full">
-                    <SelectValue placeholder="选择服务器或分组" />
+                    <SelectValue placeholder="选择服务器或分组">
+                      {`${selectedServer.name} (${selectedServer.protocol})`}
+                    </SelectValue>
                   </SelectTrigger>
                   <SelectContent>{outboundOptions}</SelectContent>
                 </Select>

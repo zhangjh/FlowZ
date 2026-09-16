@@ -13,6 +13,13 @@ import {
   FormMessage,
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
 import type { ServerConfig } from '@/bridge/types';
@@ -25,8 +32,17 @@ const hysteria2FormSchema = z.object({
   upMbps: z.number().optional(),
   downMbps: z.number().optional(),
   // 混淆设置
-  obfsEnabled: z.boolean(),
+  obfsType: z.enum(['none', 'salamander', 'gecko']),
   obfsPassword: z.string().optional(),
+  obfsMinPacketSize: z.number().optional(),
+  obfsMaxPacketSize: z.number().optional(),
+  // 端口跳跃
+  serverPorts: z.string().optional(),
+  hopInterval: z.string().optional(),
+  hopIntervalMax: z.string().optional(),
+  // sing-box 1.14.0 新增
+  bbrProfile: z.enum(['default', 'conservative', 'standard', 'aggressive']),
+  chromeParrot: z.boolean(),
   // TLS 设置
   tlsServerName: z.string().optional(),
   tlsAllowInsecure: z.boolean(),
@@ -39,6 +55,15 @@ interface Hysteria2FormProps {
   onSubmit: (config: any) => Promise<void>;
 }
 
+/** 端口跳跃范围：逗号或空格分隔，如 "2080:3000, 4000:5000" */
+function parseServerPorts(value?: string): string[] | undefined {
+  const ports = (value || '')
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return ports.length > 0 ? ports : undefined;
+}
+
 export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   const form = useForm<Hysteria2FormValues>({
     resolver: zodResolver(hysteria2FormSchema),
@@ -48,8 +73,15 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       password: '',
       upMbps: undefined,
       downMbps: undefined,
-      obfsEnabled: false,
+      obfsType: 'none',
       obfsPassword: '',
+      obfsMinPacketSize: undefined,
+      obfsMaxPacketSize: undefined,
+      serverPorts: '',
+      hopInterval: '',
+      hopIntervalMax: '',
+      bbrProfile: 'default',
+      chromeParrot: true,
       tlsServerName: '',
       tlsAllowInsecure: false,
     },
@@ -58,14 +90,23 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   useEffect(() => {
     console.log('[Hysteria2Form] Server config changed:', serverConfig);
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'hysteria2') {
+      const hy2 = serverConfig.hysteria2Settings;
       const formData = {
         address: serverConfig.address || '',
         port: serverConfig.port || 443,
         password: serverConfig.password || '',
-        upMbps: serverConfig.hysteria2Settings?.upMbps ?? undefined,
-        downMbps: serverConfig.hysteria2Settings?.downMbps ?? undefined,
-        obfsEnabled: !!serverConfig.hysteria2Settings?.obfs?.type,
-        obfsPassword: serverConfig.hysteria2Settings?.obfs?.password || '',
+        upMbps: hy2?.upMbps ?? undefined,
+        downMbps: hy2?.downMbps ?? undefined,
+        obfsType: hy2?.obfs?.type ?? ('none' as const),
+        obfsPassword: hy2?.obfs?.password || '',
+        obfsMinPacketSize: hy2?.obfs?.minPacketSize ?? undefined,
+        obfsMaxPacketSize: hy2?.obfs?.maxPacketSize ?? undefined,
+        serverPorts: hy2?.serverPorts?.join(', ') || '',
+        hopInterval: hy2?.hopInterval || '',
+        hopIntervalMax: hy2?.hopIntervalMax || '',
+        bbrProfile: hy2?.bbrProfile ?? ('default' as const),
+        // 1.14 起默认开启伪装，只有显式关闭时才为 false
+        chromeParrot: !hy2?.disableChromeParrot,
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
       };
@@ -75,6 +116,9 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   }, [serverConfig, form]);
 
   const handleSubmit = async (values: Hysteria2FormValues) => {
+    const isGecko = values.obfsType === 'gecko';
+    const serverPorts = parseServerPorts(values.serverPorts);
+
     const serverConfig: any = {
       protocol: 'hysteria2' as const,
       address: values.address,
@@ -89,19 +133,36 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       hysteria2Settings: {
         upMbps: values.upMbps || undefined,
         downMbps: values.downMbps || undefined,
-        obfs: values.obfsEnabled && values.obfsPassword
-          ? {
-              type: 'salamander',
-              password: values.obfsPassword,
-            }
-          : undefined,
+        obfs:
+          values.obfsType !== 'none' && values.obfsPassword
+            ? {
+                type: values.obfsType,
+                password: values.obfsPassword,
+                ...(isGecko && values.obfsMinPacketSize
+                  ? { minPacketSize: values.obfsMinPacketSize }
+                  : {}),
+                ...(isGecko && values.obfsMaxPacketSize
+                  ? { maxPacketSize: values.obfsMaxPacketSize }
+                  : {}),
+              }
+            : undefined,
+        serverPorts,
+        // 端口跳跃相关参数只在设置了范围时才有意义
+        hopInterval: serverPorts ? values.hopInterval || undefined : undefined,
+        hopIntervalMax: serverPorts ? values.hopIntervalMax || undefined : undefined,
+        bbrProfile: values.bbrProfile === 'default' ? undefined : values.bbrProfile,
+        // 只在关闭伪装时写入（1.14 默认即为开启）
+        disableChromeParrot: values.chromeParrot ? undefined : true,
       },
     };
 
     await onSubmit(serverConfig);
   };
 
-  const isObfsEnabled = form.watch('obfsEnabled');
+  const obfsType = form.watch('obfsType');
+  const isObfsEnabled = obfsType !== 'none';
+  const isGecko = obfsType === 'gecko';
+  const hasServerPorts = !!parseServerPorts(form.watch('serverPorts'));
 
   return (
     <Form {...form}>
@@ -208,16 +269,24 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
 
         <FormField
           control={form.control}
-          name="obfsEnabled"
+          name="obfsType"
           render={({ field }) => (
-            <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-              <FormControl>
-                <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-              </FormControl>
-              <div className="space-y-1 leading-none">
-                <FormLabel>启用 QUIC 流量混淆</FormLabel>
-                <FormDescription>使用 Salamander 混淆器伪装 QUIC 流量</FormDescription>
-              </div>
+            <FormItem>
+              <FormLabel>QUIC 流量混淆</FormLabel>
+              <Select onValueChange={field.onChange} value={field.value}>
+                <FormControl>
+                  <SelectTrigger>
+                    <SelectValue placeholder="不启用" />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent>
+                  <SelectItem value="none">不启用</SelectItem>
+                  <SelectItem value="salamander">Salamander</SelectItem>
+                  <SelectItem value="gecko">Gecko（2 代，1.14.0+）</SelectItem>
+                </SelectContent>
+              </Select>
+              <FormDescription>必须与服务端一致，不一致会直接握手失败</FormDescription>
+              <FormMessage />
             </FormItem>
           )}
         />
@@ -232,12 +301,161 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                 <FormControl>
                   <Input type="password" placeholder="输入混淆密码" {...field} />
                 </FormControl>
-                <FormDescription>Salamander 混淆器密码，需与服务端一致</FormDescription>
+                <FormDescription>混淆器密码，需与服务端一致</FormDescription>
                 <FormMessage />
               </FormItem>
             )}
           />
         )}
+
+        {isGecko && (
+          <div className="grid grid-cols-2 gap-4">
+            <FormField
+              control={form.control}
+              name="obfsMinPacketSize"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>最小包大小</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="number"
+                      placeholder="默认 512"
+                      {...field}
+                      value={field.value ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        field.onChange(val ? parseInt(val) : undefined);
+                      }}
+                    />
+                  </FormControl>
+                  <FormDescription>字节，仅 Gecko 有效</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="obfsMaxPacketSize"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>最大包大小</FormLabel>
+                  <FormControl>
+                    <Input
+                      type="number"
+                      placeholder="默认 1200"
+                      {...field}
+                      value={field.value ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        field.onChange(val ? parseInt(val) : undefined);
+                      }}
+                    />
+                  </FormControl>
+                  <FormDescription>字节，仅 Gecko 有效</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
+        )}
+
+        <FormField
+          control={form.control}
+          name="serverPorts"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>端口跳跃范围（可选）</FormLabel>
+              <FormControl>
+                <Input placeholder="2080:3000" {...field} />
+              </FormControl>
+              <FormDescription>
+                填写后上方「端口」不再生效；多个范围用逗号分隔，如 2080:3000, 4000:5000
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        {hasServerPorts && (
+          <div className="grid grid-cols-2 gap-4">
+            <FormField
+              control={form.control}
+              name="hopInterval"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>跳跃间隔</FormLabel>
+                  <FormControl>
+                    <Input placeholder="默认 30s" {...field} />
+                  </FormControl>
+                  <FormDescription>如 30s、1m</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="hopIntervalMax"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>间隔上限（可选）</FormLabel>
+                  <FormControl>
+                    <Input placeholder="用于随机化" {...field} />
+                  </FormControl>
+                  <FormDescription>实际间隔在其与跳跃间隔之间随机</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
+        )}
+
+        <FormField
+          control={form.control}
+          name="bbrProfile"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>BBR 拥塞控制配置</FormLabel>
+              <Select onValueChange={field.onChange} value={field.value}>
+                <FormControl>
+                  <SelectTrigger>
+                    <SelectValue placeholder="默认（standard）" />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent>
+                  <SelectItem value="default">默认（standard）</SelectItem>
+                  <SelectItem value="conservative">conservative（保守）</SelectItem>
+                  <SelectItem value="standard">standard（标准）</SelectItem>
+                  <SelectItem value="aggressive">aggressive（激进）</SelectItem>
+                </SelectContent>
+              </Select>
+              <FormDescription>
+                1.14.0+；仅在上行/下行带宽留空（即使用 BBR）时生效
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="chromeParrot"
+          render={({ field }) => (
+            <FormItem className="flex flex-row items-start space-x-3 space-y-0">
+              <FormControl>
+                <Checkbox checked={field.value} onCheckedChange={field.onChange} />
+              </FormControl>
+              <div className="space-y-1 leading-none">
+                <FormLabel>Chrome QUIC 指纹伪装</FormLabel>
+                <FormDescription>
+                  1.14.0+ 默认开启：QUIC 握手伪装成 Chrome，降低被指纹识别的概率。
+                  服务端使用 Ed25519 证书时需关闭（Chrome 不支持该签名算法）
+                </FormDescription>
+              </div>
+            </FormItem>
+          )}
+        />
 
         <FormField
           control={form.control}

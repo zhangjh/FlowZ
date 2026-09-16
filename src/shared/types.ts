@@ -12,6 +12,7 @@ export type ProxyModeType = 'systemProxy' | 'tun';
 export type Protocol = 'vless' | 'trojan' | 'hysteria2';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http';
 export type Hysteria2Network = 'tcp' | 'udp';
+export type Hysteria2BbrProfile = 'conservative' | 'standard' | 'aggressive';
 export type Security = 'none' | 'tls' | 'reality';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
 export type RuleAction = 'proxy' | 'direct' | 'block';
@@ -54,8 +55,11 @@ export interface HttpSettings {
 
 // Hysteria2 混淆设置
 export interface Hysteria2ObfsSettings {
-  type?: 'salamander';
+  type?: 'salamander' | 'gecko';
   password?: string;
+  // gecko 专用（sing-box 1.14.0+），默认 512 / 1200
+  minPacketSize?: number;
+  maxPacketSize?: number;
 }
 
 // Hysteria2 协议设置
@@ -64,6 +68,15 @@ export interface Hysteria2Settings {
   downMbps?: number;
   obfs?: Hysteria2ObfsSettings;
   network?: Hysteria2Network;
+  // 端口跳跃（sing-box 1.11.0+），如 ["2080:3000"]；设置后 server_port 不再生效
+  serverPorts?: string[];
+  hopInterval?: string;
+  // 端口跳跃间隔上限，取值在 hopInterval 与它之间随机（sing-box 1.14.0+）
+  hopIntervalMax?: string;
+  // BBR 拥塞控制配置（sing-box 1.14.0+），留空即 standard
+  bbrProfile?: Hysteria2BbrProfile;
+  // 关闭 Chrome QUIC 指纹伪装（sing-box 1.14.0+）；1.14 起默认开启伪装，仅需显式关闭时设置
+  disableChromeParrot?: boolean;
 }
 
 export interface ServerConfig {
