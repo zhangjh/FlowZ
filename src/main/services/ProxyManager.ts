@@ -15,7 +15,14 @@ import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
 import { getUserDataPath } from '../utils/paths';
-import { getSystemDnsServers } from '../utils/dns';
+import {
+  getSystemDnsServers,
+  getTunDnsAddresses,
+  isTunInternalAddress,
+  readMacDnsServers,
+  resetMacDnsCache,
+  setSystemDnsServers,
+} from '../utils/dns';
 import { isRunningAsAdmin } from './AdminPrivilege';
 import { PrivilegedSupervisor } from './PrivilegedSupervisor';
 
@@ -113,6 +120,7 @@ interface SingBoxInbound {
   auto_route?: boolean;
   strict_route?: boolean;
   stack?: string;
+  dns_mode?: string;
   route_exclude_address?: string[];
   platform?: {
     http_proxy?: {
@@ -241,6 +249,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private startTime: Date | null = null;
   private pid: number | null = null;
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
+  private macDnsConfigured = false; // macOS TUN 模式：系统 DNS 是否已指向 TUN 劫持地址
   private currentConfig: UserConfig | null = null;
   private configPath: string;
   private singboxPath: string;
@@ -348,6 +357,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       throw new Error('Selected server not found');
     }
 
+    // macOS TUN 模式：清理可能残留的 TUN DNS 设置，并缓存原始系统 DNS 供配置生成使用
+    const isMacTun = process.platform === 'darwin' && this.needsRootPrivilege();
+    if (isMacTun) {
+      await this.prepareMacTunDns();
+    }
+
     // 生成 sing-box 配置
     const singboxConfig = this.generateSingBoxConfig(config);
 
@@ -369,6 +384,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 等待 Clash API 就绪（sing-box 进程启动后 Clash API 需要约1秒才开始监听）
     await this.waitForClashApi();
+
+    // macOS TUN 模式：把系统 DNS 指向 TUN 劫持地址，让 DNS 查询进入 sing-box FakeIP
+    if (isMacTun) {
+      await this.setupMacTunDns(singboxConfig);
+    }
 
     try {
       // 同步 proxy selector 默认指向（分组模式下指向 urltest 分组）
@@ -474,17 +494,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   async stop(): Promise<void> {
     // macOS TUN 模式：即使 singboxProcess 为 null，也可能有后台进程在运行
-    if (!this.singboxProcess && !this.singboxPid) {
-      return;
+    const hadProcess = !!(this.singboxProcess || this.singboxPid);
+    if (hadProcess) {
+      await this.stopSingBoxProcess();
     }
 
-    await this.stopSingBoxProcess();
+    // macOS TUN 模式：恢复系统 DNS（无论进程是否存活，避免残留 TUN DNS 导致断网）
+    if (process.platform === 'darwin') {
+      await this.restoreMacTunDns();
+    }
   }
 
   /**
    * 关闭并退出特权守护进程（App 退出前调用）
    */
   async shutdown(): Promise<void> {
+    if (process.platform === 'darwin') {
+      await this.restoreMacTunDns();
+    }
     await this.supervisor.shutdown();
   }
 
@@ -1384,6 +1411,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           process.platform === 'win32' || process.platform === 'darwin'
             ? 'gvisor'
             : config.tunConfig?.stack || 'system',
+        // DNS 劫持：把系统 DNS 指向 TUN 劫持地址（地址的下一个 IP，如 172.19.0.2），
+        // 发往该地址的 DNS 查询会被劫持进 sing-box DNS 模块（FakeIP），
+        // 避免 macOS 上 DNS 绕过 TUN 拿到被污染的真实 IP
+        dns_mode: 'hijack',
         // 在系统路由层面排除本地地址和 DNS 服务器，确保本地代理端口和 DNS 可访问
         route_exclude_address: [
           '127.0.0.0/8', '::1/128',
@@ -1896,6 +1927,64 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 忽略检查错误
       }
     }
+  }
+
+  /**
+   * macOS TUN 模式：启动前检查系统 DNS 是否残留 TUN 劫持地址（上次异常退出未恢复），
+   * 若是则先恢复 DHCP，并缓存原始系统 DNS 供配置生成使用。
+   * 必须先生成配置时读取到原始 DNS，否则 dns-local 会指向 TUN 自身造成死循环。
+   */
+  private async prepareMacTunDns(): Promise<void> {
+    try {
+      const current = readMacDnsServers();
+      if (current.length > 0 && current.every((ip) => isTunInternalAddress(ip))) {
+        this.logToManager('warn', '检测到系统 DNS 残留 TUN 地址，正在恢复 DHCP');
+        setSystemDnsServers([]);
+        resetMacDnsCache();
+      }
+      // 触发缓存：后续配置生成使用原始系统 DNS（设置 TUN DNS 后 networksetup 读到的都是内部地址）
+      getSystemDnsServers();
+    } catch (error: any) {
+      this.logToManager('warn', `准备 macOS TUN DNS 失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * macOS TUN 模式：把系统 DNS 指向 TUN 劫持地址（TUN 地址的下一个 IP，如 172.19.0.2）。
+   * 系统 DNS 查询进入 TUN 后被 hijack-dns 捕获，返回 FakeIP，
+   * 浏览器连接 FakeIP 经 sniff 还原域名走代理，恢复 Windows 同款链路。
+   */
+  private async setupMacTunDns(singboxConfig: SingBoxConfig): Promise<void> {
+    try {
+      const tunInbound = singboxConfig.inbounds.find((i) => i.type === 'tun');
+      const addresses = tunInbound?.address || ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'];
+      const dnsAddresses = getTunDnsAddresses(addresses);
+      if (dnsAddresses.length === 0) {
+        this.logToManager('warn', '无法推导 TUN DNS 劫持地址，跳过系统 DNS 设置');
+        return;
+      }
+      setSystemDnsServers(dnsAddresses);
+      this.macDnsConfigured = true;
+      this.logToManager('info', `macOS 系统 DNS 已指向 TUN 劫持地址: ${dnsAddresses.join(', ')}`);
+    } catch (error: any) {
+      this.logToManager('warn', `设置 macOS TUN DNS 失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * macOS TUN 模式：恢复系统 DNS（DHCP 自动获取），并清空原始 DNS 缓存。
+   * 幂等：仅在本次会话设置过 TUN DNS 时才执行。
+   */
+  private async restoreMacTunDns(): Promise<void> {
+    if (!this.macDnsConfigured) return;
+    try {
+      setSystemDnsServers([]);
+      this.logToManager('info', 'macOS 系统 DNS 已恢复为 DHCP');
+    } catch (error: any) {
+      this.logToManager('warn', `恢复 macOS 系统 DNS 失败: ${error.message}`);
+    }
+    this.macDnsConfigured = false;
+    resetMacDnsCache();
   }
 
   /**
