@@ -46,17 +46,6 @@ export function ServerSpeedBadge({ result, isLoading, className }: ServerSpeedBa
     return 'bg-red-500/20 text-red-700 border-red-500/30';
   };
 
-  const formatSpeed = (speed: number | null): string => {
-    if (speed === null) return '';
-    if (speed >= 1024 * 1024) {
-      return `${(speed / (1024 * 1024)).toFixed(1)} MB/s`;
-    }
-    if (speed >= 1024) {
-      return `${(speed / 1024).toFixed(1)} KB/s`;
-    }
-    return `${speed.toFixed(0)} B/s`;
-  };
-
   return (
     <div className={cn('flex items-center gap-1', className)}>
       <Badge variant="outline" className={cn('text-xs', getLatencyColor(result.latency))}>
@@ -65,11 +54,6 @@ export function ServerSpeedBadge({ result, isLoading, className }: ServerSpeedBa
       {typeof result.dialLatency === 'number' && (
         <Badge variant="outline" className="text-xs text-muted-foreground">
           建连{result.dialLatency}ms
-        </Badge>
-      )}
-      {result.downloadSpeed !== null && (
-        <Badge variant="outline" className="text-xs">
-          下载{formatSpeed(result.downloadSpeed)}
         </Badge>
       )}
     </div>

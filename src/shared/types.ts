@@ -185,10 +185,10 @@ export interface AutoSelectConfig {
 // 服务器测速结果
 export interface ServerSpeedResult {
   serverId: string;
+  /** 隧道建立后会话内的稳定延迟（毫秒） */
   latency: number | null;
   /** 建连耗时（首个成功请求，含 QUIC/TCP 握手） */
   dialLatency?: number | null;
-  downloadSpeed: number | null;
   lastTestTime: string;
   error?: string;
 }

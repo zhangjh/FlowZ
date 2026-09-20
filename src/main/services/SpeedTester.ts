@@ -6,8 +6,10 @@
  * 真实拨号测速：
  *   1. 建连延迟（首个成功请求，含 QUIC/TCP/TLS 握手，UDP 系协议可能数秒）
  *   2. 会话延迟（隧道建立后稳定延迟）
- *   3. 真实带宽下载（speed.cloudflare.com 8MB，8s 上限）
  * 每节点整体 30s 超时，慢节点不拖死整批。
+ *
+ * 说明：不做带宽（下载）测试。并行测速时 N 路下载共享同一条本地出口链路，
+ * 测得的下行只是"份额"而非节点真实带宽，数值会随并发与时段大幅波动、误导用户。
  */
 
 import * as http from 'http';
@@ -26,17 +28,12 @@ export interface SpeedTestResult {
   latency: number | null;
   /** 建连耗时（首个成功请求，含 QUIC/TCP 握手），单独记录，UDP 系协议可能数秒 */
   dialLatency: number | null;
-  /** 下载吞吐（字节/秒），带宽测试完成后才有 */
-  downloadSpeed: number | null;
-  downloadBytes?: number;
-  downloadElapsedMs?: number;
-  /** ok 判定失败时为失败原因；带宽测试失败时单独说明 */
+  /** 不可达时为失败原因 */
   error?: string;
 }
 
 export interface ISpeedTester {
   testLatency(server: ServerConfig, timeout?: number): Promise<number | null>;
-  testDownloadSpeed(proxyPort: number, timeout?: number): Promise<number | null>;
   testServer(server: ServerConfig, proxyPort?: number): Promise<SpeedTestResult>;
   testMultipleServers(
     servers: ServerConfig[],
@@ -45,15 +42,12 @@ export interface ISpeedTester {
   ): Promise<Map<string, SpeedTestResult>>;
 }
 
-/** 单节点整体超时（含建连、会话、下载），与移动端一致。 */
+/** 单节点整体超时（含建连、会话），与移动端一致。 */
 const NODE_TIMEOUT_MS = 30_000;
-/** 并行并发度：太多会同时占满带宽互相拉低测速值，4 是平衡点。 */
+/** 并行并发度。 */
 const DEFAULT_CONCURRENCY = 4;
 /** 单次请求连接/读取超时。 */
 const REQUEST_TIMEOUT_MS = 8_000;
-/** 带宽测试下拉取大小与时间上限。 */
-const DOWNLOAD_CAP_MS = 8_000;
-const DOWNLOAD_BYTES = 8 * 1024 * 1024;
 const SINGBOX_STARTUP_TIMEOUT = 20_000;
 
 /** 与移动端同一组境外连通性目标。 */
@@ -62,8 +56,6 @@ const PROBE_URLS = [
   'https://cp.cloudflare.com/generate_204',
   'https://www.google.com/generate_204',
 ];
-
-const DOWNLOAD_HOST = 'speed.cloudflare.com';
 
 function isIPAddress(value: string): boolean {
   // IPv4
@@ -334,70 +326,6 @@ function requestOnce(port: number, targetUrl: string, timeout: number): Promise<
     .catch((e) => ({ ok: false, latency: Date.now() - start, error: e.message }));
 }
 
-interface DownloadOutcome {
-  ok: boolean;
-  bytes: number;
-  elapsedMs: number;
-  error?: string;
-}
-
-/** 经本地代理下载测速（限时限量，失败不影响通断结论）。 */
-function downloadVia(port: number, timeout: number): Promise<DownloadOutcome> {
-  const start = Date.now();
-  return createTunnel(port, DOWNLOAD_HOST, 443, timeout)
-    .then((tlsSocket) => {
-      return new Promise<DownloadOutcome>((resolve) => {
-        let bytes = 0;
-        let finished = false;
-        const finish = (outcome: Partial<DownloadOutcome>) => {
-          if (finished) return;
-          finished = true;
-          tlsSocket.destroy();
-          resolve({
-            ok: outcome.ok ?? false,
-            bytes: outcome.bytes ?? bytes,
-            elapsedMs: Date.now() - start,
-            error: outcome.error,
-          });
-        };
-        const request = https.request({
-          createConnection: () => tlsSocket,
-          hostname: DOWNLOAD_HOST,
-          port: 443,
-          path: `/__down?bytes=${DOWNLOAD_BYTES}`,
-          method: 'GET',
-          headers: {
-            Host: DOWNLOAD_HOST,
-            'User-Agent': 'FlowZ-SpeedTest/1.0',
-            Connection: 'close',
-          },
-        });
-        request.setTimeout(timeout, () => finish({ ok: false, error: '下载超时' }));
-        request.on('error', (e) => finish({ ok: false, error: e.message }));
-        request.on('response', (res) => {
-          const statusCode = res.statusCode ?? 0;
-          if (statusCode < 200 || statusCode >= 300) {
-            res.resume();
-            res.on('end', () => finish({ ok: false, error: `HTTP ${statusCode}` }));
-            return;
-          }
-          res.on('data', (chunk) => {
-            bytes += chunk.length;
-            // 达到下载量或时间上限：截断看部分结果（视为成功）
-            if (bytes >= DOWNLOAD_BYTES || Date.now() - start >= DOWNLOAD_CAP_MS) {
-              res.destroy();
-            }
-          });
-          res.on('close', () => finish({ ok: true, bytes }));
-          res.on('end', () => finish({ ok: true, bytes }));
-          res.on('error', (e) => finish({ ok: false, error: e.message }));
-        });
-        request.end();
-      });
-    })
-    .catch((e) => ({ ok: false, bytes: 0, elapsedMs: Date.now() - start, error: e.message }));
-}
-
 function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(onTimeout()), ms);
@@ -430,17 +358,17 @@ async function runParallel<T>(
   await Promise.all(Array.from({ length: count }, () => worker()));
 }
 
-/** 探测单个节点：建连延迟 → 会话延迟 → 带宽（可选），整体受节点超时约束。 */
+/** 探测单个节点：建连延迟 → 会话延迟，整体受节点超时约束。 */
 async function probeNode(
   port: number,
-  opts: { download: boolean; requestTimeoutMs: number }
+  requestTimeoutMs: number
 ): Promise<SpeedTestResult> {
   const nodeTask = async (): Promise<SpeedTestResult> => {
     // 建连阶段：首个成功请求 = 拨号（含 QUIC/TCP/TLS 握手耗时），单独记录
     let dialLatency: number | null = null;
     let dialError: string | undefined;
     for (const url of PROBE_URLS) {
-      const r = await requestOnce(port, url, opts.requestTimeoutMs);
+      const r = await requestOnce(port, url, requestTimeoutMs);
       if (r.ok) {
         dialLatency = r.latency;
         break;
@@ -451,7 +379,6 @@ async function probeNode(
       return {
         latency: null,
         dialLatency: null,
-        downloadSpeed: null,
         error: dialError || '无有效响应',
       };
     }
@@ -459,33 +386,16 @@ async function probeNode(
     // 会话阶段：隧道已建立，再测一次得到稳定会话延迟
     let sessionLatency: number | null = null;
     for (const url of PROBE_URLS) {
-      const r = await requestOnce(port, url, opts.requestTimeoutMs);
+      const r = await requestOnce(port, url, requestTimeoutMs);
       if (r.ok) {
         sessionLatency = r.latency;
         break;
       }
     }
     const latencyMs = sessionLatency ?? dialLatency;
-
-    if (!opts.download) {
-      return {
-        latency: latencyMs,
-        dialLatency,
-        downloadSpeed: null,
-      };
-    }
-
-    // 带宽：限时下载，失败不影响通断结论，只在结果里标注
-    const dl = await downloadVia(port, opts.requestTimeoutMs + DOWNLOAD_CAP_MS);
-    const downloadSpeed =
-      dl.bytes > 0 && dl.elapsedMs > 0 ? Math.round((dl.bytes * 1000) / dl.elapsedMs) : null;
     return {
       latency: latencyMs,
       dialLatency,
-      downloadSpeed,
-      downloadBytes: dl.bytes,
-      downloadElapsedMs: dl.elapsedMs,
-      error: dl.ok || dl.bytes > 0 ? undefined : dl.error || '带宽测试失败',
     };
   };
 
@@ -494,7 +404,6 @@ async function probeNode(
 
 interface RunBatchOptions {
   concurrency: number;
-  download: boolean;
   requestTimeoutMs: number;
 }
 
@@ -531,7 +440,6 @@ async function runBatch(
         results.set(server.id, {
           latency: null,
           dialLatency: null,
-          downloadSpeed: null,
           error: '配置校验失败',
         });
       }
@@ -584,7 +492,6 @@ async function runBatch(
         results.set(server.id, {
           latency: null,
           dialLatency: null,
-          downloadSpeed: null,
           error: 'sing-box 启动失败',
         });
       }
@@ -597,12 +504,11 @@ async function runBatch(
         results.set(server.id, {
           latency: null,
           dialLatency: null,
-          downloadSpeed: null,
           error: 'sing-box 已退出',
         });
         return;
       }
-      const result = await probeNode(ports[index], opts);
+      const result = await probeNode(ports[index], opts.requestTimeoutMs);
       results.set(server.id, result);
     });
   } catch (error) {
@@ -612,7 +518,6 @@ async function runBatch(
         results.set(server.id, {
           latency: null,
           dialLatency: null,
-          downloadSpeed: null,
           error: message,
         });
       }
@@ -647,18 +552,9 @@ export class SpeedTester implements ISpeedTester {
   async testLatency(server: ServerConfig, timeout = 12_000): Promise<number | null> {
     const results = await runBatch([server], {
       concurrency: 1,
-      download: false,
       requestTimeoutMs: Math.max(3_000, Math.min(timeout, 30_000)),
     });
     return results.get(server.id)?.latency ?? null;
-  }
-
-  /**
-   * 通过本地代理端口测试下载速度（字节/秒）
-   */
-  async testDownloadSpeed(proxyPort: number, _timeout?: number): Promise<number | null> {
-    const dl = await downloadVia(proxyPort, REQUEST_TIMEOUT_MS + DOWNLOAD_CAP_MS);
-    return dl.bytes > 0 && dl.elapsedMs > 0 ? Math.round((dl.bytes * 1000) / dl.elapsedMs) : null;
   }
 
   /**
@@ -667,14 +563,12 @@ export class SpeedTester implements ISpeedTester {
   async testServer(server: ServerConfig, _proxyPort?: number): Promise<SpeedTestResult> {
     const results = await runBatch([server], {
       concurrency: 1,
-      download: true,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
     });
     return (
       results.get(server.id) ?? {
         latency: null,
         dialLatency: null,
-        downloadSpeed: null,
         error: '测速失败',
       }
     );
@@ -690,7 +584,6 @@ export class SpeedTester implements ISpeedTester {
   ): Promise<Map<string, SpeedTestResult>> {
     return runBatch(servers, {
       concurrency,
-      download: true,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
     });
   }
@@ -701,7 +594,6 @@ export class SpeedTester implements ISpeedTester {
   async testMultipleServersLatency(servers: ServerConfig[]): Promise<Map<string, number | null>> {
     const fullResults = await runBatch(servers, {
       concurrency: DEFAULT_CONCURRENCY,
-      download: false,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
     });
     const latencyMap = new Map<string, number | null>();

@@ -183,7 +183,6 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
           serverId: server.id,
           latency: testResult?.latency ?? null,
           dialLatency: testResult?.dialLatency ?? null,
-          downloadSpeed: testResult?.downloadSpeed ?? null,
           lastTestTime: new Date().toISOString(),
           error: testResult?.latency === null ? '无法连接' : undefined,
         };
@@ -219,8 +218,6 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
 
     // 如果有测试结果，根据结果选择
     if (this.lastTestResults.length > 0) {
-      const mode = this.config?.autoSelect?.mode ?? 'latency';
-
       // 过滤出可连接的服务器
       const availableResults = this.lastTestResults.filter((r) => r.latency !== null);
 
@@ -229,15 +226,10 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
         return null;
       }
 
-      // 根据模式排序
-      const sorted = [...availableResults].sort((a, b) => {
-        if (mode === 'latency') {
-          return (a.latency ?? Infinity) - (b.latency ?? Infinity);
-        } else {
-          // speed 模式，优先下载速度
-          return (b.downloadSpeed ?? 0) - (a.downloadSpeed ?? 0);
-        }
-      });
+      // 仅以延迟排序（下载带宽并行测量无意义，已移除，速度模式回退到延迟）
+      const sorted = [...availableResults].sort(
+        (a, b) => (a.latency ?? Infinity) - (b.latency ?? Infinity)
+      );
 
       const bestId = sorted[0].serverId;
       return servers.find((s) => s.id === bestId) ?? null;
@@ -406,7 +398,6 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
           serverId: server.id,
           latency: testResult?.latency ?? null,
           dialLatency: testResult?.dialLatency ?? null,
-          downloadSpeed: testResult?.downloadSpeed ?? null,
           lastTestTime: new Date().toISOString(),
           error: testResult?.latency === null ? '无法连接' : undefined,
         };

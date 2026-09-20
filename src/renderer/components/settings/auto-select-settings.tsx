@@ -105,11 +105,10 @@ export function AutoSelectSettings() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="latency">延迟优先（推荐）</SelectItem>
-              <SelectItem value="speed">速度优先</SelectItem>
             </SelectContent>
           </Select>
           <p className="text-sm text-muted-foreground">
-            延迟优先选择响应最快的服务器，速度优先选择下载速度最高的服务器
+            延迟优先选择响应最快的服务器
           </p>
         </div>
 
