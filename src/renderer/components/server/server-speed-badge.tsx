@@ -59,15 +59,17 @@ export function ServerSpeedBadge({ result, isLoading, className }: ServerSpeedBa
 
   return (
     <div className={cn('flex items-center gap-1', className)}>
-      <Badge
-        variant="outline"
-        className={cn('text-xs', getLatencyColor(result.latency))}
-      >
-        {result.latency}ms
+      <Badge variant="outline" className={cn('text-xs', getLatencyColor(result.latency))}>
+        延迟{result.latency}ms
       </Badge>
+      {typeof result.dialLatency === 'number' && (
+        <Badge variant="outline" className="text-xs text-muted-foreground">
+          建连{result.dialLatency}ms
+        </Badge>
+      )}
       {result.downloadSpeed !== null && (
         <Badge variant="outline" className="text-xs">
-          {formatSpeed(result.downloadSpeed)}
+          下载{formatSpeed(result.downloadSpeed)}
         </Badge>
       )}
     </div>

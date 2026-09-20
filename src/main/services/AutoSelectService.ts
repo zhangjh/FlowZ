@@ -182,6 +182,7 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
         return {
           serverId: server.id,
           latency: testResult?.latency ?? null,
+          dialLatency: testResult?.dialLatency ?? null,
           downloadSpeed: testResult?.downloadSpeed ?? null,
           lastTestTime: new Date().toISOString(),
           error: testResult?.latency === null ? '无法连接' : undefined,
@@ -404,6 +405,7 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
         return {
           serverId: server.id,
           latency: testResult?.latency ?? null,
+          dialLatency: testResult?.dialLatency ?? null,
           downloadSpeed: testResult?.downloadSpeed ?? null,
           lastTestTime: new Date().toISOString(),
           error: testResult?.latency === null ? '无法连接' : undefined,

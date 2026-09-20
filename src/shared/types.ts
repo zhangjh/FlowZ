@@ -186,6 +186,8 @@ export interface AutoSelectConfig {
 export interface ServerSpeedResult {
   serverId: string;
   latency: number | null;
+  /** 建连耗时（首个成功请求，含 QUIC/TCP 握手） */
+  dialLatency?: number | null;
   downloadSpeed: number | null;
   lastTestTime: string;
   error?: string;

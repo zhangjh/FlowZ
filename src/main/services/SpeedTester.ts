@@ -1,9 +1,18 @@
 /**
- * 服务器速度测试服务
- * 通过启动临时 sing-box 进程来测试服务器延迟（与托盘测速相同方式）
+ * 服务器真实测速服务
+ *
+ * 与移动端（FlowZ Android）一致：启动一个临时 sing-box 内核，挂 N 个 loopback 入站
+ * （每节点独立端口 + 独立出站，按 inbound 路由），并行（并发度 4）对每个节点依次
+ * 真实拨号测速：
+ *   1. 建连延迟（首个成功请求，含 QUIC/TCP/TLS 握手，UDP 系协议可能数秒）
+ *   2. 会话延迟（隧道建立后稳定延迟）
+ *   3. 真实带宽下载（speed.cloudflare.com 8MB，8s 上限）
+ * 每节点整体 30s 超时，慢节点不拖死整批。
  */
 
 import * as http from 'http';
+import * as https from 'https';
+import * as tls from 'tls';
 import * as net from 'net';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -13,8 +22,15 @@ import { resourceManager } from './ResourceManager';
 import { getUserDataPath } from '../utils/paths';
 
 export interface SpeedTestResult {
+  /** 隧道建立后会话内的稳定延迟（毫秒），不可达为 null */
   latency: number | null;
+  /** 建连耗时（首个成功请求，含 QUIC/TCP 握手），单独记录，UDP 系协议可能数秒 */
+  dialLatency: number | null;
+  /** 下载吞吐（字节/秒），带宽测试完成后才有 */
   downloadSpeed: number | null;
+  downloadBytes?: number;
+  downloadElapsedMs?: number;
+  /** ok 判定失败时为失败原因；带宽测试失败时单独说明 */
   error?: string;
 }
 
@@ -29,9 +45,25 @@ export interface ISpeedTester {
   ): Promise<Map<string, SpeedTestResult>>;
 }
 
-const BASE_PORT = 65401;
-const TEST_TIMEOUT = 12000;
-const SINGBOX_STARTUP_TIMEOUT = 20000;
+/** 单节点整体超时（含建连、会话、下载），与移动端一致。 */
+const NODE_TIMEOUT_MS = 30_000;
+/** 并行并发度：太多会同时占满带宽互相拉低测速值，4 是平衡点。 */
+const DEFAULT_CONCURRENCY = 4;
+/** 单次请求连接/读取超时。 */
+const REQUEST_TIMEOUT_MS = 8_000;
+/** 带宽测试下拉取大小与时间上限。 */
+const DOWNLOAD_CAP_MS = 8_000;
+const DOWNLOAD_BYTES = 8 * 1024 * 1024;
+const SINGBOX_STARTUP_TIMEOUT = 20_000;
+
+/** 与移动端同一组境外连通性目标。 */
+const PROBE_URLS = [
+  'https://www.gstatic.com/generate_204',
+  'https://cp.cloudflare.com/generate_204',
+  'https://www.google.com/generate_204',
+];
+
+const DOWNLOAD_HOST = 'speed.cloudflare.com';
 
 function isIPAddress(value: string): boolean {
   // IPv4
@@ -114,7 +146,7 @@ function buildOutbound(server: ServerConfig, tag: string): any {
   return outbound;
 }
 
-function buildTestConfig(servers: ServerConfig[]): any {
+function buildTestConfig(servers: ServerConfig[], ports: number[]): any {
   const inbounds: any[] = [];
   const outbounds: any[] = [];
   const routeRules: any[] = [];
@@ -126,10 +158,10 @@ function buildTestConfig(servers: ServerConfig[]): any {
     const inboundTag = `speed-in-${i}`;
 
     inbounds.push({
-      type: 'http',
+      type: 'mixed',
       tag: inboundTag,
       listen: '127.0.0.1',
-      listen_port: BASE_PORT + i,
+      listen_port: ports[i],
     });
 
     outbounds.push(buildOutbound(server, outboundTag));
@@ -170,7 +202,7 @@ function buildTestConfig(servers: ServerConfig[]): any {
   }
 
   return {
-    log: { level: 'info', timestamp: true },
+    log: { level: 'warn', timestamp: false },
     dns: dnsConfig,
     inbounds,
     outbounds,
@@ -183,189 +215,495 @@ function buildTestConfig(servers: ServerConfig[]): any {
   };
 }
 
-function doOneRequest(port: number, timeout: number): Promise<{ ok: boolean; latency: number; statusCode?: number; error?: string }> {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-    const testUrl = 'http://www.gstatic.com/generate_204';
-    const req = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path: testUrl,
-        method: 'GET',
-        timeout,
-        headers: { Host: 'www.gstatic.com', 'User-Agent': 'FlowZ-SpeedTest/1.0' },
+/** 逐个分配本机空闲 loopback 端口（避免与运行中的代理/其他测速实例冲突）。 */
+async function allocatePorts(n: number): Promise<number[]> {
+  const ports: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const port: number = await new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const p = (server.address() as net.AddressInfo).port;
+        server.close(() => resolve(p));
+      });
+    });
+    ports.push(port);
+  }
+  return ports;
+}
+
+/** 经本地代理建立到目标站点的 CONNECT + TLS 隧道，返回已握手完成的 TLS socket。 */
+function createTunnel(
+  port: number,
+  host: string,
+  targetPort: number,
+  timeout: number
+): Promise<tls.TLSSocket> {
+  return new Promise((resolve, reject) => {
+    const proxyReq = http.request({
+      host: '127.0.0.1',
+      port,
+      method: 'CONNECT',
+      path: `${host}:${targetPort}`,
+      headers: { Host: host, 'User-Agent': 'FlowZ-SpeedTest/1.0' },
+    });
+    let settled = false;
+    const fail = (err: Error) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    };
+    proxyReq.setTimeout(timeout, () => proxyReq.destroy(new Error('CONNECT 超时')));
+    proxyReq.on('error', fail);
+    proxyReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        fail(new Error(`CONNECT ${res.statusCode}`));
+        return;
+      }
+      socket.setTimeout(timeout, () => socket.destroy());
+      const tlsSocket = tls.connect({ socket, servername: host });
+      tlsSocket.on('secureConnect', () => {
+        if (!settled) {
+          settled = true;
+          resolve(tlsSocket);
+        }
+      });
+      tlsSocket.on('error', fail);
+    });
+    proxyReq.end();
+  });
+}
+
+interface RequestOutcome {
+  ok: boolean;
+  statusCode?: number;
+  latency: number;
+  error?: string;
+}
+
+/** 通过本地代理完成一次真实 https GET（全新隧道，与移动端同源目标）。 */
+function requestOnce(port: number, targetUrl: string, timeout: number): Promise<RequestOutcome> {
+  const target = new URL(targetUrl);
+  const host = target.hostname;
+  const targetPort = Number(target.port) || 443;
+  const start = Date.now();
+
+  return createTunnel(port, host, targetPort, timeout)
+    .then((tlsSocket) => {
+      return new Promise<RequestOutcome>((resolve) => {
+        const request = https.request({
+          createConnection: () => tlsSocket,
+          hostname: host,
+          port: targetPort,
+          path: `${target.pathname}${target.search}`,
+          method: 'GET',
+          headers: {
+            Host: host,
+            'User-Agent': 'FlowZ-SpeedTest/1.0',
+            Connection: 'close',
+          },
+        });
+        request.setTimeout(timeout, () => request.destroy(new Error('请求超时')));
+        request.on('error', (e) => {
+          tlsSocket.destroy();
+          resolve({ ok: false, latency: Date.now() - start, error: e.message });
+        });
+        request.on('response', (res) => {
+          const statusCode = res.statusCode ?? 0;
+          res.resume();
+          res.on('end', () => {
+            tlsSocket.destroy();
+            const ok = statusCode >= 200 && statusCode < 300;
+            resolve({
+              ok,
+              statusCode,
+              latency: Date.now() - start,
+              error: ok ? undefined : `HTTP ${statusCode}`,
+            });
+          });
+          res.on('error', (e) => {
+            tlsSocket.destroy();
+            resolve({ ok: false, latency: Date.now() - start, error: e.message });
+          });
+        });
+        request.end();
+      });
+    })
+    .catch((e) => ({ ok: false, latency: Date.now() - start, error: e.message }));
+}
+
+interface DownloadOutcome {
+  ok: boolean;
+  bytes: number;
+  elapsedMs: number;
+  error?: string;
+}
+
+/** 经本地代理下载测速（限时限量，失败不影响通断结论）。 */
+function downloadVia(port: number, timeout: number): Promise<DownloadOutcome> {
+  const start = Date.now();
+  return createTunnel(port, DOWNLOAD_HOST, 443, timeout)
+    .then((tlsSocket) => {
+      return new Promise<DownloadOutcome>((resolve) => {
+        let bytes = 0;
+        let finished = false;
+        const finish = (outcome: Partial<DownloadOutcome>) => {
+          if (finished) return;
+          finished = true;
+          tlsSocket.destroy();
+          resolve({
+            ok: outcome.ok ?? false,
+            bytes: outcome.bytes ?? bytes,
+            elapsedMs: Date.now() - start,
+            error: outcome.error,
+          });
+        };
+        const request = https.request({
+          createConnection: () => tlsSocket,
+          hostname: DOWNLOAD_HOST,
+          port: 443,
+          path: `/__down?bytes=${DOWNLOAD_BYTES}`,
+          method: 'GET',
+          headers: {
+            Host: DOWNLOAD_HOST,
+            'User-Agent': 'FlowZ-SpeedTest/1.0',
+            Connection: 'close',
+          },
+        });
+        request.setTimeout(timeout, () => finish({ ok: false, error: '下载超时' }));
+        request.on('error', (e) => finish({ ok: false, error: e.message }));
+        request.on('response', (res) => {
+          const statusCode = res.statusCode ?? 0;
+          if (statusCode < 200 || statusCode >= 300) {
+            res.resume();
+            res.on('end', () => finish({ ok: false, error: `HTTP ${statusCode}` }));
+            return;
+          }
+          res.on('data', (chunk) => {
+            bytes += chunk.length;
+            // 达到下载量或时间上限：截断看部分结果（视为成功）
+            if (bytes >= DOWNLOAD_BYTES || Date.now() - start >= DOWNLOAD_CAP_MS) {
+              res.destroy();
+            }
+          });
+          res.on('close', () => finish({ ok: true, bytes }));
+          res.on('end', () => finish({ ok: true, bytes }));
+          res.on('error', (e) => finish({ ok: false, error: e.message }));
+        });
+        request.end();
+      });
+    })
+    .catch((e) => ({ ok: false, bytes: 0, elapsedMs: Date.now() - start, error: e.message }));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(onTimeout()), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
       },
-      (res) => {
-        const latency = Date.now() - startTime;
-        res.resume();
-        res.on('end', () => resolve({ ok: true, latency, statusCode: res.statusCode }));
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
       }
     );
-    req.on('error', (err) => resolve({ ok: false, latency: Date.now() - startTime, error: err.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ ok: false, latency: Date.now() - startTime, error: 'TIMEOUT' }); });
-    req.end();
   });
+}
+
+async function runParallel<T>(
+  items: T[],
+  limit: number,
+  task: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      await task(items[index], index);
+    }
+  };
+  const count = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: count }, () => worker()));
+}
+
+/** 探测单个节点：建连延迟 → 会话延迟 → 带宽（可选），整体受节点超时约束。 */
+async function probeNode(
+  port: number,
+  opts: { download: boolean; requestTimeoutMs: number }
+): Promise<SpeedTestResult> {
+  const nodeTask = async (): Promise<SpeedTestResult> => {
+    // 建连阶段：首个成功请求 = 拨号（含 QUIC/TCP/TLS 握手耗时），单独记录
+    let dialLatency: number | null = null;
+    let dialError: string | undefined;
+    for (const url of PROBE_URLS) {
+      const r = await requestOnce(port, url, opts.requestTimeoutMs);
+      if (r.ok) {
+        dialLatency = r.latency;
+        break;
+      }
+      dialError = r.error;
+    }
+    if (dialLatency === null) {
+      return {
+        latency: null,
+        dialLatency: null,
+        downloadSpeed: null,
+        error: dialError || '无有效响应',
+      };
+    }
+
+    // 会话阶段：隧道已建立，再测一次得到稳定会话延迟
+    let sessionLatency: number | null = null;
+    for (const url of PROBE_URLS) {
+      const r = await requestOnce(port, url, opts.requestTimeoutMs);
+      if (r.ok) {
+        sessionLatency = r.latency;
+        break;
+      }
+    }
+    const latencyMs = sessionLatency ?? dialLatency;
+
+    if (!opts.download) {
+      return {
+        latency: latencyMs,
+        dialLatency,
+        downloadSpeed: null,
+      };
+    }
+
+    // 带宽：限时下载，失败不影响通断结论，只在结果里标注
+    const dl = await downloadVia(port, opts.requestTimeoutMs + DOWNLOAD_CAP_MS);
+    const downloadSpeed =
+      dl.bytes > 0 && dl.elapsedMs > 0 ? Math.round((dl.bytes * 1000) / dl.elapsedMs) : null;
+    return {
+      latency: latencyMs,
+      dialLatency,
+      downloadSpeed,
+      downloadBytes: dl.bytes,
+      downloadElapsedMs: dl.elapsedMs,
+      error: dl.ok || dl.bytes > 0 ? undefined : dl.error || '带宽测试失败',
+    };
+  };
+
+  return withTimeout(nodeTask(), NODE_TIMEOUT_MS, () => new Error(`测速超时（${NODE_TIMEOUT_MS / 1000}s）`));
+}
+
+interface RunBatchOptions {
+  concurrency: number;
+  download: boolean;
+  requestTimeoutMs: number;
+}
+
+/** 启动一个临时 sing-box 探针内核，并行对全部节点做真实测速。 */
+async function runBatch(
+  servers: ServerConfig[],
+  opts: RunBatchOptions
+): Promise<Map<string, SpeedTestResult>> {
+  const results = new Map<string, SpeedTestResult>();
+  if (servers.length === 0) {
+    return results;
+  }
+
+  let testProc: ReturnType<typeof spawn> | null = null;
+  let testConfigPath = '';
+
+  try {
+    // 构建测试配置（每节点独立 loopback 端口 + 独立出站，按 inbound 路由）
+    const ports = await allocatePorts(servers.length);
+    const testConfig = buildTestConfig(servers, ports);
+    const userDataPath = getUserDataPath();
+    testConfigPath = path.join(userDataPath, 'speedtest_config.json');
+    await fs.writeFile(testConfigPath, JSON.stringify(testConfig, null, 2));
+
+    // 验证配置
+    const singboxPath = resourceManager.getSingBoxPath();
+    try {
+      execSync(`"${singboxPath}" check -c "${testConfigPath}"`, {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+    } catch {
+      for (const server of servers) {
+        results.set(server.id, {
+          latency: null,
+          dialLatency: null,
+          downloadSpeed: null,
+          error: '配置校验失败',
+        });
+      }
+      return results;
+    }
+
+    // 启动临时 sing-box
+    testProc = spawn(singboxPath, ['run', '-c', testConfigPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let processExited = false;
+    testProc.on('exit', () => {
+      processExited = true;
+    });
+
+    // 等待 sing-box 就绪
+    const startupOk = await new Promise<boolean>((resolve) => {
+      const startTime = Date.now();
+      const check = () => {
+        if (processExited) {
+          resolve(false);
+          return;
+        }
+        if (Date.now() - startTime > SINGBOX_STARTUP_TIMEOUT) {
+          resolve(false);
+          return;
+        }
+        const sock = new net.Socket();
+        sock.setTimeout(500);
+        sock.on('connect', () => {
+          sock.destroy();
+          resolve(true);
+        });
+        sock.on('error', () => {
+          sock.destroy();
+          setTimeout(check, 500);
+        });
+        sock.on('timeout', () => {
+          sock.destroy();
+          setTimeout(check, 500);
+        });
+        sock.connect(ports[0], '127.0.0.1');
+      };
+      setTimeout(check, 1000);
+    });
+
+    if (!startupOk) {
+      for (const server of servers) {
+        results.set(server.id, {
+          latency: null,
+          dialLatency: null,
+          downloadSpeed: null,
+          error: 'sing-box 启动失败',
+        });
+      }
+      return results;
+    }
+
+    // 并行测速（并发限流），每个节点独立端口独立超时，慢节点不拖死整批
+    await runParallel(servers, opts.concurrency, async (server, index) => {
+      if (processExited) {
+        results.set(server.id, {
+          latency: null,
+          dialLatency: null,
+          downloadSpeed: null,
+          error: 'sing-box 已退出',
+        });
+        return;
+      }
+      const result = await probeNode(ports[index], opts);
+      results.set(server.id, result);
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const server of servers) {
+      if (!results.has(server.id)) {
+        results.set(server.id, {
+          latency: null,
+          dialLatency: null,
+          downloadSpeed: null,
+          error: message,
+        });
+      }
+    }
+  } finally {
+    // 清理 sing-box 进程
+    if (testProc && !testProc.killed) {
+      testProc.kill();
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 3000);
+        testProc!.on('close', () => {
+          clearTimeout(t);
+          resolve();
+        });
+      });
+    }
+    // 清理配置文件
+    try {
+      await fs.unlink(testConfigPath);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return results;
 }
 
 export class SpeedTester implements ISpeedTester {
   /**
-   * 测试单个服务器延迟（通过临时 sing-box 代理）
+   * 测试单个服务器延迟（只测建连 + 会话延迟，不下载）
    */
-  async testLatency(server: ServerConfig, _timeout?: number): Promise<number | null> {
-    const results = await this.testMultipleServers([server]);
-    const result = results.get(server.id);
-    return result?.latency ?? null;
+  async testLatency(server: ServerConfig, timeout = 12_000): Promise<number | null> {
+    const results = await runBatch([server], {
+      concurrency: 1,
+      download: false,
+      requestTimeoutMs: Math.max(3_000, Math.min(timeout, 30_000)),
+    });
+    return results.get(server.id)?.latency ?? null;
   }
 
   /**
-   * 测试下载速度（通过本地代理下载测试文件）
-   * 注：当前版本暂不支持通过临时 sing-box 测速时的下载速度测试
+   * 通过本地代理端口测试下载速度（字节/秒）
    */
-  async testDownloadSpeed(_proxyPort: number, _timeout?: number): Promise<number | null> {
-    return null;
+  async testDownloadSpeed(proxyPort: number, _timeout?: number): Promise<number | null> {
+    const dl = await downloadVia(proxyPort, REQUEST_TIMEOUT_MS + DOWNLOAD_CAP_MS);
+    return dl.bytes > 0 && dl.elapsedMs > 0 ? Math.round((dl.bytes * 1000) / dl.elapsedMs) : null;
   }
 
   /**
-   * 综合测试服务器
+   * 综合测试单个服务器（真实测速逻辑）
    */
-  async testServer(server: ServerConfig, proxyPort?: number): Promise<SpeedTestResult> {
-    const latency = await this.testLatency(server);
-
-    let downloadSpeed: number | null = null;
-    if (proxyPort && latency !== null) {
-      downloadSpeed = await this.testDownloadSpeed(proxyPort);
-    }
-
-    return {
-      latency,
-      downloadSpeed,
-    };
+  async testServer(server: ServerConfig, _proxyPort?: number): Promise<SpeedTestResult> {
+    const results = await runBatch([server], {
+      concurrency: 1,
+      download: true,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    });
+    return (
+      results.get(server.id) ?? {
+        latency: null,
+        dialLatency: null,
+        downloadSpeed: null,
+        error: '测速失败',
+      }
+    );
   }
 
   /**
-   * 批量测试多个服务器（启动临时 sing-box 进程，与托盘测速相同方式）
+   * 并行真实测速多个服务器（与移动端一致：并发 4，单节点 30s 超时）
    */
   async testMultipleServers(
     servers: ServerConfig[],
     _proxyPort?: number,
-    _concurrency?: number
+    concurrency: number = DEFAULT_CONCURRENCY
   ): Promise<Map<string, SpeedTestResult>> {
-    if (servers.length === 0) {
-      return new Map();
-    }
-
-    const results = new Map<string, SpeedTestResult>();
-    let testProc: ReturnType<typeof spawn> | null = null;
-    let testConfigPath = '';
-
-    try {
-      // 构建测试配置
-      const testConfig = buildTestConfig(servers);
-      const userDataPath = getUserDataPath();
-      testConfigPath = path.join(userDataPath, 'speedtest_config.json');
-      await fs.writeFile(testConfigPath, JSON.stringify(testConfig, null, 2));
-
-      // 验证配置
-      const singboxPath = resourceManager.getSingBoxPath();
-      try {
-        execSync(`"${singboxPath}" check -c "${testConfigPath}"`, {
-          encoding: 'utf-8',
-          timeout: 10000,
-        });
-      } catch {
-        // 配置校验失败，所有服务器标记为不可用
-        for (const server of servers) {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: '配置校验失败' });
-        }
-        return results;
-      }
-
-      // 启动临时 sing-box
-      testProc = spawn(singboxPath, ['run', '-c', testConfigPath], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let processExited = false;
-      testProc.on('exit', () => { processExited = true; });
-
-      // 等待 sing-box 就绪
-      const startupOk = await new Promise<boolean>((resolve) => {
-        const startTime = Date.now();
-        const check = () => {
-          if (processExited) { resolve(false); return; }
-          if (Date.now() - startTime > SINGBOX_STARTUP_TIMEOUT) { resolve(false); return; }
-          const sock = new net.Socket();
-          sock.setTimeout(500);
-          sock.on('connect', () => { sock.destroy(); resolve(true); });
-          sock.on('error', () => { sock.destroy(); setTimeout(check, 500); });
-          sock.on('timeout', () => { sock.destroy(); setTimeout(check, 500); });
-          sock.connect(BASE_PORT, '127.0.0.1');
-        };
-        setTimeout(check, 1000);
-      });
-
-      if (!startupOk) {
-        for (const server of servers) {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: 'sing-box 启动失败' });
-        }
-        return results;
-      }
-
-      // 逐个测试服务器（每个先预热再实测）
-      for (let i = 0; i < servers.length; i++) {
-        const server = servers[i];
-        const port = BASE_PORT + i;
-
-        if (processExited) {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: 'sing-box 已退出' });
-          continue;
-        }
-
-        // 预热请求
-        const warmResult = await doOneRequest(port, TEST_TIMEOUT);
-        if (!warmResult.ok) {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: warmResult.error || '连接失败' });
-          continue;
-        }
-
-        // 实测请求
-        const measuredResult = await doOneRequest(port, TEST_TIMEOUT);
-        if (measuredResult.ok) {
-          results.set(server.id, { latency: measuredResult.latency, downloadSpeed: null });
-        } else {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: measuredResult.error || '连接失败' });
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      for (const server of servers) {
-        if (!results.has(server.id)) {
-          results.set(server.id, { latency: null, downloadSpeed: null, error: message });
-        }
-      }
-    } finally {
-      // 清理 sing-box 进程
-      if (testProc && !testProc.killed) {
-        testProc.kill();
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, 3000);
-          testProc!.on('close', () => { clearTimeout(t); resolve(); });
-        });
-      }
-      // 清理配置文件
-      try { await fs.unlink(testConfigPath); } catch { /* ignore */ }
-    }
-
-    return results;
+    return runBatch(servers, {
+      concurrency,
+      download: true,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    });
   }
 
   /**
-   * 批量测试服务器延迟，返回 Map<serverId, latencyMs | null>
-   * 供托盘测速等只需要延迟值的场景使用
+   * 批量测试服务器延迟（只测延迟，不下载），供托盘测速场景使用
    */
   async testMultipleServersLatency(servers: ServerConfig[]): Promise<Map<string, number | null>> {
-    const fullResults = await this.testMultipleServers(servers);
+    const fullResults = await runBatch(servers, {
+      concurrency: DEFAULT_CONCURRENCY,
+      download: false,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    });
     const latencyMap = new Map<string, number | null>();
     for (const [serverId, result] of fullResults) {
       latencyMap.set(serverId, result.latency);
