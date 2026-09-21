@@ -5,8 +5,12 @@
  * （每节点独立端口 + 独立出站，按 inbound 路由），并行（并发度 4）对每个节点依次
  * 真实拨号测速：
  *   1. 建连延迟（首个成功请求，含 QUIC/TCP/TLS 握手，UDP 系协议可能数秒）
- *   2. 会话延迟（隧道建立后稳定延迟）
+ *   2. 会话延迟（对同一可用目标多次采样取最小值，最接近稳态 RTT，抗瞬时抖动）
  * 每节点整体 30s 超时，慢节点不拖死整批。
+ *
+ * 探测目标统一用 http:// 的 generate_204（返回空 204，不测下载）：
+ * 明文代理 GET 无需对目标站做 TLS 握手，比 https 少 1~2 个 RTT，数值更贴近纯网络往返，
+ * 与 Clash url-test 同口径。（仍保留 https 分支以兼容 https 探测目标。）
  *
  * 说明：不做带宽（下载）测试。并行测速时 N 路下载共享同一条本地出口链路，
  * 测得的下行只是"份额"而非节点真实带宽，数值会随并发与时段大幅波动、误导用户。
@@ -50,12 +54,16 @@ const DEFAULT_CONCURRENCY = 4;
 const REQUEST_TIMEOUT_MS = 8_000;
 const SINGBOX_STARTUP_TIMEOUT = 20_000;
 
-/** 与移动端同一组境外连通性目标。 */
+/** 与移动端同一组境外连通性目标。统一用 http:// generate_204：明文探测省去对目标站的
+ *  TLS 握手，延迟数值更贴近纯网络往返（与 Clash url-test 同口径），且返回空 204 不下载数据。 */
 const PROBE_URLS = [
-  'https://www.gstatic.com/generate_204',
-  'https://cp.cloudflare.com/generate_204',
-  'https://www.google.com/generate_204',
+  'http://www.gstatic.com/generate_204',
+  'http://cp.cloudflare.com/generate_204',
+  'http://www.google.com/generate_204',
 ];
+
+/** 会话延迟采样次数，取最小值（最接近稳态 RTT，过滤瞬时抖动/排队）。 */
+const SESSION_SAMPLES = 3;
 
 function isIPAddress(value: string): boolean {
   // IPv4
@@ -275,9 +283,60 @@ interface RequestOutcome {
   error?: string;
 }
 
+/** 通过本地代理完成一次明文 http GET（绝对 URI 交给代理转发，无 CONNECT、无 TLS）。 */
+function plainRequestOnce(
+  port: number,
+  targetUrl: string,
+  timeout: number
+): Promise<RequestOutcome> {
+  const target = new URL(targetUrl);
+  const start = Date.now();
+  return new Promise<RequestOutcome>((resolve) => {
+    const request = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        // 代理模式：path 传完整绝对 URI，由 mixed 入站转发
+        path: targetUrl,
+        method: 'GET',
+        headers: {
+          Host: target.host,
+          'User-Agent': 'FlowZ-SpeedTest/1.0',
+          Connection: 'close',
+        },
+      },
+      (res) => {
+        const statusCode = res.statusCode ?? 0;
+        res.resume();
+        res.on('end', () => {
+          const ok = statusCode >= 200 && statusCode < 300;
+          resolve({
+            ok,
+            statusCode,
+            latency: Date.now() - start,
+            error: ok ? undefined : `HTTP ${statusCode}`,
+          });
+        });
+        res.on('error', (e) =>
+          resolve({ ok: false, latency: Date.now() - start, error: e.message })
+        );
+      }
+    );
+    request.setTimeout(timeout, () => request.destroy(new Error('请求超时')));
+    request.on('error', (e) =>
+      resolve({ ok: false, latency: Date.now() - start, error: e.message })
+    );
+    request.end();
+  });
+}
+
 /** 通过本地代理完成一次真实 https GET（全新隧道，与移动端同源目标）。 */
 function requestOnce(port: number, targetUrl: string, timeout: number): Promise<RequestOutcome> {
   const target = new URL(targetUrl);
+  // http 目标走明文代理 GET，省去 CONNECT + TLS 握手，延迟更贴近纯网络往返
+  if (target.protocol === 'http:') {
+    return plainRequestOnce(port, targetUrl, timeout);
+  }
   const host = target.hostname;
   const targetPort = Number(target.port) || 443;
   const start = Date.now();
@@ -383,15 +442,18 @@ async function probeNode(
       };
     }
 
-    // 会话阶段：隧道已建立，再测一次得到稳定会话延迟
-    let sessionLatency: number | null = null;
-    for (const url of PROBE_URLS) {
-      const r = await requestOnce(port, url, requestTimeoutMs);
-      if (r.ok) {
-        sessionLatency = r.latency;
-        break;
+    // 会话阶段：隧道已建立，多次采样取最小值（最接近稳态 RTT，过滤瞬时抖动）
+    const samples: number[] = [];
+    for (let i = 0; i < SESSION_SAMPLES; i++) {
+      for (const url of PROBE_URLS) {
+        const r = await requestOnce(port, url, requestTimeoutMs);
+        if (r.ok) {
+          samples.push(r.latency);
+          break;
+        }
       }
     }
+    const sessionLatency = samples.length > 0 ? Math.min(...samples) : null;
     const latencyMs = sessionLatency ?? dialLatency;
     return {
       latency: latencyMs,
