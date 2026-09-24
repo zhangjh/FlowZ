@@ -1846,14 +1846,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound: 'mode-cn',
     });
     rules.push({
-      rule_set: 'geoip-cn',
-      action: 'route',
-      outbound: 'mode-cn',
-    });
-    rules.push({
       rule_set: 'geosite-geolocation-!cn',
       action: 'route',
       outbound: 'mode-non-cn',
+    });
+    // geoip-cn 必须排在 geosite-geolocation-!cn 之后（与移动端一致）：
+    // Google 大陆边缘 IP（如 203.208.32.0/19）落在 geoip-cn 数据集内，
+    // 若 geoip-cn 在前，用 DoH/私有 DNS 拿到真实 IP 的境外连接会被误判直连。
+    rules.push({
+      rule_set: 'geoip-cn',
+      action: 'route',
+      outbound: 'mode-cn',
     });
     rules.push({
       action: 'route',
