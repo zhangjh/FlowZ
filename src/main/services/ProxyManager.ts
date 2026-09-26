@@ -1595,7 +1595,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (mode.toLowerCase() === 'direct') {
       return { cn: 'direct', nonCn: 'direct', fallback: 'direct' };
     }
-    return { cn: 'direct', nonCn: 'proxy', fallback: 'direct' };
+    // 智能模式兜底走代理：未命中任何 rule_set 的流量主要是"无域名 + 非国内 IP"
+    // 的境外裸 IP（如 Telegram 内置 DC IP、QUIC 拿到的真实边缘 IP），必须进隧道。
+    // 若兜底直连，这类流量会从本地出口访问而被墙。国内流量已由 geosite-cn/geoip-cn
+    // 显式直连，兜底代理不会误伤国内。未打包 geoip-!cn 控制包体，故用兜底等价承接。
+    return { cn: 'direct', nonCn: 'proxy', fallback: 'proxy' };
   }
 
   private generateSelectorOutbound(tag: string, selected: string): SingBoxOutbound {
