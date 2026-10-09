@@ -126,6 +126,16 @@ impl FromStr for ProxyModeType {
     }
 }
 
+impl fmt::Display for ProxyModeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let v = match self {
+            ProxyModeType::SystemProxy => "systemProxy",
+            ProxyModeType::Tun => "tun",
+        };
+        write!(f, "{}", v)
+    }
+}
+
 impl Serialize for ProxyModeType {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let v = match self {
@@ -527,7 +537,7 @@ pub fn validate_config(cfg: &mut UserConfig) -> Result<(), String> {
 // 路径（与 Electron 版 app.getPath('userData') 等价，保证迁移不断档）
 // ---------------------------------------------------------------------------
 
-fn user_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn user_data_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
         env::var("APPDATA")

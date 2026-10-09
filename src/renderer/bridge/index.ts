@@ -1,24 +1,9 @@
 /**
  * Bridge module exports
  *
- * The `api` namespace is selected at runtime:
- * - Tauri webview (window.__TAURI__ present) -> ../tauri/bridge
- *   (phase-1 subset; unported calls throw honest "not ported yet" errors)
- * - otherwise -> ./api-wrapper (Electron path, unchanged default behavior)
+ * 运行时 api 选择已下沉到 `src/renderer/ipc/index.ts`（与 api-client 同形，
+ * Tauri/Electron 一套调用方代码）。这里只保留类型导出和兼容性转发。
  */
 
 export * from './types';
-
-import * as electronApi from './api-wrapper';
-import { api as tauriApi } from '../tauri/bridge';
-
-declare global {
-  interface Window {
-    __TAURI__?: unknown;
-  }
-}
-
-const isTauriRuntime =
-  typeof window !== 'undefined' && typeof window.__TAURI__ !== 'undefined';
-
-export const api: typeof electronApi = isTauriRuntime ? tauriApi : electronApi;
+export { api } from '../ipc';

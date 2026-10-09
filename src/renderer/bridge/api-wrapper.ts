@@ -3,7 +3,7 @@
  * 将 Electron IPC API 适配为原 WPF 项目的 API 接口
  */
 
-import { api } from '../ipc/api-client';
+import { api } from '../ipc';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 import type { ApiResponse, UserConfig, ServerConfig, DomainRule } from './types';
 
