@@ -425,6 +425,8 @@ export class AutoSelectService extends EventEmitter implements IAutoSelectServic
         if (!hotReloaded) {
           // 热更新失败，尝试重启
           this.logToManager('warn', '热更新失败，尝试重启代理');
+          // 通知渲染进程正在重启，保持与配置变更重启一致的按钮状态
+          this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_RESTARTING, {});
           await this.proxyManager.restart(newConfig);
         }
 
