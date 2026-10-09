@@ -77,7 +77,7 @@ pub struct SingBoxDnsConfig {
     pub final_: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SingBoxInbound {
     #[serde(rename = "type")]
     pub inbound_type: String,
@@ -212,6 +212,8 @@ pub struct SingBoxOutbound {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SingBoxRouteRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,6 +372,18 @@ pub fn get_system_dns_servers() -> Vec<String> {
 
 fn server_outbound_tag(server_id: &str) -> String {
     format!("proxy-{}", server_id)
+}
+
+/// 运行时 proxy selector 的目标 tag（对应 getProxyTargetTag）
+pub fn get_proxy_target_tag(config: &UserConfig) -> String {
+    let is_group = config.selected_group_id.is_some() && !get_active_servers(config).is_empty();
+    if is_group {
+        return format!("group-{}", config.selected_group_id.as_deref().unwrap_or(""));
+    }
+    match &config.selected_server_id {
+        Some(id) => server_outbound_tag(id),
+        None => "direct".to_string(),
+    }
 }
 
 fn get_active_servers<'a>(config: &'a UserConfig) -> Vec<&'a ServerConfig> {
@@ -705,7 +719,7 @@ fn generate_selector_outbound(tag: &str, selected: &str) -> SingBoxOutbound {
     }
 }
 
-fn generate_proxy_outbound(server: &ServerConfig, tag: &str) -> SingBoxOutbound {
+pub fn generate_proxy_outbound(server: &ServerConfig, tag: &str) -> SingBoxOutbound {
     let mut o = SingBoxOutbound {
         outbound_type: server.protocol.to_string(),
         tag: tag.to_string(),

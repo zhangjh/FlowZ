@@ -10,6 +10,8 @@
 //! Clash API  selector 热切换、日志流式解析。
 
 use crate::config::{self, UserConfig};
+use crate::clash;
+use crate::logs::{self, LogLevel, SharedLogManager};
 use crate::singbox::{self, GenContext};
 use crate::supervisor::{self, PrivilegedSupervisor};
 use chrono::Utc;
@@ -58,6 +60,7 @@ fn now_iso() -> String {
 pub struct ProxyManager {
     direct_child: Option<Child>,
     supervisor: Option<PrivilegedSupervisor>,
+    logs: SharedLogManager,
     pid: Option<u32>,
     start_instant: Option<Instant>,
     start_time_iso: Option<String>,
@@ -67,10 +70,11 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
-    pub fn new() -> Self {
+    pub fn new(logs: SharedLogManager) -> Self {
         ProxyManager {
             direct_child: None,
             supervisor: None,
+            logs,
             pid: None,
             start_instant: None,
             start_time_iso: None,
@@ -159,8 +163,8 @@ impl ProxyManager {
             self.start_tun(app, &ctx, &singbox).await?;
         } else {
             let mut child = spawn_with_retry(&singbox, &config_path).await?;
-            // 排空 stdout/stderr，避免管道写满阻塞子进程（日志流式解析是后续工作）
-            drain_pipes(&mut child);
+            // 转发 stdout/stderr：解析后写入日志管理器并推送前端
+            Self::forward_logs(&mut child, self.logs.clone(), app);
 
             self.pid = child.id();
             self.direct_child = Some(child);
@@ -177,6 +181,21 @@ impl ProxyManager {
                 timestamp: now_iso(),
             },
         );
+
+        // Clash API 就绪后设置初始模式 selector（异步，不阻塞启动返回）
+        let mode = cfg.proxy_mode.clone();
+        let logs = self.logs.clone();
+        tokio::spawn(async move {
+            if clash::wait_for_api(Duration::from_secs(10)).await {
+                if let Err(e) = clash::update_mode_selectors(&mode).await {
+                    if let Ok(mut m) = logs.lock() {
+                        m.add_log(LogLevel::Warn, &format!("初始化模式选择器失败: {}", e), "proxy");
+                    }
+                }
+            } else if let Ok(mut m) = logs.lock() {
+                m.add_log(LogLevel::Warn, "Clash API 在 10s 内未就绪", "proxy");
+            }
+        });
         Ok(())
     }
 
@@ -247,6 +266,132 @@ impl ProxyManager {
             let _ = sup.shutdown().await;
         }
         Ok(())
+    }
+
+    /// 运行时热切换（对应 hotReloadConfig）：只切换了服务器/代理模式时走
+    /// Clash API，成功则无需重启；失败返回 false 由调用方回退到重启。
+    pub async fn hot_reload_config(
+        &mut self,
+        app: &AppHandle,
+        new_config: &UserConfig,
+    ) -> bool {
+        let current = match &self.last_config {
+            Some(c) => c.clone(),
+            None => return false,
+        };
+        let mode_changed = current.proxy_mode != new_config.proxy_mode;
+        let current_target = singbox::get_proxy_target_tag(&current);
+        let new_target = singbox::get_proxy_target_tag(new_config);
+        let target_changed = current_target != new_target;
+
+        self.add_log(
+            LogLevel::Info,
+            &format!(
+                "热更新: modeChanged={} ({}→{}), proxyTarget={}→{}",
+                mode_changed, current.proxy_mode, new_config.proxy_mode, current_target, new_target
+            ),
+        );
+
+        let mut verify: Vec<(String, String)> = Vec::new();
+        let result: Result<(), String> = async {
+            if target_changed {
+                clash::set_selector("proxy", &new_target).await?;
+                verify.push(("proxy".to_string(), new_target.clone()));
+            }
+            if mode_changed {
+                clash::update_mode_selectors(&new_config.proxy_mode).await?;
+                let (cn, non_cn, fallback) = clash::mode_selections(&new_config.proxy_mode);
+                verify.push(("mode-cn".to_string(), cn.to_string()));
+                verify.push(("mode-non-cn".to_string(), non_cn.to_string()));
+                verify.push(("mode-fallback".to_string(), fallback.to_string()));
+            }
+            if !verify.is_empty() {
+                let refs: Vec<(&str, &str)> = verify
+                    .iter()
+                    .map(|(a, b)| (a.as_str(), b.as_str()))
+                    .collect();
+                clash::verify_selectors(&refs).await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            self.add_log(
+                LogLevel::Warn,
+                &format!("运行时代理配置切换失败: {}，将回退到重启", e),
+            );
+            return false;
+        }
+
+        // 目标切换成功后异步探测新节点可用性（不阻塞）
+        if target_changed {
+            let target = new_target.clone();
+            let logs = self.logs.clone();
+            tokio::spawn(async move {
+                match clash::probe_delay(&target, 5000).await {
+                    Some(ms) => {
+                        if let Ok(mut m) = logs.lock() {
+                            m.add_log(LogLevel::Info, &format!("节点 {} 探测成功，延迟 {}ms", target, ms), "proxy");
+                        }
+                    }
+                    None => {
+                        if let Ok(mut m) = logs.lock() {
+                            m.add_log(LogLevel::Warn, &format!("节点 {} 切换成功但探测不可达，请检查节点状态", target), "proxy");
+                        }
+                    }
+                }
+            });
+        }
+
+        // 写入磁盘（持久化，下次启动用）
+        let ctx = match gen_context(app) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        match singbox::generate_singbox_config(new_config, &ctx) {
+            Ok(sb) => {
+                let path = ctx.user_data_dir.join("singbox_config.json");
+                if serde_json::to_string_pretty(&sb)
+                    .ok()
+                    .map(|content| std::fs::write(&path, content).is_ok())
+                    != Some(true)
+                {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+
+        self.last_config = Some(new_config.clone());
+        self.add_log(LogLevel::Info, "运行时代理配置切换成功，无需重启代理");
+        true
+    }
+
+    /// 切换服务器：先热更新，失败回退到重启（对应 SERVER_SWITCH 的热更新路径）
+    pub async fn switch_server(
+        &mut self,
+        app: &AppHandle,
+        server_id: &str,
+    ) -> Result<(), String> {
+        let mut cfg = crate::config::load_config()?;
+        cfg.selected_server_id = Some(server_id.to_string());
+        cfg.selected_group_id = None;
+        crate::config::validate_config(&mut cfg)?;
+        crate::config::save_config(&cfg)?;
+
+        if self.is_running() && self.hot_reload_config(app, &cfg).await {
+            let _ = app.emit("event:proxyStarted", StartedPayload { pid: self.pid.unwrap_or(0), timestamp: now_iso() });
+            return Ok(());
+        }
+        // 热更新不可用或失败 → 重启
+        self.restart(app, &cfg).await
+    }
+
+    fn add_log(&self, level: LogLevel, message: &str) {
+        if let Ok(mut m) = self.logs.lock() {
+            m.add_log(level, message, "proxy");
+        }
     }
 
     pub async fn restart(&mut self, app: &AppHandle, cfg: &UserConfig) -> Result<(), String> {
@@ -455,18 +600,50 @@ async fn spawn_singbox(singbox: &PathBuf, config_path: &PathBuf) -> Result<Child
 }
 
 /// 排空子进程的 stdout/stderr，防止管道写满阻塞
-fn drain_pipes(child: &mut Child) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    if let Some(stdout) = child.stdout.take() {
+impl ProxyManager {
+    /// sing-box stdout/stderr 转发：解析 → 日志管理器 → 前端事件
+    /// （对应 ProxyManager.handleProcessOutput + parseAndLogLine 流水线）
+    fn forward_logs(child: &mut Child, logs: SharedLogManager, app: &AppHandle) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        if let Some(stdout) = child.stdout.take() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let app = app.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(_)) = lines.next_line().await {}
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(_)) = lines.next_line().await {}
+            let mut pipeline = logs::LogPipeline::new();
+            while let Some(line) = rx.recv().await {
+                if let Some((level, message)) = pipeline.process_line(&line) {
+                    let entry = logs
+                        .lock()
+                        .map(|mut m| m.add_log(level, &message, "sing-box"))
+                        .ok()
+                        .flatten();
+                    if let Some(entry) = entry {
+                        let _ = app.emit("event:logReceived", &entry);
+                    }
+                }
+            }
         });
     }
 }

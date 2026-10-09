@@ -166,6 +166,23 @@ const systemProxyApi = {
   getStatus: (): Promise<unknown> => invoke('system_proxy_get_status'),
 };
 
+const logsApi = {
+  get: (limit?: number): Promise<unknown[]> =>
+    invoke('logs_get', { limit }),
+  clear: (): Promise<void> => invoke('logs_clear'),
+  setLevel: (level: string): Promise<void> => invoke('logs_set_level', { level }),
+  openFolder: (): Promise<void> => invoke('logs_open_folder'),
+  onReceived: (listener: (log: unknown) => void): (() => void) => {
+    let unlisten: (() => void) | null = null;
+    listen<unknown>('event:logReceived', (e) => listener(e.payload)).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  },
+};
+
 const autoStartApi = {
   set: (enabled: boolean): Promise<boolean> =>
     invoke('autostart_set', { enabled }).then(() => true),
@@ -200,7 +217,7 @@ export const api = {
   server: serverApi,
   group: stubNamespace('group'),
   rules: stubNamespace('rules'),
-  logs: stubNamespace('logs'),
+  logs: logsApi,
   systemProxy: systemProxyApi,
   autoStart: autoStartApi,
   stats: stubNamespace('stats'),

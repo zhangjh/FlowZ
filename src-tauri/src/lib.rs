@@ -6,10 +6,13 @@
 //! TUN 特权守护进程）、sysproxy（SystemProxyManager）、托盘、开机自启。
 //! 待移植：macOS TUN DNS、Clash API 热切换、日志流、自动测速/故障转移。
 
+mod clash;
 mod config;
+mod logs;
 mod protocol;
 mod proxy;
 mod singbox;
+mod speedtest;
 mod subscription;
 mod supervisor;
 mod sysproxy;
@@ -99,6 +102,7 @@ async fn parse_subscription(payload: Value) -> Result<Value, String> {
 
 type ProxyState = Mutex<proxy::ProxyManager>;
 type SysProxyState = Mutex<sysproxy::SystemProxyManager>;
+type LogsState = logs::SharedLogManager;
 
 /// 生成 sing-box 配置（调试用；start 内部也会生成）。
 #[tauri::command]
@@ -229,6 +233,54 @@ async fn system_proxy_get_status(
 ) -> Result<Value, String> {
     let st = sysproxy.lock().await.get_proxy_status().await;
     serde_json::to_value(&st).map_err(|e| format!("序列化失败: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// 日志（对应 logsApi）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn logs_get(logs: tauri::State<'_, LogsState>, limit: Option<usize>) -> Result<Value, String> {
+    let entries = logs.lock().map(|m| m.get_logs(limit)).map_err(|e| e.to_string())?;
+    serde_json::to_value(&entries).map_err(|e| format!("序列化失败: {}", e))
+}
+
+#[tauri::command]
+async fn logs_clear(logs: tauri::State<'_, LogsState>) -> Result<(), String> {
+    logs.lock().map(|mut m| m.clear()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn logs_set_level(logs: tauri::State<'_, LogsState>, level: String) -> Result<(), String> {
+    let lv = logs::LogLevel::parse(&level).ok_or_else(|| format!("未知日志级别: {}", level))?;
+    logs.lock().map(|mut m| m.set_level(lv)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn logs_open_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = config::user_data_dir()?;
+    #[cfg(target_os = "linux")]
+    let mut cmd = { let mut c = std::process::Command::new("xdg-open"); c.arg(&dir); c };
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = std::process::Command::new("open"); c.arg(&dir); c };
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = std::process::Command::new("explorer"); c.arg(&dir); c };
+    cmd.spawn().map_err(|e| format!("打开日志目录失败: {}", e))?;
+    let _ = app;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 服务器切换（热更新优先，失败回退重启）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn proxy_switch_server(
+    app: tauri::AppHandle,
+    proxy: tauri::State<'_, ProxyState>,
+    server_id: String,
+) -> Result<(), String> {
+    proxy.lock().await.switch_server(&app, &server_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -373,9 +425,12 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let shared_logs = logs::new_shared();
+    let proxy_manager = proxy::ProxyManager::new(shared_logs.clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
-        .manage(Mutex::new(proxy::ProxyManager::new()))
+        .manage(shared_logs)
+        .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))
         .setup(|app| {
             // 托盘
@@ -408,6 +463,11 @@ pub fn run() {
             proxy_stop,
             proxy_restart,
             proxy_get_status,
+            proxy_switch_server,
+            logs_get,
+            logs_clear,
+            logs_set_level,
+            logs_open_folder,
             system_proxy_enable,
             system_proxy_disable,
             system_proxy_get_status,
