@@ -157,6 +157,27 @@ const versionApi = {
 };
 
 // ---------------------------------------------------------------------------
+// systemProxy / autoStart / admin
+// ---------------------------------------------------------------------------
+const systemProxyApi = {
+  enable: (address: string, port: number): Promise<void> =>
+    invoke('system_proxy_enable', { address, httpPort: port, socksPort: port }),
+  disable: (): Promise<void> => invoke('system_proxy_disable'),
+  getStatus: (): Promise<unknown> => invoke('system_proxy_get_status'),
+};
+
+const autoStartApi = {
+  set: (enabled: boolean): Promise<boolean> =>
+    invoke('autostart_set', { enabled }).then(() => true),
+  getStatus: async (): Promise<{ enabled: boolean }> => ({
+    enabled: await invoke<boolean>('autostart_is_enabled'),
+  }),
+};
+
+const adminApi = {
+  check: (): Promise<unknown> => invoke('admin_check'),
+};
+// ---------------------------------------------------------------------------
 // 未移植的 namespace：invoke 抛错，订阅 warn+空卸载
 // ---------------------------------------------------------------------------
 function stubNamespace(ns: string): any {
@@ -180,12 +201,12 @@ export const api = {
   group: stubNamespace('group'),
   rules: stubNamespace('rules'),
   logs: stubNamespace('logs'),
-  systemProxy: stubNamespace('systemProxy'),
-  autoStart: stubNamespace('autoStart'),
+  systemProxy: systemProxyApi,
+  autoStart: autoStartApi,
   stats: stubNamespace('stats'),
   connection: stubNamespace('connection'),
   version: versionApi,
-  admin: stubNamespace('admin'),
+  admin: adminApi,
   update: stubNamespace('update'),
   autoSelect: stubNamespace('autoSelect'),
 };

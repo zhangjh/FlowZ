@@ -11,6 +11,7 @@
 
 use crate::config::{self, UserConfig};
 use crate::singbox::{self, GenContext};
+use crate::supervisor::{self, PrivilegedSupervisor};
 use chrono::Utc;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -55,7 +56,8 @@ fn now_iso() -> String {
 }
 
 pub struct ProxyManager {
-    child: Option<Child>,
+    direct_child: Option<Child>,
+    supervisor: Option<PrivilegedSupervisor>,
     pid: Option<u32>,
     start_instant: Option<Instant>,
     start_time_iso: Option<String>,
@@ -67,7 +69,8 @@ pub struct ProxyManager {
 impl ProxyManager {
     pub fn new() -> Self {
         ProxyManager {
-            child: None,
+            direct_child: None,
+            supervisor: None,
             pid: None,
             start_instant: None,
             start_time_iso: None,
@@ -78,13 +81,21 @@ impl ProxyManager {
     }
 
     pub fn is_running(&mut self) -> bool {
-        match &mut self.child {
+        if let Some(sup) = &self.supervisor {
+            return sup.singbox_pid().is_some();
+        }
+        match &mut self.direct_child {
             Some(child) => match child.try_wait() {
                 Ok(None) => true,
                 _ => false,
             },
             None => false,
         }
+    }
+
+    /// 当前是否为 TUN 模式（supervisor 接管）
+    pub fn is_tun(&self) -> bool {
+        self.supervisor.is_some()
     }
 
     pub fn status(&mut self) -> ProxyStatusPayload {
@@ -107,21 +118,28 @@ impl ProxyManager {
 
     /// 启动代理（systemProxy 模式）
     pub async fn start(&mut self, app: &AppHandle, cfg: &UserConfig) -> Result<(), String> {
+        self.start_with_reset(app, cfg, true).await
+    }
+
+    /// start 的内部实现；reset_count=false 时供自动重启使用（不重置计数）
+    async fn start_with_reset(
+        &mut self,
+        app: &AppHandle,
+        cfg: &UserConfig,
+        reset_count: bool,
+    ) -> Result<(), String> {
         if self.is_running() {
             self.stop(app).await?;
         }
-        // 手动启动重置重启计数（与 TS 一致）
-        self.reset_restart_count();
+        if reset_count {
+            // 手动启动重置重启计数（与 TS 一致）
+            self.reset_restart_count();
+        }
 
         // 选中校验
         validate_selection(cfg)?;
-        // TUN 模式暂不支持（phase-4）
-        if cfg.proxy_mode_type.to_string().to_lowercase() != "systemproxy" {
-            return Err(
-                "TUN 模式需要提权守护进程（phase-4 未移植），请先使用系统代理模式".to_string(),
-            );
-        }
 
+        let tun = cfg.proxy_mode_type.to_string().to_lowercase() != "systemproxy";
         let ctx = gen_context(app)?;
         let sb_config = singbox::generate_singbox_config(cfg, &ctx)?;
         let config_path = ctx.user_data_dir.join("singbox_config.json");
@@ -137,14 +155,19 @@ impl ProxyManager {
             return Err(format!("找不到 sing-box 可执行文件: {}", singbox.display()));
         }
 
-        let mut child = spawn_with_retry(&singbox, &config_path).await?;
-        // 排空 stdout/stderr，避免管道写满阻塞子进程（日志流式解析是后续工作）
-        drain_pipes(&mut child);
+        if tun {
+            self.start_tun(app, &ctx, &singbox).await?;
+        } else {
+            let mut child = spawn_with_retry(&singbox, &config_path).await?;
+            // 排空 stdout/stderr，避免管道写满阻塞子进程（日志流式解析是后续工作）
+            drain_pipes(&mut child);
 
-        self.pid = child.id();
+            self.pid = child.id();
+            self.direct_child = Some(child);
+            self.supervisor = None;
+        }
         self.start_instant = Some(Instant::now());
         self.start_time_iso = Some(now_iso());
-        self.child = Some(child);
         self.last_config = Some(cfg.clone());
 
         let _ = app.emit(
@@ -157,8 +180,42 @@ impl ProxyManager {
         Ok(())
     }
 
+    /// TUN 模式：通过特权守护进程启动（单次授权复用）
+    async fn start_tun(
+        &mut self,
+        app: &AppHandle,
+        ctx: &GenContext,
+        singbox: &std::path::Path,
+    ) -> Result<(), String> {
+        let _ = app;
+        let pid_file = ctx.user_data_dir.join("singbox.pid");
+        let mut sup = PrivilegedSupervisor::new(
+            singbox.to_path_buf(),
+            ctx.user_data_dir.join("singbox_config.json"),
+            ctx.user_data_dir.clone(),
+            pid_file,
+        );
+        if !sup.ensure_started().await? {
+            return Err("特权守护进程未能启动（用户可能取消了授权）".to_string());
+        }
+        sup.send_command(supervisor::CMD_START)?;
+        let pid = sup
+            .wait_for_singbox_pid(Duration::from_secs(10))
+            .await
+            .ok_or_else(|| "sing-box 未能启动（PID 文件未出现）".to_string())?;
+        self.pid = Some(pid);
+        self.direct_child = None;
+        self.supervisor = Some(sup);
+        Ok(())
+    }
+
     pub async fn stop(&mut self, app: &AppHandle) -> Result<(), String> {
-        if let Some(mut child) = self.child.take() {
+        if let Some(sup) = &mut self.supervisor {
+            // TUN 模式：守护进程负责停止（supervisor 脚本内 SIGTERM→SIGKILL）
+            let _ = sup.send_command(supervisor::CMD_STOP);
+            self.supervisor = None;
+        }
+        if let Some(mut child) = self.direct_child.take() {
             // 先 SIGTERM，5 秒后仍未退出则 SIGKILL（与 TS 的 stopSingBoxProcess 一致）
             if let Some(pid) = self.pid {
                 unsafe {
@@ -180,6 +237,15 @@ impl ProxyManager {
                 timestamp: now_iso(),
             },
         );
+        Ok(())
+    }
+
+    /// App 退出前调用：停止代理并退出特权守护进程
+    pub async fn shutdown(&mut self, app: &AppHandle) -> Result<(), String> {
+        self.stop(app).await?;
+        if let Some(mut sup) = self.supervisor.take() {
+            let _ = sup.shutdown().await;
+        }
         Ok(())
     }
 
@@ -221,7 +287,7 @@ impl ProxyManager {
             let _ = app.emit("event:proxyRestarting", serde_json::json!({}));
             if let Some(cfg) = self.last_config.clone() {
                 // 重启时不重置计数（与 TS 的 isRestarting 语义一致）
-                match self.start_inner(app, &cfg).await {
+                match self.start_with_reset(app, &cfg, false).await {
                     Ok(_) => return true,
                     Err(e) => {
                         let _ = app.emit(
@@ -246,45 +312,6 @@ impl ProxyManager {
             self.start_time_iso = None;
         }
         false
-    }
-
-    /// start 的内部实现（不重置重启计数，供自动重启使用）
-    async fn start_inner(&mut self, app: &AppHandle, cfg: &UserConfig) -> Result<(), String> {
-        if self.is_running() {
-            self.stop(app).await?;
-        }
-        validate_selection(cfg)?;
-        if cfg.proxy_mode_type.to_string().to_lowercase() != "systemproxy" {
-            return Err("TUN 模式需要提权守护进程（phase-4 未移植）".to_string());
-        }
-        let ctx = gen_context(app)?;
-        let sb_config = singbox::generate_singbox_config(cfg, &ctx)?;
-        let config_path = ctx.user_data_dir.join("singbox_config.json");
-        if let Some(dir) = config_path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
-        }
-        let content = serde_json::to_string_pretty(&sb_config)
-            .map_err(|e| format!("序列化 sing-box 配置失败: {}", e))?;
-        std::fs::write(&config_path, content).map_err(|e| format!("写入 sing-box 配置失败: {}", e))?;
-        let singbox = resolve_singbox_path(app)?;
-        if !singbox.exists() {
-            return Err(format!("找不到 sing-box 可执行文件: {}", singbox.display()));
-        }
-        let mut child = spawn_with_retry(&singbox, &config_path).await?;
-        drain_pipes(&mut child);
-        self.pid = child.id();
-        self.start_instant = Some(Instant::now());
-        self.start_time_iso = Some(now_iso());
-        self.child = Some(child);
-        self.last_config = Some(cfg.clone());
-        let _ = app.emit(
-            "event:proxyStarted",
-            StartedPayload {
-                pid: self.pid.unwrap_or(0),
-                timestamp: now_iso(),
-            },
-        );
-        Ok(())
     }
 }
 

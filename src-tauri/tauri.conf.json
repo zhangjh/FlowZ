@@ -27,5 +27,10 @@
   },
   "identifier": "com.flowz.app",
   "productName": "FlowZ",
-  "version": "3.7.5"
+  "version": "3.7.5",
+  "plugins": {
+    "autostart": {
+      "active": true
+    }
+  }
 }
