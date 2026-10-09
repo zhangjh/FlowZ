@@ -51,3 +51,5 @@ Desktop.ini
 
 # Tauri
 src-tauri/target/
+src-tauri/bundle-resources/
+src-tauri/WixTools/

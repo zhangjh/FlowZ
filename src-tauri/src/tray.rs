@@ -222,8 +222,15 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
         .path()
         .resource_dir()
         .ok()
-        .map(|r| r.join("app.png"))
+        .map(|r| r.join("bundle-resources").join("app.png"))
         .filter(|p| p.exists())
+        .or_else(|| {
+            app.path()
+                .resource_dir()
+                .ok()
+                .map(|r| r.join("app.png"))
+                .filter(|p| p.exists())
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("resources/app.png"));
     let rgba = image::open(&icon_path)
         .map_err(|e| format!("加载托盘图标失败: {}", e))?

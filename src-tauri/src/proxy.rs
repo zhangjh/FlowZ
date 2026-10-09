@@ -618,8 +618,13 @@ pub(crate) fn resolve_singbox_path(app: &AppHandle) -> Result<PathBuf, String> {
     } else {
         "sing-box"
     };
-    // Tauri 打包后的 resource 目录（保持与 Electron 一致的 resources/<platform>/ 布局）
+    // Tauri 打包后的 resource 目录：优先 staging 布局（bundle-resources/），
+    // 兼容 Electron 式 resources/<platform>/ 布局
     if let Ok(res) = app.path().resource_dir() {
+        let staged = res.join("bundle-resources").join(filename);
+        if staged.exists() {
+            return Ok(staged);
+        }
         #[cfg(target_os = "windows")]
         let cand = res.join("win").join(filename);
         #[cfg(target_os = "macos")]

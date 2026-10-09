@@ -16,14 +16,21 @@
     "beforeBuildCommand": "npm run build:renderer",
     "beforeDevCommand": "npm run dev:renderer",
     "devUrl": "http://localhost:5173",
-    "frontendDist": "../dist/renderer"
+    "frontendDist": "../dist/renderer",
+    "beforeBundleCommand": "node ../scripts/tauri-stage-resources.mjs"
   },
   "bundle": {
     "active": true,
     "icon": [
+      "../build/icon.ico",
+      "../build/icon.icns",
       "../build/icon.png"
     ],
-    "targets": "all"
+    "targets": "all",
+    "resources": [
+      "bundle-resources/*"
+    ],
+    "createUpdaterArtifacts": true
   },
   "identifier": "com.flowz.app",
   "productName": "FlowZ",

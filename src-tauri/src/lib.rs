@@ -118,16 +118,21 @@ async fn generate_singbox_config(
     let cfg: config::UserConfig =
         serde_json::from_value(config).map_err(|e| format!("配置格式错误: {}", e))?;
     let user_data_dir = config::user_data_dir()?;
-    let data_dir = std::env::var("FLOWZ_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            app.path()
-                .resource_dir()
-                .ok()
-                .map(|r| r.join("data"))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| std::path::PathBuf::from("resources/data"))
-        });
+    let data_dir = std::env::var("FLOWZ_DATA_DIR").map(std::path::PathBuf::from).ok().filter(|p| p.exists()).unwrap_or_else(|| {
+        let candidates = [
+            // staging 布局
+            app.path().resource_dir().ok().map(|r| r.join("bundle-resources").join("data")),
+            // Electron 式布局
+            app.path().resource_dir().ok().map(|r| r.join("data")),
+            // 开发期
+            Some(std::path::PathBuf::from("resources/data")),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("resources/data"))
+    });
     let sb = singbox::generate_singbox_config(
         &cfg,
         &singbox::GenContext {
