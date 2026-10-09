@@ -201,6 +201,8 @@ interface SingBoxRouteRule {
   ip_cidr?: string[];
   action: string;
   outbound?: string;
+  /** sniff 动作专用：嗅探后是否用嗅探出的域名覆盖目标地址 */
+  sniff_override_destination?: boolean;
 }
 
 interface SingBoxRuleSet {
@@ -1347,6 +1349,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       //   多网卡 DNS 路由等复杂场景，与浏览器等应用使用完全相同的 DNS 解析路径
       // - macOS/Linux: 使用系统解析器（/etc/resolv.conf 等）
       // 系统代理模式下不存在 TUN DNS 死循环问题，可以安全使用 type:'local'
+      //
+      // ⚠️ 注意：系统代理只接管 HTTP/HTTPS，不接管 DNS。应用（浏览器）仍直接向系统
+      // 解析器查 A/AAAA 拿到【真实 IP】，下面配置的 fakeip 规则在此模式下不会被命中。
+      // 因此 systemProxy 下的域名分流完全依赖路由规则里的 sniff（见 generateRouteConfig），
+      // 这也是自定义规则额外生成 domain_keyword 兜底的原因。
       dnsServers.push({
         tag: 'dns-local',
         type: 'local',
@@ -1787,8 +1794,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 协议嗅探（必须放在最前）：嗅探出的域名用于后续规则的域名匹配
     // sing-box 1.13.0 起移除 inbound 上的 sniff 字段，改用路由规则 action:'sniff'
+    //
+    // systemProxy 模式的关键差异：
+    // 系统代理不接管 DNS，浏览器/应用通过系统解析器拿到的是真实 IP（如 muse.ai → Meta 的
+    // 157.240.11.17），FakeIP 映射表对真实 IP 无效。此时 sing-box 只能靠 sniff 嗅探真实域名
+    // 才能命中 domain_suffix 自定义规则；若不显式 override，嗅探出的域名不会覆盖目标地址，
+    // 后续按 IP 的 geoip/fallback 判断就会误判（表现为部分站点被判定直连而无法访问）。
+    // TUN 模式由 FakeIP 反查域名，无需 override（且 SSH/QUIC 等嗅探不可靠的协议依赖此项保持关闭）。
+    const isSystemProxyMode = (config.proxyModeType || 'systemProxy').toLowerCase() === 'systemproxy';
     rules.push({
       action: 'sniff',
+      ...(isSystemProxyMode ? { sniff_override_destination: true } : {}),
     } as SingBoxRouteRule);
 
     // DNS 劫持规则（必须）
@@ -1910,6 +1926,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成自定义路由规则
    * 所有域名统一使用 domain_suffix 匹配，即匹配该域名及其所有子域名
+   *
+   * 额外生成 domain_keyword 兜底：
+   * SNI/HTTP Host 嗅探在部分协议（QUIC、非标准 TLS ClientHello）下可能失败，
+   * 仅靠 domain_suffix 匹配不到时，规则会被跳过而落到按 IP 的 geoip/fallback 判断，
+   * 导致被墙站点（如 Meta 系域名解析到境外 IP）被误判。domain_keyword 对域名主体
+   * 做子串匹配，作为 domain_suffix 的补充，显著提升嗅探路径下的命中率。
    */
   private generateCustomRules(
     customRules: import('../../shared/types').DomainRule[]
@@ -1929,6 +1951,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         action: 'route',
         domain_suffix: domains,
       };
+
+      // 嗅探兜底：用域名主体（去掉首段公共后缀）做 keyword 子串匹配。
+      // 仅在域名形如 a.b.c（至少两段）时生成，避免 "ai"、"dev" 这类过于宽泛的词
+      // 造成误伤；keyword 匹配是子串匹配，取完整注册域更安全。
+      const keywords = [
+        ...new Set(
+          domains
+            .map((d) => d.toLowerCase())
+            .filter((d) => d.includes('.') && d.split('.').length >= 2)
+        ),
+      ];
+      if (keywords.length > 0) {
+        singboxRule.domain_keyword = keywords;
+      }
 
       // 设置出站
       if (rule.action === 'proxy') {
