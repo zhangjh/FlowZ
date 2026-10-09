@@ -48,3 +48,6 @@ Desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Tauri
+src-tauri/target/

@@ -84,6 +84,7 @@
     "@radix-ui/react-slot": "^1.2.3",
     "@radix-ui/react-switch": "^1.2.6",
     "@tanstack/react-virtual": "^3.14.5",
+    "@tauri-apps/api": "^2.12.2",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.454.0",

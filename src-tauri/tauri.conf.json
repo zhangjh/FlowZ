@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "height": 800,
+        "title": "FlowZ",
+        "width": 1200
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "npm run build:renderer",
+    "beforeDevCommand": "npm run dev:renderer",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist/renderer"
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "../build/icon.png"
+    ],
+    "targets": "all"
+  },
+  "identifier": "com.flowz.app",
+  "productName": "FlowZ",
+  "version": "3.7.5"
+}
