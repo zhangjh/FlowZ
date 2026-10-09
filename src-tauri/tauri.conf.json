@@ -31,6 +31,16 @@
   "plugins": {
     "autostart": {
       "active": true
+    },
+    "updater": {
+      "active": false,
+      "endpoints": [
+        "https://github.com/zhangjh/FlowZ/releases/latest/download/latest.json"
+      ],
+      "pubkey": "TODO: 运行 `tauri signer generate` 后填入公钥",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

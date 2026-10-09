@@ -183,6 +183,33 @@ const logsApi = {
   },
 };
 
+const autoSelectApi = {
+  testAll: (): Promise<unknown[]> => invoke('autoselect_test_all'),
+  getStatus: (): Promise<unknown> => invoke('autoselect_get_status'),
+  triggerFailover: (): Promise<void> => invoke('autoselect_trigger_failover'),
+};
+
+const updateApi = {
+  check: (includePrerelease = false): Promise<unknown> =>
+    invoke('update_check', { includePrerelease }),
+  download: (): Promise<{ success: boolean }> =>
+    invoke('update_download_install'),
+  install: (): Promise<{ success: boolean }> =>
+    Promise.resolve({ success: true }),
+  skip: (): Promise<{ success: boolean }> =>
+    Promise.resolve({ success: true }),
+  openReleases: (): Promise<{ success: boolean }> => invoke('update_open_releases'),
+  onProgress: (listener: (progress: unknown) => void): (() => void) => {
+    let unlisten: (() => void) | null = null;
+    listen<unknown>('event:updateProgress', (e) => listener(e.payload)).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  },
+};
+
 const autoStartApi = {
   set: (enabled: boolean): Promise<boolean> =>
     invoke('autostart_set', { enabled }).then(() => true),
@@ -224,8 +251,8 @@ export const api = {
   connection: stubNamespace('connection'),
   version: versionApi,
   admin: adminApi,
-  update: stubNamespace('update'),
-  autoSelect: stubNamespace('autoSelect'),
+  update: updateApi,
+  autoSelect: autoSelectApi,
 };
 
 export default api;

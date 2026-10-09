@@ -6,8 +6,10 @@
 //! TUN 特权守护进程）、sysproxy（SystemProxyManager）、托盘、开机自启。
 //! 待移植：macOS TUN DNS、Clash API 热切换、日志流、自动测速/故障转移。
 
+mod autoselect;
 mod clash;
 mod config;
+mod dns;
 mod logs;
 mod protocol;
 mod proxy;
@@ -16,10 +18,12 @@ mod speedtest;
 mod subscription;
 mod supervisor;
 mod sysproxy;
+mod tray;
 
 use chrono::Utc;
 use serde_json::Value;
-use tauri::Manager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
 
@@ -100,9 +104,10 @@ async fn parse_subscription(payload: Value) -> Result<Value, String> {
 // 代理控制（对应 ProxyManager + proxy-handlers 的编排）
 // ---------------------------------------------------------------------------
 
-type ProxyState = Mutex<proxy::ProxyManager>;
-type SysProxyState = Mutex<sysproxy::SystemProxyManager>;
-type LogsState = logs::SharedLogManager;
+pub(crate) type ProxyState = Mutex<proxy::ProxyManager>;
+pub(crate) type SysProxyState = Mutex<sysproxy::SystemProxyManager>;
+pub(crate) type LogsState = logs::SharedLogManager;
+pub(crate) type AutoSelectState = Arc<autoselect::AutoSelectService>;
 
 /// 生成 sing-box 配置（调试用；start 内部也会生成）。
 #[tauri::command]
@@ -163,7 +168,17 @@ async fn proxy_start(
             return Err(e);
         }
     }
+    // 自动选择服务：配置 + 代理启动后开始健康检查
+    {
+        let svc: Arc<autoselect::AutoSelectService> = app.state::<AutoSelectState>().inner().clone();
+        svc.configure(cfg.clone());
+        svc.notify_proxy_started(
+            Arc::new(TauriProxyControl { app: app.clone() }),
+            Arc::new(TauriEventEmitter { app: app.clone() }),
+        );
+    }
     update_tray_tooltip(&app, true).await;
+    tray::refresh_tray_menu(&app);
     Ok(())
 }
 
@@ -178,7 +193,13 @@ async fn proxy_stop(
         eprintln!("[proxy] 禁用系统代理失败: {}", e);
     }
     proxy.lock().await.stop(&app).await?;
+    // 停止自动选择健康检查
+    {
+        let svc: Arc<autoselect::AutoSelectService> = app.state::<AutoSelectState>().inner().clone();
+        svc.stop();
+    }
     update_tray_tooltip(&app, false).await;
+    tray::refresh_tray_menu(&app);
     Ok(())
 }
 
@@ -316,7 +337,7 @@ fn admin_check() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// 托盘
+// 托盘 / 内部复用入口
 // ---------------------------------------------------------------------------
 
 async fn update_tray_tooltip(app: &tauri::AppHandle, connected: bool) {
@@ -329,112 +350,331 @@ async fn update_tray_tooltip(app: &tauri::AppHandle, connected: bool) {
     }
 }
 
-fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
-    use tauri::tray::{MouseButton, TrayIconBuilder};
-    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+/// 供托盘事件复用的启动入口
+pub(crate) async fn proxy_start_inner(
+    app: &tauri::AppHandle,
+    config: Option<Value>,
+) -> Result<(), String> {
+    let proxy = app.state::<ProxyState>();
+    let sysproxy = app.state::<SysProxyState>();
+    proxy_start(app.clone(), proxy, sysproxy, config).await
+}
 
-    // 图标：打包后走 resource dir，开发期走仓库 resources/
-    let icon_path = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|r| r.join("app.png"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("resources/app.png"));
-    let rgba = image::open(&icon_path)
-        .map_err(|e| format!("加载托盘图标失败: {}", e))?
-        .to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+/// 供托盘事件复用的停止入口
+pub(crate) async fn proxy_stop_inner(app: &tauri::AppHandle) -> Result<(), String> {
+    let proxy = app.state::<ProxyState>();
+    let sysproxy = app.state::<SysProxyState>();
+    proxy_stop(app.clone(), proxy, sysproxy).await
+}
 
-    let show = MenuItemBuilder::with_id("show", "显示主窗口").build(app)
-        .map_err(|e| e.to_string())?;
-    let start = MenuItemBuilder::with_id("start", "启动代理").build(app)
-        .map_err(|e| e.to_string())?;
-    let stop = MenuItemBuilder::with_id("stop", "停止代理").build(app)
-        .map_err(|e| e.to_string())?;
-    let quit = MenuItemBuilder::with_id("quit", "退出").build(app)
-        .map_err(|e| e.to_string())?;
-    let menu = MenuBuilder::new(app)
-        .items(&[&show, &start, &stop, &quit])
-        .build()
-        .map_err(|e| e.to_string())?;
+/// 切换分组（托盘菜单）
+pub(crate) async fn switch_group(app: &tauri::AppHandle, group_id: &str) -> Result<(), String> {
+    let mut cfg = config::load_config()?;
+    cfg.selected_group_id = Some(group_id.to_string());
+    cfg.selected_server_id = None;
+    config::validate_config(&mut cfg)?;
+    config::save_config(&cfg)?;
+    let proxy = app.state::<ProxyState>();
+    let mut mgr = proxy.lock().await;
+    if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
+        return Ok(());
+    }
+    mgr.restart(app, &cfg).await
+}
 
-    let _tray = TrayIconBuilder::with_id("main")
-        .icon(icon)
-        .tooltip("FlowZ")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| {
-            let app = app.clone();
-            let id = event.id().as_ref().to_string();
-            tauri::async_runtime::spawn(async move {
-                match id.as_str() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "start" => {
-                        let proxy = app.state::<ProxyState>();
-                        let sysproxy = app.state::<SysProxyState>();
-                        if let Err(e) =
-                            proxy_start(app.clone(), proxy, sysproxy, None).await
-                        {
-                            eprintln!("[tray] 启动代理失败: {}", e);
-                        }
-                    }
-                    "stop" => {
-                        let proxy = app.state::<ProxyState>();
-                        let sysproxy = app.state::<SysProxyState>();
-                        if let Err(e) = proxy_stop(app.clone(), proxy, sysproxy).await {
-                            eprintln!("[tray] 停止代理失败: {}", e);
-                        }
-                    }
-                    "quit" => {
-                        // 退出前停代理 + 退守护进程
-                        let proxy = app.state::<ProxyState>();
-                        {
-                            let mut mgr = proxy.lock().await;
-                            let _ = mgr.shutdown(&app).await;
-                        }
-                        app.exit(0);
-                    }
-                    _ => {}
-                }
-            });
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click {
-                button: MouseButton::Left,
-                ..
-            } = event
-            {
-                let app = tray.app_handle().clone();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
+/// 切换代理模式（托盘菜单）
+pub(crate) async fn switch_proxy_mode(app: &tauri::AppHandle, mode: &str) -> Result<(), String> {
+    let mut cfg = config::load_config()?;
+    cfg.proxy_mode = mode.parse().map_err(|e: String| e)?;
+    config::validate_config(&mut cfg)?;
+    config::save_config(&cfg)?;
+    let proxy = app.state::<ProxyState>();
+    let mut mgr = proxy.lock().await;
+    if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
+        return Ok(());
+    }
+    mgr.restart(app, &cfg).await
+}
+
+/// 托盘触发的全部服务器测速（后台执行，结果写入 SpeedResultMap 并推送事件）
+pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let cfg = match config::load_config() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[tray] 测速失败: {}", e);
+                return;
+            }
+        };
+        if cfg.servers.is_empty() {
+            return;
+        }
+        let singbox = match proxy::resolve_singbox_path(&app) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[tray] 测速失败: {}", e);
+                return;
+            }
+        };
+        let work_dir = match config::user_data_dir() {
+            Ok(d) => d,
+            Err(_) => std::env::temp_dir(),
+        };
+        let results = speedtest::test_multiple_servers(&cfg.servers, &singbox, &work_dir).await;
+        // 写入托盘延迟缓存
+        if let Some(map) = app.try_state::<tray::SpeedResultMap>() {
+            if let Ok(mut m) = map.lock() {
+                for r in &results {
+                    m.insert(r.server_id.clone(), r.latency);
                 }
             }
-        })
-        .build(app)
+        }
+        let _ = app.emit(
+            "event:speedTestCompleted",
+            serde_json::to_value(&results).unwrap_or_default(),
+        );
+        tray::refresh_tray_menu(&app);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 自动更新（tauri-plugin-updater）
+// ---------------------------------------------------------------------------
+
+/// 是否配置了更新签名公钥。用户需运行 `tauri signer generate` 生成密钥对，
+/// 把公钥填入 tauri.conf.json 的 plugins.updater.pubkey，并把私钥配到 CI。
+/// 未配置时更新检查返回明确错误，不崩溃。
+const UPDATER_CONFIGURED: bool = false;
+
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle, include_prerelease: bool) -> Result<Value, String> {
+    let result = update_check_inner(&app, include_prerelease).await?;
+    serde_json::to_value(&result).map_err(|e| format!("序列化失败: {}", e))
+}
+
+pub(crate) async fn update_check_inner(
+    app: &tauri::AppHandle,
+    _include_prerelease: bool,
+) -> Result<serde_json::Value, String> {
+    if !UPDATER_CONFIGURED {
+        return Err("自动更新未配置：需要先运行 `tauri signer generate` 生成签名密钥并填入 tauri.conf.json".to_string());
+    }
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => Ok(serde_json::json!({
+            "hasUpdate": true,
+            "updateInfo": {
+                "version": update.version,
+                "title": format!("FlowZ {}", update.version),
+                "releaseNotes": update.body.unwrap_or_default(),
+                "downloadUrl": "",
+                "fileSize": 0,
+                "publishedAt": update.date.map(|d| d.to_string()).unwrap_or_default(),
+                "isPrerelease": false,
+                "fileName": "",
+            },
+        })),
+        None => Ok(serde_json::json!({ "hasUpdate": false })),
+    }
+}
+
+#[tauri::command]
+async fn update_download_install(app: tauri::AppHandle) -> Result<Value, String> {
+    if !UPDATER_CONFIGURED {
+        return Err("自动更新未配置：需要先运行 `tauri signer generate` 生成签名密钥并填入 tauri.conf.json".to_string());
+    }
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("没有可用更新")?;
+    let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    update
+        .download_and_install(
+            {
+                let app = app.clone();
+                let total = total.clone();
+                let downloaded = downloaded.clone();
+                move |chunk_len, content_len| {
+                    if let Some(len) = content_len {
+                        total.store(len, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    downloaded.fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed);
+                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
+                    let d = downloaded.load(std::sync::atomic::Ordering::Relaxed);
+                    let pct = if t > 0 { (d as f64 / t as f64 * 100.0) as u32 } else { 0 };
+                    let _ = app.emit(
+                        "event:updateProgress",
+                        serde_json::json!({
+                            "status": "downloading",
+                            "percentage": pct,
+                            "message": format!("下载中 {}%", pct),
+                        }),
+                    );
+                }
+            },
+            || {},
+        )
+        .await
         .map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        "event:updateProgress",
+        serde_json::json!({ "status": "downloaded", "percentage": 100, "message": "下载完成，正在安装…" }),
+    );
+    Ok(serde_json::json!({ "success": true }))
+}
+
+#[tauri::command]
+async fn update_open_releases() -> Result<Value, String> {
+    // 用系统浏览器打开 Releases 页（对应 shell.openExternal）
+    #[cfg(target_os = "linux")]
+    let r = std::process::Command::new("xdg-open")
+        .arg("https://github.com/zhangjh/FlowZ/releases")
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open")
+        .arg("https://github.com/zhangjh/FlowZ/releases")
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("cmd")
+        .args(["/c", "start", "https://github.com/zhangjh/FlowZ/releases"])
+        .spawn();
+    r.map_err(|e| format!("打开浏览器失败: {}", e))?;
+    Ok(serde_json::json!({ "success": true }))
+}
+
+// ---------------------------------------------------------------------------
+// 自动选择（对应 autoSelectApi）
+// ---------------------------------------------------------------------------
+
+/// ProxyControl 的 Tauri 实现（供 AutoSelectService 回调）
+struct TauriProxyControl {
+    app: tauri::AppHandle,
+}
+
+impl autoselect::ProxyControl for TauriProxyControl {
+    fn hot_reload<'a>(
+        &'a self,
+        config: &'a config::UserConfig,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        let app = self.app.clone();
+        Box::pin(async move {
+            let proxy = app.state::<ProxyState>();
+            let mut guard = proxy.lock().await;
+            guard.hot_reload_config(&app, config).await
+        })
+    }
+
+    fn restart<'a>(
+        &'a self,
+        config: &'a config::UserConfig,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+    {
+        let app = self.app.clone();
+        Box::pin(async move {
+            let proxy = app.state::<ProxyState>();
+            let mut guard = proxy.lock().await;
+            guard.restart(&app, config).await
+        })
+    }
+
+    fn is_running(&self) -> bool {
+        self.app
+            .try_state::<ProxyState>()
+            .map(|s| s.blocking_lock().is_running())
+            .unwrap_or(false)
+    }
+}
+
+struct TauriEventEmitter {
+    app: tauri::AppHandle,
+}
+
+impl autoselect::EventEmitter for TauriEventEmitter {
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        let _ = self.app.emit(event, payload);
+    }
+}
+
+#[tauri::command]
+async fn autoselect_test_all(
+    app: tauri::AppHandle,
+    autoselect: tauri::State<'_, AutoSelectState>,
+) -> Result<Value, String> {
+    let cfg = config::load_config()?;
+    let svc: Arc<autoselect::AutoSelectService> = autoselect.inner().clone();
+    let results = svc.test_all_servers(cfg.servers.clone()).await;
+    // 测速结果同步到托盘延迟缓存
+    if let Some(map) = app.try_state::<tray::SpeedResultMap>() {
+        if let Ok(mut m) = map.lock() {
+            for r in &results {
+                m.insert(r.server_id.clone(), r.latency);
+            }
+        }
+    }
+    let _ = app.emit(
+        "event:autoSelectTestCompleted",
+        serde_json::to_value(&results).unwrap_or_default(),
+    );
+    serde_json::to_value(&results).map_err(|e| format!("序列化失败: {}", e))
+}
+
+#[tauri::command]
+async fn autoselect_get_status(
+    autoselect: tauri::State<'_, AutoSelectState>,
+) -> Result<Value, String> {
+    let st = autoselect.inner().get_status();
+    serde_json::to_value(&st).map_err(|e| format!("序列化失败: {}", e))
+}
+
+#[tauri::command]
+async fn autoselect_trigger_failover(
+    app: tauri::AppHandle,
+    autoselect: tauri::State<'_, AutoSelectState>,
+) -> Result<(), String> {
+    let svc: Arc<autoselect::AutoSelectService> = autoselect.inner().clone();
+    let proxy = Arc::new(TauriProxyControl { app: app.clone() });
+    let emitter = Arc::new(TauriEventEmitter { app: app.clone() });
+    svc.trigger_immediate_failover(proxy, emitter).await;
     Ok(())
 }
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared_logs = logs::new_shared();
     let proxy_manager = proxy::ProxyManager::new(shared_logs.clone());
-    tauri::Builder::default()
+    // 自动选择服务（后台健康检查 + 故障转移）
+    let singbox_path = proxy::resolve_singbox_path_early();
+    let work_dir = config::user_data_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let autoselect = Arc::new(autoselect::AutoSelectService::new(
+        shared_logs.clone(),
+        singbox_path,
+        work_dir,
+    ));
+
+    let builder = tauri::Builder::default();
+    // 自动更新插件：仅在配置了签名公钥时注册
+    let builder = if UPDATER_CONFIGURED {
+        builder.plugin(tauri_plugin_updater::Builder::new().build())
+    } else {
+        builder
+    };
+    builder
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .manage(shared_logs)
         .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))
+        .manage(autoselect)
+        .manage(tray::SpeedResultMap::default())
         .setup(|app| {
-            // 托盘
-            if let Err(e) = build_tray(app.handle()) {
+            // 托盘（动态菜单）
+            if let Err(e) = tray::setup_tray(app.handle()) {
                 eprintln!("[tray] {}", e);
             }
             // 健康检查后台任务：每 30s 探测 sing-box 存活，意外退出时自动重启
@@ -474,6 +714,12 @@ pub fn run() {
             autostart_set,
             autostart_is_enabled,
             admin_check,
+            autoselect_test_all,
+            autoselect_get_status,
+            autoselect_trigger_failover,
+            update_check,
+            update_download_install,
+            update_open_releases,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

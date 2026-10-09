@@ -11,6 +11,7 @@
 
 use crate::config::{self, UserConfig};
 use crate::clash;
+use crate::dns;
 use crate::logs::{self, LogLevel, SharedLogManager};
 use crate::singbox::{self, GenContext};
 use crate::supervisor::{self, PrivilegedSupervisor};
@@ -159,6 +160,16 @@ impl ProxyManager {
             return Err(format!("找不到 sing-box 可执行文件: {}", singbox.display()));
         }
 
+        #[cfg(target_os = "macos")]
+        if tun {
+            prepare_mac_tun_dns(&self.logs);
+        }
+
+        #[cfg(target_os = "macos")]
+        if tun {
+            setup_mac_tun_dns(&sb_config, &self.logs);
+        }
+
         if tun {
             self.start_tun(app, &ctx, &singbox).await?;
         } else {
@@ -229,6 +240,15 @@ impl ProxyManager {
     }
 
     pub async fn stop(&mut self, app: &AppHandle) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            dns::reset_mac_dns_cache();
+            if let Err(e) = dns::set_system_dns_servers(&[]) {
+                self.add_log(LogLevel::Warn, &format!("恢复 macOS 系统 DNS 失败: {}", e));
+            } else {
+                self.add_log(LogLevel::Info, "macOS 系统 DNS 已恢复 DHCP");
+            }
+        }
         if let Some(sup) = &mut self.supervisor {
             // TUN 模式：守护进程负责停止（supervisor 脚本内 SIGTERM→SIGKILL）
             let _ = sup.send_command(supervisor::CMD_STOP);
@@ -393,7 +413,62 @@ impl ProxyManager {
             m.add_log(level, message, "proxy");
         }
     }
+}
 
+/// macOS TUN 启动前准备：清理残留的 TUN DNS，缓存原始 DNS（仅 macOS）
+#[cfg(target_os = "macos")]
+fn prepare_mac_tun_dns(logs: &SharedLogManager) {
+    let log = |level: LogLevel, msg: &str| {
+        if let Ok(mut m) = logs.lock() {
+            m.add_log(level, msg, "proxy");
+        }
+    };
+    let current = dns::read_mac_dns_servers();
+    if !current.is_empty() && current.iter().all(dns::is_tun_internal_address) {
+        log(LogLevel::Warn, "检测到系统 DNS 残留 TUN 地址，正在恢复 DHCP");
+        if let Err(e) = dns::set_system_dns_servers(&[]) {
+            log(LogLevel::Warn, &format!("恢复 DHCP 失败: {}", e));
+        }
+        dns::reset_mac_dns_cache();
+    }
+    // 触发缓存：后续配置生成使用原始系统 DNS
+    let _ = dns::get_system_dns_servers();
+}
+
+/// macOS TUN 启动后：系统 DNS 指向 TUN 劫持地址（仅 macOS）
+#[cfg(target_os = "macos")]
+fn setup_mac_tun_dns(sb_config: &crate::singbox::SingBoxConfig, logs: &SharedLogManager) {
+    let log = |level: LogLevel, msg: &str| {
+        if let Ok(mut m) = logs.lock() {
+            m.add_log(level, msg, "proxy");
+        }
+    };
+    let addresses: Vec<String> = sb_config
+        .inbounds
+        .iter()
+        .find(|i| i.inbound_type == "tun")
+        .and_then(|tun| tun.address.clone())
+        .unwrap_or_else(|| {
+            vec![
+                "172.19.0.1/30".to_string(),
+                "fdfe:dcba:9876::1/126".to_string(),
+            ]
+        });
+    let dns_addrs = dns::get_tun_dns_addresses(&addresses);
+    if dns_addrs.is_empty() {
+        log(LogLevel::Warn, "无法推导 TUN DNS 劫持地址，跳过系统 DNS 设置");
+        return;
+    }
+    match dns::set_system_dns_servers(&dns_addrs) {
+        Ok(()) => log(
+            LogLevel::Info,
+            &format!("macOS 系统 DNS 已指向 TUN 劫持地址: {}", dns_addrs.join(", ")),
+        ),
+        Err(e) => log(LogLevel::Warn, &format!("设置 macOS TUN DNS 失败: {}", e)),
+    }
+}
+
+impl ProxyManager {
     pub async fn restart(&mut self, app: &AppHandle, cfg: &UserConfig) -> Result<(), String> {
         let _ = app.emit("event:proxyRestarting", serde_json::json!({}));
         self.stop(app).await?;
@@ -513,7 +588,28 @@ fn gen_context(app: &AppHandle) -> Result<GenContext, String> {
     })
 }
 
-fn resolve_singbox_path(app: &AppHandle) -> Result<PathBuf, String> {
+/// 启动前（无 AppHandle 时）的 sing-box 路径解析：环境变量优先，否则开发期布局
+pub fn resolve_singbox_path_early() -> PathBuf {
+    if let Ok(p) = std::env::var("FLOWZ_SINGBOX_PATH") {
+        return PathBuf::from(p);
+    }
+    let filename = if cfg!(target_os = "windows") {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    };
+    #[cfg(target_os = "windows")]
+    let dev = PathBuf::from("resources/win").join(filename);
+    #[cfg(target_os = "macos")]
+    let dev = PathBuf::from("resources/mac-arm64").join(filename);
+    #[cfg(target_os = "linux")]
+    let dev = PathBuf::from("resources/linux-x64").join(filename);
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let dev = PathBuf::from("resources").join(filename);
+    dev
+}
+
+pub(crate) fn resolve_singbox_path(app: &AppHandle) -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("FLOWZ_SINGBOX_PATH") {
         return Ok(PathBuf::from(p));
     }
