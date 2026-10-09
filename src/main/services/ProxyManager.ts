@@ -324,6 +324,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 更新主窗口引用
+   * 窗口关闭后重建时调用，否则事件会发往已销毁的旧窗口而静默丢失
+   *（表现为重启完成后首页按钮永久卡在"重启中"）
+   */
+  setMainWindow(mainWindow: BrowserWindow): void {
+    this.mainWindow = mainWindow;
+  }
+
+  /**
    * 启动代理
    */
   async start(config: UserConfig): Promise<void> {

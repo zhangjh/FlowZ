@@ -192,6 +192,11 @@ function createWindow() {
   // 注册窗口到 IPC 事件发送器，以便接收广播事件
   ipcEventEmitter.registerWindow(mainWindow);
 
+  // 更新代理管理器的窗口引用（窗口重建后旧引用会失效，导致启动/停止事件丢失）
+  if (proxyManager) {
+    proxyManager.setMainWindow(mainWindow);
+  }
+
   // 更新托盘管理器的窗口引用
   if (trayManager) {
     trayManager.setMainWindow(mainWindow);
@@ -786,6 +791,9 @@ app.whenReady().then(async () => {
         await disableSystemProxyQuietly('after restart failure');
         // 重启失败，更新托盘状态为停止
         updateTrayMenuState(false, true);
+        // 通知渲染进程重启已结束（失败），否则首页按钮会永久卡在"重启中"
+        //（渲染层收到后会刷新真实状态来自愈）
+        ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
       }
     }
   });

@@ -22,6 +22,34 @@ interface NativeEventData {
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
 
+// "重启中"状态的兜底定时器：
+// 重启开始事件（proxyRestarting）与结束事件（processStarted/processStopped）是两个独立 IPC，
+// 任何一个结束事件丢失都会让首页按钮永久卡在"重启中"。兜底定时器保证超时后按实际状态自愈。
+let restartingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+// Linux 下提权弹窗等用户操作可能耗时较长，留足 90 秒
+const RESTARTING_FALLBACK_MS = 90_000;
+
+function clearRestartingFallback(): void {
+  if (restartingFallbackTimer) {
+    clearTimeout(restartingFallbackTimer);
+    restartingFallbackTimer = null;
+  }
+}
+
+/** 结束"重启中"状态：先刷新真实连接状态，再复位按钮 */
+function finishRestartingPhase(): void {
+  import('../store/app-store').then(({ useAppStore }) => {
+    const state = useAppStore.getState();
+    if (state.proxyPhase !== 'restarting') return;
+    // 刷新真实状态后再复位，避免把一次仍在进行的重启误判为空闲
+    state.refreshConnectionStatus().finally(() => {
+      if (useAppStore.getState().proxyPhase === 'restarting') {
+        useAppStore.setState({ proxyPhase: 'idle', isLoading: false });
+      }
+    });
+  });
+}
+
 export function useNativeEvent<K extends keyof NativeEventData>(
   eventName: K,
   callback: NativeEventListener<K>
@@ -70,6 +98,7 @@ export function useNativeEvent<K extends keyof NativeEventData>(
 export function useNativeEventListeners() {
   const handleProcessStarted = (data: NativeEventData['processStarted']) => {
     console.log('Process started:', data);
+    clearRestartingFallback();
     // Refresh connection status when process starts
     import('../store/app-store').then(({ useAppStore }) => {
       const state = useAppStore.getState();
@@ -83,6 +112,7 @@ export function useNativeEventListeners() {
 
   const handleProcessStopped = (data: NativeEventData['processStopped']) => {
     console.log('Process stopped:', data);
+    clearRestartingFallback();
     // Refresh connection status when process stops
     import('../store/app-store').then(({ useAppStore }) => {
       const state = useAppStore.getState();
@@ -192,7 +222,15 @@ export function useNativeEventListeners() {
   useNativeEvent('proxyRestarting', () => {
     console.log('[NativeEvent] Proxy restarting');
     import('../store/app-store').then(({ useAppStore }) => {
+      clearRestartingFallback();
       useAppStore.setState({ proxyPhase: 'restarting', isLoading: true, error: null });
+      // 兜底：若后续的 started/stopped 事件丢失，超时后按实际状态自愈，
+      // 避免首页按钮永久卡在"重启中"
+      restartingFallbackTimer = setTimeout(() => {
+        restartingFallbackTimer = null;
+        console.log('[NativeEvent] Restarting fallback: resetting stuck restarting state');
+        finishRestartingPhase();
+      }, RESTARTING_FALLBACK_MS);
     });
   });
 }
