@@ -35,7 +35,8 @@
     "package:tauri:win": "tauri build --target x86_64-pc-windows-msvc",
     "package:tauri:linux": "tauri build --target x86_64-unknown-linux-gnu",
     "package:tauri:mac": "tauri build --target aarch64-apple-darwin",
-    "package:tauri:mac-intel": "tauri build --target x86_64-apple-darwin"
+    "package:tauri:mac-intel": "tauri build --target x86_64-apple-darwin",
+    "tauri:stage": "node scripts/tauri-stage-resources.mjs"
   },
   "keywords": [
     "electron",

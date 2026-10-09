@@ -14,10 +14,10 @@
   },
   "build": {
     "beforeBuildCommand": "npm run build:renderer",
-    "beforeDevCommand": "node ../scripts/tauri-stage-resources.mjs && npm run dev:renderer",
+    "beforeDevCommand": "npm run tauri:stage && npm run dev:renderer",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist/renderer",
-    "beforeBundleCommand": "node ../scripts/tauri-stage-resources.mjs"
+    "beforeBundleCommand": "npm run tauri:stage"
   },
   "bundle": {
     "active": true,
