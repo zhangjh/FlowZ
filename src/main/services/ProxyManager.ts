@@ -4185,6 +4185,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 发送事件到渲染进程
    */
   private sendEventToRenderer(channel: string, data: any): void {
+    // 重启中间态的 stopped 不通知渲染层：
+    // restart = stop + start，中间的 EVENT_PROXY_STOPPED 会让首页按钮提前退出
+    // "重启中"状态（表现为"关闭代理→开启代理→关闭代理"，而非预期的"关闭代理→重启中→关闭代理"）。
+    // 重启的终结状态由后续事件保证：
+    // - 成功 → performRestart 各路径发送 EVENT_PROXY_STARTED；
+    // - 失败 → restart() 的 finally 已复位 restartInProgress，外层 catch 补发的
+    //   EVENT_PROXY_STOPPED 不受此抑制影响。
+    if (channel === IPC_CHANNELS.EVENT_PROXY_STOPPED && this.restartInProgress) {
+      return;
+    }
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send(channel, data);
     }
