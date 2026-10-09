@@ -11,6 +11,7 @@
 
 use crate::config::{self, UserConfig};
 use crate::clash;
+#[cfg(target_os = "macos")]
 use crate::dns;
 use crate::logs::{self, LogLevel, SharedLogManager};
 use crate::singbox::{self, GenContext};
@@ -256,6 +257,8 @@ impl ProxyManager {
         }
         if let Some(mut child) = self.direct_child.take() {
             // 先 SIGTERM，5 秒后仍未退出则 SIGKILL（与 TS 的 stopSingBoxProcess 一致）
+            // Windows 无 SIGTERM（Node 的 kill('SIGTERM') 本来也是强制终止），直接走超时 kill
+            #[cfg(unix)]
             if let Some(pid) = self.pid {
                 unsafe {
                     libc::kill(pid as i32, libc::SIGTERM);

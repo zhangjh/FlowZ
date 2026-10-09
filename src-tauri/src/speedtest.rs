@@ -13,7 +13,7 @@ use crate::singbox::{
     SingBoxOutbound, SingBoxRouteConfig, SingBoxRouteRule,
 };
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 

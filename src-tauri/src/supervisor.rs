@@ -490,6 +490,7 @@ impl PrivilegedSupervisor {
     }
 
     fn launch_supervisor(&self) -> Result<(), String> {
+        #[cfg(not(target_os = "windows"))]
         let script = self.script_file();
         #[cfg(target_os = "macos")]
         {

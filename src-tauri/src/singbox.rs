@@ -3,7 +3,7 @@
 //! 生成 sing-box 1.14.x 格式配置。纯逻辑，可单测。
 
 use crate::config::{
-    DomainRule, Network, Protocol, ProxyMode, Security, ServerConfig, UserConfig,
+    Network, Protocol, ProxyMode, Security, ServerConfig, UserConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

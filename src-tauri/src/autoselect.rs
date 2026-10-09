@@ -9,9 +9,8 @@
 
 use crate::config::{ServerConfig, UserConfig};
 use crate::logs::{LogLevel, SharedLogManager};
-use crate::speedtest::{self, SpeedTestResult};
+use crate::speedtest;
 use serde::Serialize;
-use tauri::Emitter;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

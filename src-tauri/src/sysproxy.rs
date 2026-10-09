@@ -7,6 +7,7 @@
 //! Windows/macOS 分支为直接移植，沙箱内无法实测，调用前请真机验证。
 
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 use tokio::process::Command;
 
