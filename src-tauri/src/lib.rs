@@ -457,21 +457,37 @@ pub(crate) async fn switch_proxy_mode(app: &tauri::AppHandle, mode: &str) -> Res
 /// 托盘触发的全部服务器测速（后台执行，结果写入 SpeedResultMap 并推送事件）
 pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
     let app = app.clone();
+    let app_log = app.clone();
+    // 日志辅助闭包
+    let log = move |msg: String| {
+        if let Some(logs) = app_log.try_state::<LogsState>() {
+            let entry = logs
+                .lock()
+                .map(|mut m| m.add_log(logs::LogLevel::Info, &format!("[tray-speedtest] {}", msg), "tray"))
+                .ok()
+                .flatten();
+            if let Some(e) = entry {
+                let _ = app_log.emit("event:logReceived", &e);
+            }
+        }
+    };
     tauri::async_runtime::spawn(async move {
         let cfg = match config::load_config() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[tray] 测速失败: {}", e);
+                log(format!("测速失败: 加载配置失败: {}", e));
                 return;
             }
         };
         if cfg.servers.is_empty() {
+            log("没有服务器可测速".to_string());
             return;
         }
+        log(format!("开始测速，共 {} 个服务器", cfg.servers.len()));
         let singbox = match proxy::resolve_singbox_path(&app) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[tray] 测速失败: {}", e);
+                log(format!("测速失败: 找不到 sing-box: {}", e));
                 return;
             }
         };
@@ -480,6 +496,7 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             Err(_) => std::env::temp_dir(),
         };
         let results = speedtest::test_multiple_servers(&cfg.servers, &singbox, &work_dir).await;
+        log(format!("测速完成，共 {} 个结果", results.len()));
         // 写入托盘延迟缓存
         if let Some(map) = app.try_state::<tray::SpeedResultMap>() {
             if let Ok(mut m) = map.lock() {
