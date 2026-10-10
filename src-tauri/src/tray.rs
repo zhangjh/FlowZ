@@ -188,7 +188,7 @@ pub fn build_menu(app: &AppHandle, data: &TrayMenuData) -> Result<tauri::menu::M
 }
 
 /// 刷新托盘菜单（配置/状态变化后调用）
-pub fn refresh_tray_menu(app: &AppHandle) {
+pub async fn refresh_tray_menu(app: &AppHandle) {
     let tray = match app.tray_by_id("main") {
         Some(t) => t,
         None => return,
@@ -197,10 +197,10 @@ pub fn refresh_tray_menu(app: &AppHandle) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let running = app
-        .try_state::<crate::ProxyState>()
-        .map(|s| s.blocking_lock().is_running())
-        .unwrap_or(false);
+    let running = match app.try_state::<crate::ProxyState>() {
+        Some(s) => s.lock().await.is_running(),
+        None => false,
+    };
     let speeds = app
         .try_state::<SpeedResultMap>()
         .map(|s| s.lock().map(|m| m.clone()).unwrap_or_default())
@@ -295,10 +295,10 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "show" => show_main_window(app),
         "toggle" => {
-            let running = app
-                .try_state::<crate::ProxyState>()
-                .map(|s| s.blocking_lock().is_running())
-                .unwrap_or(false);
+            let running = match app.try_state::<crate::ProxyState>() {
+                Some(s) => s.lock().await.is_running(),
+                None => false,
+            };
             if running {
                 if let Err(e) = crate::proxy_stop_inner(&app).await {
                     eprintln!("[tray] 停止代理失败: {}", e);
@@ -308,7 +308,7 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
                     eprintln!("[tray] 启动代理失败: {}", e);
                 }
             }
-            refresh_tray_menu(app);
+            refresh_tray_menu(app).await;
         }
         "manage-servers" => {
             show_main_window(app);
@@ -349,21 +349,21 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             if let Err(e) = proxy.lock().await.switch_server(app, server_id).await {
                 eprintln!("[tray] 切换服务器失败: {}", e);
             }
-            refresh_tray_menu(app);
+            refresh_tray_menu(app).await;
         }
         _ if id.starts_with("group:") => {
             let group_id = &id["group:".len()..];
             if let Err(e) = crate::switch_group(app, group_id).await {
                 eprintln!("[tray] 切换分组失败: {}", e);
             }
-            refresh_tray_menu(app);
+            refresh_tray_menu(app).await;
         }
         _ if id.starts_with("mode:") => {
             let mode = &id["mode:".len()..];
             if let Err(e) = crate::switch_proxy_mode(app, mode).await {
                 eprintln!("[tray] 切换代理模式失败: {}", e);
             }
-            refresh_tray_menu(app);
+            refresh_tray_menu(app).await;
         }
         _ => {}
     }

@@ -209,7 +209,7 @@ async fn proxy_start(
             Arc::new(TauriEventEmitter { app: app_bg.clone() }),
         );
         update_tray_tooltip(&app_bg, true).await;
-        tray::refresh_tray_menu(&app_bg);
+        tray::refresh_tray_menu(&app_bg).await;
     });
     Ok(())
 }
@@ -231,7 +231,7 @@ async fn proxy_stop(
         svc.stop();
     }
     update_tray_tooltip(&app, false).await;
-    tray::refresh_tray_menu(&app);
+    tray::refresh_tray_menu(&app).await;
     Ok(())
 }
 
@@ -466,7 +466,7 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             "event:speedTestCompleted",
             serde_json::to_value(&results).unwrap_or_default(),
         );
-        tray::refresh_tray_menu(&app);
+        tray::refresh_tray_menu(&app).await;
     });
 }
 
