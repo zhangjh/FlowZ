@@ -13,6 +13,8 @@ use crate::config::{self, UserConfig};
 use crate::clash;
 #[cfg(target_os = "macos")]
 use crate::dns;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use crate::logs::{self, LogLevel, SharedLogManager};
 use crate::singbox::{self, GenContext};
 use crate::supervisor::{self, PrivilegedSupervisor};
@@ -692,14 +694,17 @@ async fn spawn_with_retry(singbox: &PathBuf, config_path: &PathBuf) -> Result<Ch
 }
 
 async fn spawn_singbox(singbox: &PathBuf, config_path: &PathBuf) -> Result<Child, String> {
-    Command::new(singbox)
-        .arg("run")
+    let mut cmd = Command::new(singbox);
+    cmd.arg("run")
         .arg("-c")
         .arg(config_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    // Windows 下不弹控制台窗口（CREATE_NO_WINDOW = 0x08000000）
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    cmd.spawn()
         .map_err(|e| format!("启动 sing-box 失败: {}", e))
 }
 

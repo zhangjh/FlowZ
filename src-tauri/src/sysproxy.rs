@@ -10,6 +10,8 @@ use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 use tokio::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SystemProxyStatus {
@@ -321,8 +323,11 @@ impl SystemProxyManager {
         "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
     async fn reg(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("reg")
-            .args(args)
+        let mut cmd = Command::new("reg");
+        cmd.args(args);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW，不弹控制台
+        let out = cmd
             .output()
             .await
             .map_err(|e| format!("reg 执行失败: {}", e))?;
