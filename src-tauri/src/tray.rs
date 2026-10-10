@@ -292,7 +292,23 @@ fn show_main_window(app: &AppHandle) {
 
 /// 托盘菜单事件分发
 async fn handle_menu_event(app: &AppHandle, id: &str) {
-    eprintln!("[tray] 收到菜单点击: {}", id);
+    // 写到实时日志，方便排查
+    if let Some(logs) = app.try_state::<crate::logs::SharedLogManager>() {
+        let entry = logs
+            .lock()
+            .map(|mut m| {
+                m.add_log(
+                    crate::logs::LogLevel::Info,
+                    &format!("[tray] 收到菜单点击: {}", id),
+                    "tray",
+                )
+            })
+            .ok()
+            .flatten();
+        if let Some(e) = entry {
+            let _ = app.emit("event:logReceived", &e);
+        }
+    }
     match id {
         "show" => show_main_window(app),
         "toggle" => {
