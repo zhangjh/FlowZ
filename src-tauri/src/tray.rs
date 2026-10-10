@@ -14,6 +14,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// 托盘服务器标签上的延迟缓存
 pub type SpeedResultMap = Arc<Mutex<HashMap<String, Option<u64>>>>;
+/// 测速完成版本号，每次托盘测速完成时 +1，前端轮询此版本号决定是否弹窗
+pub type SpeedtestVersion = Arc<std::sync::atomic::AtomicU64>;
 
 pub struct TrayMenuData {
     pub is_running: bool,

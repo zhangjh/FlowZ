@@ -223,6 +223,14 @@ async fn proxy_start(
 }
 
 /// 停止代理：先禁用系统代理（best-effort），再停 sing-box。
+/// 获取托盘测速版本号
+#[tauri::command]
+async fn get_tray_speedtest_version(
+    v: tauri::State<'_, tray::SpeedtestVersion>,
+) -> Result<u64, String> {
+    Ok(v.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// 获取托盘测速结果（供服务器页面同步）
 #[tauri::command]
 async fn get_tray_speedtest_results(
@@ -534,6 +542,10 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             })
             .collect();
         let _ = app.emit("event:speedTestResult", &formatted);
+        // 版本号 +1，前端轮询到变化时弹窗
+        if let Some(v) = app.try_state::<tray::SpeedtestVersion>() {
+            v.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         tray::refresh_tray_menu(&app).await;
     });
 }
@@ -807,6 +819,7 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .manage(shared_logs)
         .manage(PendingTrayAction::default())
+        .manage(tray::SpeedtestVersion::default())
         .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))
         .manage(autoselect)
@@ -851,6 +864,7 @@ pub fn run() {
             proxy_get_status,
             get_pending_tray_action,
             get_tray_speedtest_results,
+            get_tray_speedtest_version,
             proxy_switch_server,
             logs_get,
             logs_clear,

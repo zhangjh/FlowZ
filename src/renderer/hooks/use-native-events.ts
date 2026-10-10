@@ -325,7 +325,40 @@ export function useNativeEventListeners() {
     };
 
     // 可见时每 3 秒检查；窗口获得焦点时立即检查一次
-    const timer = setInterval(doSync, 3000);
+    const timer = setInterval(async () => {
+      await doSync();
+      // 检查托盘测速是否完成（版本号变化则弹窗）
+      try {
+        const apiTyped = api as unknown as {
+          appEvents: {
+            getTraySpeedtestVersion: () => Promise<number>;
+            getTraySpeedtestResults: () => Promise<Array<[string, number | null]>>;
+          };
+        };
+        const version = await apiTyped.appEvents.getTraySpeedtestVersion();
+        const lastVersion = (window as unknown as { __lastSpeedtestVersion?: number }).__lastSpeedtestVersion ?? 0;
+        if (version > lastVersion) {
+          (window as unknown as { __lastSpeedtestVersion?: number }).__lastSpeedtestVersion = version;
+          console.log('[tray-sync] 检测到托盘测速完成，打开结果弹窗');
+          // 拉取结果并通过自定义事件通知 App 打开弹窗
+          const results = await apiTyped.appEvents.getTraySpeedtestResults();
+          // 需要服务器名称和协议，从配置里查
+          const { useAppStore } = await import('../store/app-store');
+          const cfg = useAppStore.getState().config;
+          const formatted = results.map(([serverId, latency]) => {
+            const srv = cfg?.servers?.find((s: { id: string }) => s.id === serverId);
+            return {
+              name: (srv as { name?: string })?.name || serverId,
+              protocol: ((srv as { protocol?: string })?.protocol || '').toUpperCase(),
+              latency,
+            };
+          });
+          window.dispatchEvent(new CustomEvent('tray-speedtest-done', { detail: formatted }));
+        }
+      } catch {
+        // 忽略
+      }
+    }, 3000);
     const onFocus = () => doSync();
     window.addEventListener('focus', onFocus);
     // 启动后 3 秒做一次初始同步

@@ -44,17 +44,15 @@ function App() {
     return () => unsubscribe();
   }, [setCurrentView]);
 
-  // Listen to speed test results
+  // Listen to speed test results (via custom event from polling, Tauri events unreliable)
   useEffect(() => {
-    const unsubscribe = ipcClient.on<Array<{ name: string; protocol: string; latency: number | null }>>(
-      'speedTestResult',
-      (results: SpeedTestResultItem[]) => {
-        setSpeedTestResults(results);
-        setSpeedTestDialogOpen(true);
-      }
-    );
-
-    return () => unsubscribe();
+    const handler = (e: Event) => {
+      const results = (e as CustomEvent<SpeedTestResultItem[]>).detail;
+      setSpeedTestResults(results);
+      setSpeedTestDialogOpen(true);
+    };
+    window.addEventListener('tray-speedtest-done', handler);
+    return () => window.removeEventListener('tray-speedtest-done', handler);
   }, []);
 
   return (

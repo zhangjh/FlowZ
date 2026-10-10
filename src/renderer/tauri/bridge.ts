@@ -71,6 +71,8 @@ const appEventsApi = {
     invoke('get_pending_tray_action'),
   getTraySpeedtestResults: (): Promise<Array<[string, number | null]>> =>
     invoke('get_tray_speedtest_results'),
+  getTraySpeedtestVersion: (): Promise<number> =>
+    invoke('get_tray_speedtest_version'),
 };
 
 const configApi = {
