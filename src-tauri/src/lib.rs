@@ -42,11 +42,17 @@ fn get_config() -> Result<Value, String> {
 
 /// 保存用户配置（对应 ConfigManager.saveConfig，含验证）。
 #[tauri::command]
-fn save_config(config: Value) -> Result<(), String> {
+fn save_config(app: tauri::AppHandle, config: Value) -> Result<(), String> {
     let mut cfg: config::UserConfig =
         serde_json::from_value(config).map_err(|e| format!("配置格式错误: {}", e))?;
     config::validate_config(&mut cfg)?;
-    config::save_config(&cfg)
+    config::save_config(&cfg)?;
+    // UI 修改配置后刷新托盘菜单，保持选中态一致
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tray::refresh_tray_menu(&app_clone).await;
+    });
+    Ok(())
 }
 
 /// 解析协议 URL（对应 server:parseUrl）。
