@@ -1,4 +1,4 @@
-name: Release
+name: Release (Tauri)
 
 on:
   push:
@@ -13,14 +13,18 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             platform: win
+            args: '--bundles nsis'
           - os: macos-14
             platform: mac
-          - os: ubuntu-latest
+            args: '--target aarch64-apple-darwin'
+          - os: ubuntu-22.04
             platform: linux
+            args: ''
 
     steps:
       - name: Checkout code
@@ -32,36 +36,27 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install dependencies
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build application
-        run: npm run build
-
-      - name: Package application
-        run: npm run package:${{ matrix.platform }}
+      - name: Build and package (Tauri)
+        uses: tauri-apps/tauri-action@v0
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: false
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
 
-      - name: Create DMG (macOS)
-        if: matrix.platform == 'mac'
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          APP_PATH="dist-package/mac-arm64/FlowZ.app"
-          DMG_PATH="dist-package/FlowZ-${VERSION}-mac-arm64.dmg"
-          
-          echo "Creating DMG..."
-          TEMP_DIR=$(mktemp -d)
-          cp -R "$APP_PATH" "$TEMP_DIR/"
-          ln -s /Applications "$TEMP_DIR/Applications"
-          
-          hdiutil create -volname "FlowZ ${VERSION}" \
-            -srcfolder "$TEMP_DIR" \
-            -ov -format UDZO \
-            "$DMG_PATH"
-          
-          rm -rf "$TEMP_DIR"
-          echo "Created: $DMG_PATH"
+      - name: Collect artifacts to dist-package/
+        run: node scripts/tauri-collect.mjs
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -118,12 +113,8 @@ jobs:
         with:
           name: Release ${{ steps.version.outputs.VERSION }}
           body: ${{ steps.release_notes.outputs.NOTES }}
-          draft: true
-          prerelease: false
           files: |
             artifacts/**/*.exe
             artifacts/**/*.dmg
             artifacts/**/*.AppImage
             artifacts/**/*.deb
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
