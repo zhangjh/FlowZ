@@ -537,11 +537,23 @@ pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
 
     let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
-    let release: GitHubRelease = client
+    let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("检查更新失败: {}", e))?
+        .map_err(|e| format!("检查更新失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // 404 = 还没有发布过 release；403 = API 限流；其他按原文返回
+        if status.as_u16() == 404 {
+            return Ok(serde_json::json!({ "hasUpdate": false }));
+        }
+        return Err(format!("GitHub API 返回 {}: {}", status.as_u16(), body.chars().take(200).collect::<String>()));
+    }
+
+    let release: GitHubRelease = resp
         .json()
         .await
         .map_err(|e| format!("解析 release 信息失败: {}", e))?;
