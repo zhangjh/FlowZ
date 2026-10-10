@@ -7,6 +7,18 @@
 </head>
 <body>
   <div id="root"></div>
+  <div id="boot-error" style="display:none;position:fixed;inset:0;background:#fff;color:#c00;padding:24px;font:14px/1.6 monospace;white-space:pre-wrap;overflow:auto;z-index:99999;"></div>
+  <script>
+    // 启动期错误浮层：模块加载期抛错会导致白屏，把错误直接显示出来便于定位
+    window.addEventListener('error', function (e) {
+      var el = document.getElementById('boot-error');
+      if (!el || el.style.display === 'block') return;
+      // React 成功挂载后不再弹（应用内有 ErrorBoundary 处理运行时错误）
+      if (document.getElementById('root') && document.getElementById('root').children.length > 0) return;
+      el.style.display = 'block';
+      el.textContent = '启动失败: ' + (e.error && e.error.message || e.message) + '\n' + (e.error && e.error.stack || '');
+    });
+  </script>
   <script type="module" src="./main.tsx"></script>
 </body>
 </html>

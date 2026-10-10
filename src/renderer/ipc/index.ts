@@ -12,7 +12,11 @@ import { api as tauriApi } from '../tauri/bridge';
 
 const isTauriRuntime =
   typeof window !== 'undefined' &&
-  (window as unknown as { __TAURI__?: unknown }).__TAURI__ !== undefined;
+  ((window as unknown as { __TAURI__?: unknown }).__TAURI__ !== undefined ||
+    // Tauri 2.12+ 默认 withGlobalTauri=false，不再注入 window.__TAURI__，
+    // 但 __TAURI_INTERNALS__ 始终存在（@tauri-apps/api 的 IPC 机制）
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ !==
+      undefined);
 
 /**
  * 运行时选择的 api：Tauri webview 里走 invoke/listen，
