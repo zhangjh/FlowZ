@@ -574,15 +574,21 @@ fn validate_selection(cfg: &UserConfig) -> Result<(), String> {
 
 fn gen_context(app: &AppHandle) -> Result<GenContext, String> {
     let user_data_dir = config::user_data_dir()?;
-    // .srs 数据目录：环境变量 > Tauri resource dir > 开发期相对路径
+    // .srs 数据目录：环境变量 > Tauri resource dir（bundle-resources/data 优先） > 开发期相对路径
     let data_dir = if let Ok(p) = std::env::var("FLOWZ_DATA_DIR") {
         PathBuf::from(p)
     } else if let Ok(res) = app.path().resource_dir() {
-        let cand = res.join("data");
-        if cand.exists() {
-            cand
+        // 优先 staging 布局：bundle-resources/data/
+        let staged = res.join("bundle-resources").join("data");
+        if staged.exists() {
+            staged
         } else {
-            PathBuf::from("resources/data")
+            let cand = res.join("data");
+            if cand.exists() {
+                cand
+            } else {
+                PathBuf::from("resources/data")
+            }
         }
     } else {
         PathBuf::from("resources/data")
