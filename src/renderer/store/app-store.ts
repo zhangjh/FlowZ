@@ -409,6 +409,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       ) {
         set({ connectionStatus: next });
       }
+      // 代理实际在运行但 store 有残留 error（如超时后实际连上了），清除错误状态
+      if (next.proxyCore.running && get().error) {
+        set({ error: null });
+      }
     } catch (error) {
       console.error('Failed to refresh connection status:', error);
     }
