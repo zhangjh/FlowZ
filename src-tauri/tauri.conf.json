@@ -37,7 +37,8 @@
         "languages": [
           "SimpChinese"
         ],
-        "installerIcon": "../build/icon.ico"
+        "installerIcon": "../build/icon.ico",
+        "uninstallerIcon": "../build/icon.ico"
       }
     }
   },
