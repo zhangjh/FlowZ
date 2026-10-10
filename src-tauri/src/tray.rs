@@ -314,7 +314,10 @@ fn tray_log(app: &AppHandle, msg: &str) {
 async fn handle_menu_event(app: &AppHandle, id: &str) {
     tray_log(app, &format!("收到菜单点击: {}", id));
     match id {
-        "show" => show_main_window(app),
+        "show" => {
+            tray_log(app, "打开主窗口");
+            show_main_window(app);
+        }
         "toggle" => {
             tray_log(app, "执行 toggle");
             let running = match app.try_state::<crate::ProxyState>() {
@@ -339,25 +342,32 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             refresh_tray_menu(app).await;
         }
         "manage-servers" => {
+            tray_log(app, "打开服务器管理");
             show_main_window(app);
             let _ = app.emit("event:navigate", serde_json::json!({ "page": "servers" }));
         }
         "settings" => {
+            tray_log(app, "打开设置页面");
             show_main_window(app);
             let _ = app.emit("event:navigate", serde_json::json!({ "page": "settings" }));
+            tray_log(app, "已发送 navigate 事件");
         }
         "update" => {
+            tray_log(app, "开始检查更新...");
             match crate::update_check_inner(false).await {
                 Ok(r) => {
+                    tray_log(app, "检查更新完成，已发送事件");
                     let _ = app.emit("event:updateCheckResult", &r);
                 }
-                Err(e) => eprintln!("[tray] 检查更新失败: {}", e),
+                Err(e) => tray_log(app, &format!("检查更新失败: {}", e)),
             }
         }
         "speedtest" => {
+            tray_log(app, "开始服务器测速...");
             crate::run_tray_speedtest(&app);
         }
         "quit" => {
+            tray_log(app, "正在退出...");
             let proxy = app.state::<crate::ProxyState>();
             {
                 let mut mgr = proxy.lock().await;
@@ -373,23 +383,32 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         _ if id.starts_with("server:") => {
             let server_id = &id["server:".len()..];
+            tray_log(app, &format!("切换服务器: {}", server_id));
             let proxy = app.state::<crate::ProxyState>();
             if let Err(e) = proxy.lock().await.switch_server(app, server_id).await {
-                eprintln!("[tray] 切换服务器失败: {}", e);
+                tray_log(app, &format!("切换服务器失败: {}", e));
+            } else {
+                tray_log(app, "切换服务器完成");
             }
             refresh_tray_menu(app).await;
         }
         _ if id.starts_with("group:") => {
             let group_id = &id["group:".len()..];
+            tray_log(app, &format!("切换分组: {}", group_id));
             if let Err(e) = crate::switch_group(app, group_id).await {
-                eprintln!("[tray] 切换分组失败: {}", e);
+                tray_log(app, &format!("切换分组失败: {}", e));
+            } else {
+                tray_log(app, "切换分组完成");
             }
             refresh_tray_menu(app).await;
         }
         _ if id.starts_with("mode:") => {
             let mode = &id["mode:".len()..];
+            tray_log(app, &format!("切换代理模式: {}", mode));
             if let Err(e) = crate::switch_proxy_mode(app, mode).await {
-                eprintln!("[tray] 切换代理模式失败: {}", e);
+                tray_log(app, &format!("切换代理模式失败: {}", e));
+            } else {
+                tray_log(app, "切换代理模式完成");
             }
             refresh_tray_menu(app).await;
         }
