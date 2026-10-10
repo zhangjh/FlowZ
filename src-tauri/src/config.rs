@@ -1,7 +1,7 @@
 //! ConfigManager 移植（对应 `src/main/services/ConfigManager.ts`）。
 //!
 //! 职责：用户配置的加载 / 保存 / 验证 / 默认值。
-//! 为保证从 Electron 版平滑迁移，配置文件路径与 Electron 版保持一致
+//! 配置文件路径保持向后兼容
 //! （`app.getPath('userData')/config.json` 的等价位置），而不是 Tauri 默认的
 //! identifier 路径。
 
@@ -534,7 +534,7 @@ pub fn validate_config(cfg: &mut UserConfig) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 路径（与 Electron 版 app.getPath('userData') 等价，保证迁移不断档）
+// 用户数据目录路径
 // ---------------------------------------------------------------------------
 
 pub(crate) fn user_data_dir() -> Result<PathBuf, String> {
@@ -637,7 +637,7 @@ mod tests {
     fn default_config_json_roundtrip_matches_ts_shape() {
         let cfg = default_config();
         let v = serde_json::to_value(&cfg).unwrap();
-        // 关键字段名必须是 camelCase（与 Electron 版 config.json 互通）
+        // 关键字段名必须是 camelCase
         assert_eq!(v["proxyMode"], "global");
         assert_eq!(v["proxyModeType"], "systemProxy");
         assert_eq!(v["socksPort"], 65534);

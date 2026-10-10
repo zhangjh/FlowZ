@@ -127,7 +127,7 @@ const serverApi = {
     cfg.selectedServerId = serverId;
     cfg.selectedGroupId = null;
     await configApi.save(cfg);
-    // 切换节点后重启代理（与 Electron 行为一致）
+    // 切换节点后重启代理
     await proxyApi.restart(cfg);
   },
   parseUrl: (url: string): Promise<any> => invoke('parse_protocol_url', { url }),
@@ -272,16 +272,16 @@ export const api = {
 export default api;
 
 // ---------------------------------------------------------------------------
-// ipcClient：事件订阅（兼容旧 Electron 通道名）
+// ipcClient：事件订阅
 // ---------------------------------------------------------------------------
 
-/** Electron 通道名 -> Tauri 事件名的映射 */
+/** 通道名 -> Tauri 事件名的映射 */
 const tauriEventMap: Record<string, string> = {
   navigate: 'event:navigate',
   speedTestResult: 'event:speedTestResult',
 };
 
-/** Rust 托盘发来的 { page } -> Electron 风格的路由字符串 */
+/** Rust 托盘发来的 { page } -> 路由字符串 */
 const navigatePageMap: Record<string, string> = {
   servers: '/server',
   settings: '/settings',
@@ -291,7 +291,7 @@ const navigatePageMap: Record<string, string> = {
 
 /**
  * Tauri 下的事件订阅客户端：`on()` 走 @tauri-apps/api/event 的 listen，
- * 并把 Rust 事件的 payload 适配成调用方期望的 Electron 格式。
+ * 并把 Rust 事件的 payload 适配成调用方期望的格式。
  */
 class TauriIpcClient {
   on<T>(channel: string, listener: (data: T) => void): Unsubscribe {

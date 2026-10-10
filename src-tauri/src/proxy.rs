@@ -3,7 +3,7 @@
 //! phase-3 范围：
 //! - sing-box 配置生成 + 写入（systemProxy 模式）
 //! - 进程启动 / 停止 / 重启（含重试、健康检查、自动重启冷却）
-//! - 状态查询与事件推送（通道名与 Electron 版一致）
+//! - 状态查询与事件推送
 //! - TUN 模式：诚实报错（提权守护进程是 phase-4）
 //!
 //! 未移植（phase-4+）：PrivilegedSupervisor 提权流程、macOS TUN DNS、
@@ -651,7 +651,7 @@ pub(crate) fn resolve_singbox_path(app: &AppHandle) -> Result<PathBuf, String> {
         "sing-box"
     };
     // Tauri 打包后的 resource 目录：优先 staging 布局（bundle-resources/），
-    // 兼容 Electron 式 resources/<platform>/ 布局
+    // 兼容 resources/<platform>/ 布局
     if let Ok(res) = app.path().resource_dir() {
         let staged = res.join("bundle-resources").join(filename);
         if staged.exists() {

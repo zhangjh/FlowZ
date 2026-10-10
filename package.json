@@ -4,7 +4,7 @@
   "singboxVersion": "1.14.1",
   "description": "FlowZ - 简洁现代的跨平台代理客户端",
   "scripts": {
-    "dev": "node scripts/dev.js",
+    "dev": "tauri dev",
     "dev:renderer": "vite",
     "build": "npm run build:renderer",
     "build:renderer": "vite build",
@@ -28,7 +28,6 @@
     "tauri:collect": "node scripts/tauri-collect.mjs"
   },
   "keywords": [
-    "electron",
     "proxy",
     "sing-box",
     "vless",

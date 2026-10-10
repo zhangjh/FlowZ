@@ -1,6 +1,6 @@
 //! FlowZ Tauri 2 backend.
 //!
-//! Electron -> Tauri 迁移（分支 `feat/tauri-migration`）。
+//! FlowZ Tauri 版本。
 //! 已移植：config（ConfigManager）、protocol（ProtocolParser）、
 //! subscription（SubscriptionService）、proxy（ProxyManager 核心 +
 //! TUN 特权守护进程）、sysproxy（SystemProxyManager）、托盘、开机自启。
@@ -130,7 +130,7 @@ async fn generate_singbox_config(
         let candidates = [
             // staging 布局
             app.path().resource_dir().ok().map(|r| r.join("bundle-resources").join("data")),
-            // Electron 式布局
+            // resources/<platform>/ 布局
             app.path().resource_dir().ok().map(|r| r.join("data")),
             // 开发期
             Some(std::path::PathBuf::from("resources/data")),
@@ -188,7 +188,7 @@ async fn proxy_start(
     proxy.lock().await.start(&app, &cfg).await?;
     diag("sing-box 启动完成");
 
-    // 系统代理模式：设置系统代理（失败不回滚 sing-box，与 Electron 一致）
+    // 系统代理模式：设置系统代理（失败不回滚 sing-box）
     if cfg.proxy_mode_type.to_string().to_lowercase() == "systemproxy" {
         diag("设置系统代理...");
         if let Err(e) = sysproxy
@@ -525,7 +525,7 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             }
         }
         // 格式化为前端期望的格式（name, protocol, latency），通过 event:speedTestResult 通知
-        // 对应原版 Electron 的 webContents.send('speedTestResult', ...)
+        // 发送 speedTestResult 事件到前端
         let formatted: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
@@ -551,7 +551,7 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// 自动更新：GitHub Release 检查（无签名，与 Electron 版机制一致）
+// 自动更新：GitHub Release 检查（无签名）
 // ---------------------------------------------------------------------------
 // 检查 https://api.github.com/repos/zhangjh/FlowZ/releases/latest，
 // 对比当前版本，有新版则返回下载链接，前端弹窗提示用户去下载。
@@ -846,7 +846,7 @@ pub fn run() {
                 eprintln!("[tray] {}", e);
             }
             // 健康检查后台任务：每 30s 探测 sing-box 存活，意外退出时自动重启
-            //（冷却：60s 内最多 3 次；与 Electron 版一致）
+            //（冷却：60s 内最多 3 次）
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -860,7 +860,7 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭窗口时最小化到托盘，不退出应用（与 Electron 版一致）
+            // 关闭窗口时最小化到托盘，不退出应用
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();

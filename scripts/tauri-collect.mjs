@@ -1,6 +1,6 @@
 /**
  * Tauri 打包后：把 src-tauri/target/<triple>/release/bundle/ 下的产物
- * 集中拷到根目录 dist-package/（与之前 electron-builder 的输出目录一致）。
+ * 集中拷到根目录 dist-package/。
  */
 import { renameSync, mkdirSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';

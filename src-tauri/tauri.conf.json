@@ -36,12 +36,12 @@
         "installerHooks": "./nsis-hooks.nsh",
         "languages": [
           "SimpChinese"
-        ]
+        ],
+        "installerIcon": "../build/icon.ico"
       }
     }
   },
   "identifier": "com.flowz.app",
   "productName": "FlowZ",
-  "version": "3.7.5",
   "plugins": {}
 }
