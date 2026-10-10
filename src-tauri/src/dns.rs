@@ -7,6 +7,7 @@
 //! 注意：macOS 分支在 Linux 沙箱无法执行，逻辑与 TS 版逐行对应，
 //! 待真机验证。
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::Command;
 
 fn parse_resolv_conf(path: &str) -> Vec<String> {
