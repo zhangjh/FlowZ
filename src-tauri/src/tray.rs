@@ -63,8 +63,8 @@ pub fn build_menu(app: &AppHandle, data: &TrayMenuData) -> Result<tauri::menu::M
     } else {
         "⚪ 已断开"
     };
+    // 状态项不禁用，让 emoji 显示彩色（原版是 disabled 灰色，用户要求彩色反馈）
     let status = MenuItemBuilder::with_id("status", status_label)
-        .enabled(false)
         .build(app)
         .map_err(|e| e.to_string())?;
 
@@ -260,16 +260,16 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
         .path()
         .resource_dir()
         .ok()
-        .map(|r| r.join("bundle-resources").join("app.png"))
+        .map(|r| r.join("bundle-resources").join("app-gray.png"))
         .filter(|p| p.exists())
         .or_else(|| {
             app.path()
                 .resource_dir()
                 .ok()
-                .map(|r| r.join("app.png"))
+                .map(|r| r.join("app-gray.png"))
                 .filter(|p| p.exists())
         })
-        .unwrap_or_else(|| std::path::PathBuf::from("resources/app.png"));
+        .unwrap_or_else(|| std::path::PathBuf::from("resources/app-gray.png"));
     let rgba = image::open(&icon_path)
         .map_err(|e| format!("加载托盘图标失败: {}", e))?
         .to_rgba8();
