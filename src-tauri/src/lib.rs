@@ -108,6 +108,8 @@ pub(crate) type ProxyState = Mutex<proxy::ProxyManager>;
 pub(crate) type SysProxyState = Mutex<sysproxy::SystemProxyManager>;
 pub(crate) type LogsState = logs::SharedLogManager;
 pub(crate) type AutoSelectState = Arc<autoselect::AutoSelectService>;
+/// 托盘待处理的前端动作（事件不可靠时的轮询兜底）
+pub(crate) type PendingTrayAction = Arc<std::sync::Mutex<Option<String>>>;
 
 /// 生成 sing-box 配置（调试用；start 内部也会生成）。
 #[tauri::command]
@@ -215,6 +217,14 @@ async fn proxy_start(
 }
 
 /// 停止代理：先禁用系统代理（best-effort），再停 sing-box。
+/// 获取并清空托盘待处理的前端动作
+#[tauri::command]
+async fn get_pending_tray_action(
+    pending: tauri::State<'_, PendingTrayAction>,
+) -> Result<Option<String>, String> {
+    Ok(pending.lock().map(|mut p| p.take()).unwrap_or(None))
+}
+
 #[tauri::command]
 async fn proxy_stop(
     app: tauri::AppHandle,
@@ -728,6 +738,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .manage(shared_logs)
+        .manage(PendingTrayAction::default())
         .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))
         .manage(autoselect)
@@ -770,6 +781,7 @@ pub fn run() {
             proxy_stop,
             proxy_restart,
             proxy_get_status,
+            get_pending_tray_action,
             proxy_switch_server,
             logs_get,
             logs_clear,

@@ -236,40 +236,77 @@ export function useNativeEventListeners() {
     });
   });
 
-  // 托盘操作轮询兜底：Tauri 事件在某些环境下不可靠，每 2 秒检查代理状态和配置
-  // 确保从托盘启动/停止/切换服务器/模式后，前端 UI 能同步
+  // 托盘操作同步：窗口获得焦点时检查一次（用户从托盘操作后回到窗口）
+  // 比常驻轮询更省资源，且覆盖托盘切换服务器/模式/启停的场景
   useEffect(() => {
     let lastRunning: boolean | null = null;
     let lastConfigJson: string | null = null;
-    const timer = setInterval(async () => {
+    let syncing = false;
+
+    const doSync = async () => {
+      if (syncing) return;
+      syncing = true;
       try {
         const { useAppStore } = await import('../store/app-store');
         const state = useAppStore.getState();
-        // 跳过前端正在操作时，避免冲突
         if (state.isLoading) return;
 
-        // 检查代理运行状态
         const status = (await api.proxy.getStatus()) as { running: boolean };
         const running = !!status?.running;
-        if (lastRunning !== null && lastRunning !== running) {
-          console.log(`[tray-poll] 代理状态变化: ${lastRunning} -> ${running}`);
+        const cfg = (await api.config.get()) as unknown;
+        const cfgJson = JSON.stringify(cfg);
+
+        const runningChanged = lastRunning !== null && lastRunning !== running;
+        const configChanged = lastConfigJson !== null && lastConfigJson !== cfgJson;
+
+        if (runningChanged || configChanged) {
+          console.log('[tray-sync] 检测到托盘操作，同步前端');
+          if (configChanged) {
+            useAppStore.setState({ config: cfg as never });
+          }
           await state.refreshConnectionStatus();
         }
         lastRunning = running;
-
-        // 检查配置变化（托盘切换服务器/模式）
-        const cfg = (await api.config.get()) as unknown;
-        const cfgJson = JSON.stringify(cfg);
-        if (lastConfigJson !== null && lastConfigJson !== cfgJson) {
-          console.log('[tray-poll] 配置变化，同步前端');
-          useAppStore.setState({ config: cfg as never });
-          await state.refreshConnectionStatus();
-        }
         lastConfigJson = cfgJson;
-      } catch (e) {
-        // 静默失败，下次重试
+      } catch {
+        // 静默失败
+      } finally {
+        syncing = false;
       }
-    }, 2000);
-    return () => clearInterval(timer);
+    };
+
+    // 窗口获得焦点时同步
+    const onFocus = async () => {
+      await doSync();
+      // 检查托盘待处理的前端动作（如打开设置页面）
+      try {
+        const pending = await (api as unknown as {
+          appEvents: { getPendingTrayAction: () => Promise<string | null> };
+        }).appEvents.getPendingTrayAction();
+        if (pending && pending.startsWith('navigate:')) {
+          const page = pending.slice('navigate:'.length);
+          const { useAppStore } = await import('../store/app-store');
+          const viewMap: Record<string, string> = {
+            settings: 'settings',
+            servers: 'server',
+            home: 'home',
+            rules: 'rules',
+          };
+          const view = viewMap[page] || 'home';
+          console.log(`[tray-sync] 导航到: ${view}`);
+          useAppStore.getState().setCurrentView(view);
+        }
+      } catch {
+        // 忽略
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    // 启动后 3 秒做一次初始同步
+    const initTimer = setTimeout(doSync, 3000);
+
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      clearTimeout(initTimer);
+    };
   }, []);
 }

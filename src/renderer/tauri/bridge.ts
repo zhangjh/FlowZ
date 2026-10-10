@@ -67,6 +67,8 @@ const appEventsApi = {
     onEvent('event:navigate', listener),
   onUpdateCheckResult: (listener: Listener<unknown>): Unsubscribe =>
     onEvent('event:updateCheckResult', listener),
+  getPendingTrayAction: (): Promise<string | null> =>
+    invoke('get_pending_tray_action'),
 };
 
 const configApi = {

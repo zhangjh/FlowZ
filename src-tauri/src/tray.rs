@@ -346,14 +346,27 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             refresh_tray_menu(app).await;
         }
         "manage-servers" => {
-            tray_log(app, "打开服务器管理");
+            tray_log(app, "打开servers页面");
             show_main_window(app);
+            // 事件 + 轮询双保险
             let _ = app.emit("event:navigate", serde_json::json!({ "page": "servers" }));
+            if let Some(pending) = app.try_state::<crate::PendingTrayAction>() {
+                if let Ok(mut p) = pending.lock() {
+                    *p = Some("navigate:servers".to_string());
+                }
+            }
+            tray_log(app, "已发送 navigate 事件");
         }
         "settings" => {
-            tray_log(app, "打开设置页面");
+            tray_log(app, "打开settings页面");
             show_main_window(app);
+            // 事件 + 轮询双保险
             let _ = app.emit("event:navigate", serde_json::json!({ "page": "settings" }));
+            if let Some(pending) = app.try_state::<crate::PendingTrayAction>() {
+                if let Ok(mut p) = pending.lock() {
+                    *p = Some("navigate:settings".to_string());
+                }
+            }
             tray_log(app, "已发送 navigate 事件");
         }
         "update" => {
