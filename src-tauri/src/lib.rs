@@ -534,34 +534,6 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             })
             .collect();
         let _ = app.emit("event:speedTestResult", &formatted);
-        // 桌面通知：照搬原版 toast 格式，显示每个服务器的延迟
-        // 原版：`${r.name}（${r.protocol}）: ${r.latency}ms` 或 `超时`
-        {
-            use tauri_plugin_notification::NotificationExt;
-            let mut lines: Vec<String> = Vec::new();
-            for f in &formatted {
-                let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let protocol = f.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
-                let latency = f.get("latency");
-                let line = match latency.and_then(|v| v.as_u64()) {
-                    Some(ms) => format!("{}（{}）: {}ms", name, protocol, ms),
-                    None => format!("{}（{}）: 超时", name, protocol),
-                };
-                lines.push(line);
-            }
-            // 桌面通知有长度限制，取前 8 条，其余折叠
-            let body = if lines.len() > 8 {
-                format!("{}\n...等{}个", lines[..8].join("\n"), lines.len())
-            } else {
-                lines.join("\n")
-            };
-            let _ = app
-                .notification()
-                .builder()
-                .title("FlowZ 服务器测速完成")
-                .body(&body)
-                .show();
-        }
         tray::refresh_tray_menu(&app).await;
     });
 }
@@ -833,7 +805,6 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_notification::init())
         .manage(shared_logs)
         .manage(PendingTrayAction::default())
         .manage(Mutex::new(proxy_manager))
