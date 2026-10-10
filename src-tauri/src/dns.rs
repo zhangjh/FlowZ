@@ -74,7 +74,7 @@ fn get_linux_dns_servers() -> Vec<String> {
 #[cfg(target_os = "windows")]
 fn get_windows_dns_servers() -> Vec<String> {
     // 方法 1: PowerShell
-    if let Ok(out) = Command::new("powershell")
+    if let Ok(out) = { let mut c = Command::new("powershell"); #[cfg(target_os = "windows")] c.creation_flags(0x08000000); c }
         .args(["-NoProfile", "-Command",
                "Get-DnsClientServerAddress -AddressFamily IPv4,IPv6 | Select-Object -ExpandProperty ServerAddresses"])
         .output()
@@ -90,7 +90,7 @@ fn get_windows_dns_servers() -> Vec<String> {
         }
     }
     // 方法 2: ipconfig /all
-    if let Ok(out) = Command::new("ipconfig").arg("/all").output() {
+    if let Ok(out) = { let mut c = Command::new("ipconfig"); c.arg("/all"); #[cfg(target_os = "windows")] c.creation_flags(0x08000000); c.output() } {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut servers = Vec::new();
         for line in text.lines() {

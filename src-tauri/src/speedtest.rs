@@ -16,6 +16,8 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const NODE_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -276,13 +278,15 @@ pub async fn test_multiple_servers(
         return Vec::new();
     }
 
-    let mut child = match Command::new(singbox_path)
-        .arg("run")
+    let mut cmd = Command::new(singbox_path);
+    cmd.arg("run")
         .arg("-c")
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = match cmd.spawn()
     {
         Ok(c) => c,
         Err(e) => {
