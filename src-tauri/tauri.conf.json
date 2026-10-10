@@ -30,7 +30,7 @@
     "resources": [
       "bundle-resources/*"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "identifier": "com.flowz.app",
   "productName": "FlowZ",
