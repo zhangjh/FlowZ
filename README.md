@@ -48,7 +48,7 @@ npm run package:win   # Windows
 npm run package:mac   # macOS
 ```
 
-macOS Intel 用户需要修改 `electron-builder.json` 中的 `mac.target.arch` 为 `["x64"]`。
+macOS Intel 用户打包前确认 Rust target 为 `x86_64-apple-darwin`。
 
 ### mac下若打开提示“软件已损坏”，可在终端执行`xattr -cr /Applications/FLowZ.app`后再打开
 
@@ -82,7 +82,7 @@ macOS Intel 用户需要修改 `electron-builder.json` 中的 `mac.target.arch` 
 
 ## 🔧 技术栈
 
-- Electron
+- Tauri 2 （Rust 后端）
 - React 18 + TypeScript
 - sing-box 核心
 - Tailwind CSS + shadcn/ui

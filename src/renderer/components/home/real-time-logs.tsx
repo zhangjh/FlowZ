@@ -113,7 +113,28 @@ export function RealTimeLogs() {
     };
 
     addEventListener('logReceived', handleLogReceived);
-    return () => removeEventListener('logReceived', handleLogReceived);
+
+    // 轮询兜底：每 2 秒拉取新日志，防止事件丢失导致不更新
+    let lastCount = 0;
+    const pollTimer = setInterval(async () => {
+      try {
+        const response = await getLogs(500);
+        if (response && response.success && response.data) {
+          const logs = response.data as LogEntry[];
+          if (logs.length !== lastCount) {
+            lastCount = logs.length;
+            setLogs(logs.slice(-MAX_LOGS));
+          }
+        }
+      } catch {
+        // 忽略轮询错误
+      }
+    }, 2000);
+
+    return () => {
+      removeEventListener('logReceived', handleLogReceived);
+      clearInterval(pollTimer);
+    };
   }, []);
 
   const prevTotalSize = useRef(0);
