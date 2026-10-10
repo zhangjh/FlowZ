@@ -28,7 +28,7 @@
     ],
     "targets": "all",
     "resources": [
-      "bundle-resources/*"
+      "bundle-resources/**/*"
     ],
     "createUpdaterArtifacts": false
   },
