@@ -30,11 +30,22 @@ function getIpcRenderer(): ElectronIpcRenderer {
 type EventListener = (...args: any[]) => void;
 
 export class IpcClient {
-  private ipcRenderer: ElectronIpcRenderer;
+  private ipcRenderer: ElectronIpcRenderer | null = null;
   private eventListeners: Map<string, Set<EventListener>> = new Map();
 
+  /**
+   * 延迟获取 ipcRenderer：构造时不抛错（Tauri webview 里没有 window.electron，
+   * 模块顶层实例化不能崩，否则整个前端白屏）。真正调用时才检查。
+   */
+  private get renderer(): ElectronIpcRenderer {
+    if (!this.ipcRenderer) {
+      this.ipcRenderer = getIpcRenderer();
+    }
+    return this.ipcRenderer;
+  }
+
   constructor() {
-    this.ipcRenderer = getIpcRenderer();
+    // 故意不在构造时获取 ipcRenderer，见 renderer getter 的注释
   }
 
   /**
@@ -47,7 +58,7 @@ export class IpcClient {
     try {
       console.log(`[IPC Client] Invoking: ${channel}`, args);
 
-      const response = (await this.ipcRenderer.invoke(channel, args)) as ApiResponse<TResult>;
+      const response = (await this.renderer.invoke(channel, args)) as ApiResponse<TResult>;
 
       if (!response.success) {
         const error = new Error(response.error || 'Unknown error');
@@ -79,7 +90,7 @@ export class IpcClient {
     };
 
     // 注册监听器
-    this.ipcRenderer.on(channel, wrappedListener);
+    this.renderer.on(channel, wrappedListener);
 
     // 记录监听器以便管理
     if (!this.eventListeners.has(channel)) {
@@ -106,7 +117,7 @@ export class IpcClient {
       listener(data);
     };
 
-    this.ipcRenderer.once(channel, wrappedListener);
+    this.renderer.once(channel, wrappedListener);
   }
 
   /**
@@ -116,7 +127,7 @@ export class IpcClient {
    */
   off(channel: string, listener?: EventListener): void {
     if (listener) {
-      this.ipcRenderer.off(channel, listener as any);
+      this.renderer.off(channel, listener as any);
 
       const listeners = this.eventListeners.get(channel);
       if (listeners) {
@@ -128,7 +139,7 @@ export class IpcClient {
 
       console.log(`[IPC Client] Removed listener for: ${channel}`);
     } else {
-      this.ipcRenderer.removeAllListeners(channel);
+      this.renderer.removeAllListeners(channel);
       this.eventListeners.delete(channel);
       console.log(`[IPC Client] Removed all listeners for: ${channel}`);
     }
@@ -139,7 +150,7 @@ export class IpcClient {
    */
   removeAllListeners(): void {
     for (const channel of this.eventListeners.keys()) {
-      this.ipcRenderer.removeAllListeners(channel);
+      this.renderer.removeAllListeners(channel);
     }
     this.eventListeners.clear();
     console.log(`[IPC Client] Removed all listeners`);
@@ -161,9 +172,9 @@ export class IpcClient {
 }
 
 /**
- * 全局 IPC 客户端实例
+ * 全局 IPC 客户端实例（Electron 专用；Tauri 下请用 ipc/index.ts 导出的运行时选择版本）
  */
-export const ipcClient = new IpcClient();
+export const electronIpcClient = new IpcClient();
 
 /**
  * 便捷函数：调用主进程方法
@@ -172,26 +183,26 @@ export async function invoke<TArgs = any, TResult = any>(
   channel: string,
   args?: TArgs
 ): Promise<TResult> {
-  return ipcClient.invoke<TArgs, TResult>(channel, args);
+  return electronIpcClient.invoke<TArgs, TResult>(channel, args);
 }
 
 /**
  * 便捷函数：监听主进程事件
  */
 export function on<T = any>(channel: string, listener: (data: T) => void): () => void {
-  return ipcClient.on<T>(channel, listener);
+  return electronIpcClient.on<T>(channel, listener);
 }
 
 /**
  * 便捷函数：监听主进程事件（仅一次）
  */
 export function once<T = any>(channel: string, listener: (data: T) => void): void {
-  ipcClient.once<T>(channel, listener);
+  electronIpcClient.once<T>(channel, listener);
 }
 
 /**
  * 便捷函数：取消监听主进程事件
  */
 export function off(channel: string, listener?: EventListener): void {
-  ipcClient.off(channel, listener);
+  electronIpcClient.off(channel, listener);
 }

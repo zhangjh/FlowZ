@@ -3,7 +3,7 @@
  * 封装所有 IPC 调用方法，提供类型安全的 API 接口
  */
 
-import { ipcClient } from './ipc-client';
+import { electronIpcClient as ipcClient } from './ipc-client';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import type {
   UserConfig,

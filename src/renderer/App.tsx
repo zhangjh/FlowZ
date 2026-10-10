@@ -8,7 +8,7 @@ import { RulesPage } from './pages/rules-page';
 import { SettingsPage } from './pages/settings-page';
 import { Toaster } from './components/ui/sonner';
 import { ErrorBoundary } from './components/error-boundary';
-import { ipcClient } from './ipc/ipc-client';
+import { ipcClient } from './ipc';
 import { toast } from 'sonner';
 
 function App() {
