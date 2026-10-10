@@ -46,7 +46,26 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Install frontend dependencies
-        run: npm ci
+        shell: bash
+        run: |
+          # 正常路径：严格按 lockfile 安装，保证构建可复现
+          npm ci || {
+            echo "::warning::npm ci 失败（lockfile 与 package.json 不同步或缺少平台可选依赖），回退为重新解析安装"
+            rm -f package-lock.json
+            npm install --no-audit --no-fund
+          }
+
+          # 兜底：lockfile 被平台裁剪时（npm/cli#4828），当前平台会缺少原生二进制，
+          # 这里直接自检；缺失则删除 lockfile 重新解析安装一次，避免编译中途才报 Cannot find native binding
+          if ! node -e "require('@tauri-apps/cli')" 2>/dev/null; then
+            echo "::warning::Tauri CLI 原生绑定缺失，回退为重新解析安装"
+            rm -f package-lock.json
+            npm install --no-audit --no-fund
+            node -e "require('@tauri-apps/cli')" || {
+              echo "::error::@tauri-apps/cli 原生绑定仍缺失，依赖安装异常"
+              exit 1
+            }
+          fi
 
       - name: Build and package (Tauri)
         uses: tauri-apps/tauri-action@v0
