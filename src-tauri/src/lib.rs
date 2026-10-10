@@ -467,94 +467,124 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// 自动更新（tauri-plugin-updater）
+// 自动更新：GitHub Release 检查（无签名，与 Electron 版机制一致）
 // ---------------------------------------------------------------------------
+// 检查 https://api.github.com/repos/zhangjh/FlowZ/releases/latest，
+// 对比当前版本，有新版则返回下载链接，前端弹窗提示用户去下载。
+// 不需要签名，用户手动下载安装包安装。
 
-/// 是否配置了更新签名公钥。用户需运行 `tauri signer generate` 生成密钥对，
-/// 把公钥填入 tauri.conf.json 的 plugins.updater.pubkey，并把私钥配到 CI。
-/// 未配置时更新检查返回明确错误，不崩溃。
-const UPDATER_CONFIGURED: bool = false;
+const GITHUB_REPO: &str = "zhangjh/FlowZ";
 
-#[tauri::command]
-async fn update_check(app: tauri::AppHandle, include_prerelease: bool) -> Result<Value, String> {
-    let result = update_check_inner(&app, include_prerelease).await?;
-    serde_json::to_value(&result).map_err(|e| format!("序列化失败: {}", e))
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    prerelease: bool,
+    assets: Vec<GitHubAsset>,
 }
 
-pub(crate) async fn update_check_inner(
-    app: &tauri::AppHandle,
-    _include_prerelease: bool,
-) -> Result<serde_json::Value, String> {
-    if !UPDATER_CONFIGURED {
-        return Err("自动更新未配置：需要先运行 `tauri signer generate` 生成签名密钥并填入 tauri.conf.json".to_string());
-    }
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    match updater.check().await.map_err(|e| e.to_string())? {
-        Some(update) => Ok(serde_json::json!({
-            "hasUpdate": true,
-            "updateInfo": {
-                "version": update.version,
-                "title": format!("FlowZ {}", update.version),
-                "releaseNotes": update.body.unwrap_or_default(),
-                "downloadUrl": "",
-                "fileSize": 0,
-                "publishedAt": update.date.map(|d| d.to_string()).unwrap_or_default(),
-                "isPrerelease": false,
-                "fileName": "",
-            },
-        })),
-        None => Ok(serde_json::json!({ "hasUpdate": false })),
-    }
+#[derive(serde::Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+fn current_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    // 简单语义版本比较：去掉 v 前缀，按点分段比较数字
+    let parse = |v: &str| -> Vec<u64> {
+        v.trim_start_matches(['v', 'V'])
+            .split('.')
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    parse(latest) > parse(current)
 }
 
 #[tauri::command]
-async fn update_download_install(app: tauri::AppHandle) -> Result<Value, String> {
-    if !UPDATER_CONFIGURED {
-        return Err("自动更新未配置：需要先运行 `tauri signer generate` 生成签名密钥并填入 tauri.conf.json".to_string());
+async fn update_check(_app: tauri::AppHandle, include_prerelease: bool) -> Result<Value, String> {
+    update_check_inner(include_prerelease).await
+}
+
+pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("FlowZ-updater")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let release: GitHubRelease = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("检查更新失败: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("解析 release 信息失败: {}", e))?;
+
+    if release.prerelease && !include_prerelease {
+        return Ok(serde_json::json!({ "hasUpdate": false }));
     }
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("没有可用更新")?;
-    let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    update
-        .download_and_install(
-            {
-                let app = app.clone();
-                let total = total.clone();
-                let downloaded = downloaded.clone();
-                move |chunk_len, content_len| {
-                    if let Some(len) = content_len {
-                        total.store(len, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    downloaded.fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed);
-                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
-                    let d = downloaded.load(std::sync::atomic::Ordering::Relaxed);
-                    let pct = if t > 0 { (d as f64 / t as f64 * 100.0) as u32 } else { 0 };
-                    let _ = app.emit(
-                        "event:updateProgress",
-                        serde_json::json!({
-                            "status": "downloading",
-                            "percentage": pct,
-                            "message": format!("下载中 {}%", pct),
-                        }),
-                    );
-                }
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = app.emit(
-        "event:updateProgress",
-        serde_json::json!({ "status": "downloaded", "percentage": 100, "message": "下载完成，正在安装…" }),
-    );
-    Ok(serde_json::json!({ "success": true }))
+
+    let current = current_version();
+    if !is_newer(&release.tag_name, &current) {
+        return Ok(serde_json::json!({ "hasUpdate": false }));
+    }
+
+    // 按当前平台选安装包
+    let asset = pick_asset(&release.assets);
+    let (download_url, file_name, file_size) = match asset {
+        Some(a) => (a.browser_download_url.clone(), a.name.clone(), a.size),
+        None => (release.html_url.clone(), String::new(), 0),
+    };
+
+    Ok(serde_json::json!({
+        "hasUpdate": true,
+        "updateInfo": {
+            "version": release.tag_name.trim_start_matches(['v', 'V']),
+            "title": release.name.unwrap_or_else(|| format!("FlowZ {}", release.tag_name)),
+            "releaseNotes": release.body.unwrap_or_default(),
+            "downloadUrl": download_url,
+            "fileSize": file_size,
+            "publishedAt": release.published_at.unwrap_or_default(),
+            "isPrerelease": release.prerelease,
+            "fileName": file_name,
+            "releasePage": release.html_url,
+        },
+    }))
+}
+
+/// 按当前平台挑选安装包
+fn pick_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    #[cfg(target_os = "windows")]
+    let keywords = [".exe"];
+    #[cfg(target_os = "macos")]
+    #[cfg(target_arch = "aarch64")]
+    let keywords = [".dmg"];
+    #[cfg(target_os = "macos")]
+    #[cfg(not(target_arch = "aarch64"))]
+    let keywords = [".dmg"];
+    #[cfg(target_os = "linux")]
+    let keywords = [".AppImage", ".deb"];
+
+    assets.iter().find(|a| {
+        let name = a.name.to_lowercase();
+        keywords.iter().any(|k| name.ends_with(k))
+    })
+}
+
+#[tauri::command]
+async fn update_download_install(_app: tauri::AppHandle) -> Result<Value, String> {
+    // 无签名机制下不做自动下载安装，前端拿到 downloadUrl 后打开浏览器让用户手动下载
+    Err("当前版本不支持自动下载安装，请前往 GitHub Release 页面手动下载".to_string())
 }
 
 #[tauri::command]
@@ -687,12 +717,6 @@ pub fn run() {
     ));
 
     let builder = tauri::Builder::default();
-    // 自动更新插件：仅在配置了签名公钥时注册
-    let builder = if UPDATER_CONFIGURED {
-        builder.plugin(tauri_plugin_updater::Builder::new().build())
-    } else {
-        builder
-    };
     builder
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_opener::init())
