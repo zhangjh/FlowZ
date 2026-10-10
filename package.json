@@ -25,7 +25,8 @@
     "package:tauri:mac": "tauri build --target aarch64-apple-darwin && node scripts/tauri-collect.mjs",
     "package:tauri:mac-intel": "tauri build --target x86_64-apple-darwin && node scripts/tauri-collect.mjs",
     "tauri:stage": "node scripts/tauri-stage-resources.mjs",
-    "tauri:collect": "node scripts/tauri-collect.mjs"
+    "tauri:collect": "node scripts/tauri-collect.mjs",
+    "tauri:sync-version": "node scripts/sync-version.mjs"
   },
   "keywords": [
     "proxy",
