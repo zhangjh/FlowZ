@@ -235,4 +235,41 @@ export function useNativeEventListeners() {
       }, RESTARTING_FALLBACK_MS);
     });
   });
+
+  // 托盘操作轮询兜底：Tauri 事件在某些环境下不可靠，每 2 秒检查代理状态和配置
+  // 确保从托盘启动/停止/切换服务器/模式后，前端 UI 能同步
+  useEffect(() => {
+    let lastRunning: boolean | null = null;
+    let lastConfigJson: string | null = null;
+    const timer = setInterval(async () => {
+      try {
+        const { useAppStore } = await import('../store/app-store');
+        const state = useAppStore.getState();
+        // 跳过前端正在操作时，避免冲突
+        if (state.isLoading) return;
+
+        // 检查代理运行状态
+        const status = (await api.proxy.getStatus()) as { running: boolean };
+        const running = !!status?.running;
+        if (lastRunning !== null && lastRunning !== running) {
+          console.log(`[tray-poll] 代理状态变化: ${lastRunning} -> ${running}`);
+          await state.refreshConnectionStatus();
+        }
+        lastRunning = running;
+
+        // 检查配置变化（托盘切换服务器/模式）
+        const cfg = (await api.config.get()) as unknown;
+        const cfgJson = JSON.stringify(cfg);
+        if (lastConfigJson !== null && lastConfigJson !== cfgJson) {
+          console.log('[tray-poll] 配置变化，同步前端');
+          useAppStore.setState({ config: cfg as never });
+          await state.refreshConnectionStatus();
+        }
+        lastConfigJson = cfgJson;
+      } catch (e) {
+        // 静默失败，下次重试
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, []);
 }
