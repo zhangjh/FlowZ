@@ -319,7 +319,7 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = app.emit("event:navigate", serde_json::json!({ "page": "settings" }));
         }
         "update" => {
-            match crate::update_check_inner(&app, false).await {
+            match crate::update_check_inner(false).await {
                 Ok(r) => {
                     let _ = app.emit("event:updateCheckResult", &r);
                 }
