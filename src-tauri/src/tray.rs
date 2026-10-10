@@ -214,6 +214,28 @@ pub async fn refresh_tray_menu(app: &AppHandle) {
         }
         Err(e) => eprintln!("[tray] 刷新菜单失败: {}", e),
     }
+    // 更新托盘图标：连接时彩色，断开时灰色（与原版一致）
+    update_tray_icon(app, running);
+}
+
+/// 更新托盘图标（彩色/灰色）
+pub fn update_tray_icon(app: &AppHandle, connected: bool) {
+    let tray = match app.tray_by_id("main") {
+        Some(t) => t,
+        None => return,
+    };
+    let filename = if connected { "app.png" } else { "app-gray.png" };
+    // 从打包资源目录加载（与 setup_tray 一致）
+    let icon_path = app
+        .path()
+        .resource_dir()
+        .map(|d| d.join(filename))
+        .unwrap_or_else(|_| std::path::PathBuf::from("resources").join(filename));
+    if let Ok(rgba) = image::open(&icon_path).map(|img| img.to_rgba8()) {
+        let (w, h) = (rgba.width(), rgba.height());
+        let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+        let _ = tray.set_icon(Some(icon));
+    }
 }
 
 /// 创建托盘（动态菜单 + 事件分发）
@@ -288,6 +310,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
+        let _ = w.unminimize();
         let _ = w.set_focus();
     }
 }
