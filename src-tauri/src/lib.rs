@@ -419,7 +419,11 @@ pub(crate) async fn switch_group(app: &tauri::AppHandle, group_id: &str) -> Resu
     let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
     let proxy = app.state::<ProxyState>();
     let mut mgr = proxy.lock().await;
-    if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
+    // 代理未运行时只保存配置，不自动启动
+    if !mgr.is_running() {
+        return Ok(());
+    }
+    if mgr.hot_reload_config(app, &cfg).await {
         return Ok(());
     }
     mgr.restart(app, &cfg).await
@@ -434,7 +438,11 @@ pub(crate) async fn switch_proxy_mode(app: &tauri::AppHandle, mode: &str) -> Res
     let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
     let proxy = app.state::<ProxyState>();
     let mut mgr = proxy.lock().await;
-    if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
+    // 代理未运行时只保存配置，不自动启动
+    if !mgr.is_running() {
+        return Ok(());
+    }
+    if mgr.hot_reload_config(app, &cfg).await {
         return Ok(());
     }
     mgr.restart(app, &cfg).await

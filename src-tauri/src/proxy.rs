@@ -422,11 +422,15 @@ impl ProxyManager {
         // 通知前端配置已变更（托盘切换）
         let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
 
-        if self.is_running() && self.hot_reload_config(app, &cfg).await {
+        // 代理未运行时只保存配置，不自动启动
+        if !self.is_running() {
+            return Ok(());
+        }
+        if self.hot_reload_config(app, &cfg).await {
             let _ = app.emit("event:proxyStarted", StartedPayload { pid: self.pid.unwrap_or(0), timestamp: now_iso() });
             return Ok(());
         }
-        // 热更新不可用或失败 → 重启
+        // 热更新失败 → 重启（代理原本就在运行）
         self.restart(app, &cfg).await
     }
 
