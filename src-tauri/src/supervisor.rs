@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 pub type SupervisorCommand = &'static str;
 pub const CMD_START: SupervisorCommand = "start";
@@ -354,10 +356,11 @@ impl PrivilegedSupervisor {
         }
         #[cfg(target_os = "windows")]
         {
-            // 保守判断：tasklist 查询
-            std::process::Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-                .output()
+            // 保守判断：tasklist 查询（CREATE_NO_WINDOW 避免弹控制台）
+            let mut cmd = std::process::Command::new("tasklist");
+            cmd.args(["/FI", &format!("PID eq {}", pid), "/NH"]);
+            cmd.creation_flags(0x08000000);
+            cmd.output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
                 .unwrap_or(false)
         }

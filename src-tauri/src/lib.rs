@@ -159,10 +159,13 @@ async fn proxy_start(
     };
     config::validate_config(&mut cfg)?;
 
+    eprintln!("[proxy_start] 开始启动代理，模式: {}", cfg.proxy_mode_type);
     proxy.lock().await.start(&app, &cfg).await?;
+    eprintln!("[proxy_start] sing-box 启动完成");
 
     // 系统代理模式：设置系统代理（失败不回滚 sing-box，与 Electron 一致）
     if cfg.proxy_mode_type.to_string().to_lowercase() == "systemproxy" {
+        eprintln!("[proxy_start] 设置系统代理...");
         if let Err(e) = sysproxy
             .lock()
             .await
@@ -172,6 +175,7 @@ async fn proxy_start(
             eprintln!("[proxy] 设置系统代理失败: {}", e);
             return Err(e);
         }
+        eprintln!("[proxy_start] 系统代理设置完成");
     }
     // 自动选择服务：配置 + 代理启动后开始健康检查
     {
@@ -546,8 +550,8 @@ async fn update_open_releases() -> Result<Value, String> {
         .arg("https://github.com/zhangjh/FlowZ/releases")
         .spawn();
     #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("cmd")
-        .args(["/c", "start", "https://github.com/zhangjh/FlowZ/releases"])
+    let r = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", "https://github.com/zhangjh/FlowZ/releases"])
         .spawn();
     r.map_err(|e| format!("打开浏览器失败: {}", e))?;
     Ok(serde_json::json!({ "success": true }))
