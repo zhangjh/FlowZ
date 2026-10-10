@@ -290,16 +290,15 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// 托盘菜单事件分发
-async fn handle_menu_event(app: &AppHandle, id: &str) {
-    // 写到实时日志，方便排查
+/// 写托盘日志到实时日志
+fn tray_log(app: &AppHandle, msg: &str) {
     if let Some(logs) = app.try_state::<crate::logs::SharedLogManager>() {
         let entry = logs
             .lock()
             .map(|mut m| {
                 m.add_log(
                     crate::logs::LogLevel::Info,
-                    &format!("[tray] 收到菜单点击: {}", id),
+                    &format!("[tray] {}", msg),
                     "tray",
                 )
             })
@@ -309,20 +308,32 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = app.emit("event:logReceived", &e);
         }
     }
+}
+
+/// 托盘菜单事件分发
+async fn handle_menu_event(app: &AppHandle, id: &str) {
+    tray_log(app, &format!("收到菜单点击: {}", id));
     match id {
         "show" => show_main_window(app),
         "toggle" => {
+            tray_log(app, "执行 toggle");
             let running = match app.try_state::<crate::ProxyState>() {
                 Some(s) => s.lock().await.is_running(),
                 None => false,
             };
             if running {
+                tray_log(app, "正在停止代理...");
                 if let Err(e) = crate::proxy_stop_inner(&app).await {
-                    eprintln!("[tray] 停止代理失败: {}", e);
+                    tray_log(app, &format!("停止代理失败: {}", e));
+                } else {
+                    tray_log(app, "停止代理完成");
                 }
             } else {
+                tray_log(app, "正在启动代理...");
                 if let Err(e) = crate::proxy_start_inner(&app, None).await {
-                    eprintln!("[tray] 启动代理失败: {}", e);
+                    tray_log(app, &format!("启动代理失败: {}", e));
+                } else {
+                    tray_log(app, "启动代理完成");
                 }
             }
             refresh_tray_menu(app).await;
