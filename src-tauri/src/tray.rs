@@ -330,6 +330,8 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
                     tray_log(app, &format!("停止代理失败: {}", e));
                 } else {
                     tray_log(app, "停止代理完成");
+                    // 通知前端刷新（proxyStopped 事件的双保险）
+                    let _ = app.emit("event:configChanged", serde_json::json!({}));
                 }
             } else {
                 tray_log(app, "正在启动代理...");
@@ -337,6 +339,8 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
                     tray_log(app, &format!("启动代理失败: {}", e));
                 } else {
                     tray_log(app, "启动代理完成");
+                    // 通知前端刷新（proxyStarted 事件的双保险）
+                    let _ = app.emit("event:configChanged", serde_json::json!({}));
                 }
             }
             refresh_tray_menu(app).await;

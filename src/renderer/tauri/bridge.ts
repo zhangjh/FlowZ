@@ -62,6 +62,13 @@ const proxyApi = {
 // ---------------------------------------------------------------------------
 // config（Rust: config.rs；updateMode/getValue/setValue 走 get+save 组合）
 // ---------------------------------------------------------------------------
+const appEventsApi = {
+  onNavigate: (listener: Listener<{ page: string }>): Unsubscribe =>
+    onEvent('event:navigate', listener),
+  onUpdateCheckResult: (listener: Listener<unknown>): Unsubscribe =>
+    onEvent('event:updateCheckResult', listener),
+};
+
 const configApi = {
   get: (): Promise<any> => invoke('get_config'),
   save: (config: unknown): Promise<void> => invoke('save_config', { config }),
@@ -253,6 +260,7 @@ export const api = {
   admin: adminApi,
   update: updateApi,
   autoSelect: autoSelectApi,
+  appEvents: appEventsApi,
 };
 
 export default api;

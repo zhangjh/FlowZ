@@ -189,6 +189,8 @@ export function useNativeEventListeners() {
           state.loadConfig();
         }
       }
+      // 托盘切换服务器/模式后，也要刷新连接状态（选中态、按钮状态联动）
+      useAppStore.getState().refreshConnectionStatus();
     });
   };
 

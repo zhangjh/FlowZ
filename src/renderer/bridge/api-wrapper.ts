@@ -525,6 +525,12 @@ export function addEventListener(event: string, listener: (...args: any[]) => vo
     case 'connectionStateChanged':
       unlisten = api.connection.onStateChanged(listener);
       break;
+    case 'navigate':
+      unlisten = (api as any).appEvents.onNavigate(listener);
+      break;
+    case 'updateCheckResult':
+      unlisten = (api as any).appEvents.onUpdateCheckResult(listener);
+      break;
   }
   if (typeof unlisten === 'function') {
     if (!listenerCleanups.has(event)) {
