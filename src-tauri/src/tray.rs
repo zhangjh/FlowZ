@@ -292,6 +292,7 @@ fn show_main_window(app: &AppHandle) {
 
 /// 托盘菜单事件分发
 async fn handle_menu_event(app: &AppHandle, id: &str) {
+    eprintln!("[tray] 收到菜单点击: {}", id);
     match id {
         "show" => show_main_window(app),
         "toggle" => {
