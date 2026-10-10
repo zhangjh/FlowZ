@@ -196,17 +196,21 @@ async fn proxy_start(
         diag("系统代理设置完成");
     }
     diag("proxy_start 全部完成");
-    // 自动选择服务：配置 + 代理启动后开始健康检查
-    {
-        let svc: Arc<autoselect::AutoSelectService> = app.state::<AutoSelectState>().inner().clone();
-        svc.configure(cfg.clone());
+    // 自动选择服务：配置 + 代理启动后开始健康检查（后台，不阻塞返回）
+    // 托盘更新也放后台，让 api.proxy.start 尽早返回，前端按钮及时切换状态
+    let app_bg = app.clone();
+    let cfg_bg = cfg.clone();
+    tauri::async_runtime::spawn(async move {
+        let svc: Arc<autoselect::AutoSelectService> =
+            app_bg.state::<AutoSelectState>().inner().clone();
+        svc.configure(cfg_bg);
         svc.notify_proxy_started(
-            Arc::new(TauriProxyControl { app: app.clone() }),
-            Arc::new(TauriEventEmitter { app: app.clone() }),
+            Arc::new(TauriProxyControl { app: app_bg.clone() }),
+            Arc::new(TauriEventEmitter { app: app_bg.clone() }),
         );
-    }
-    update_tray_tooltip(&app, true).await;
-    tray::refresh_tray_menu(&app);
+        update_tray_tooltip(&app_bg, true).await;
+        tray::refresh_tray_menu(&app_bg);
+    });
     Ok(())
 }
 
