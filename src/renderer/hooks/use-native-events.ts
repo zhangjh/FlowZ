@@ -236,8 +236,9 @@ export function useNativeEventListeners() {
     });
   });
 
-  // 托盘操作同步：窗口获得焦点时检查一次（用户从托盘操作后回到窗口）
-  // 比常驻轮询更省资源，且覆盖托盘切换服务器/模式/启停的场景
+  // 托盘操作同步：窗口可见时每 3 秒检查一次配置/状态
+  // （托盘是原生菜单，操作时不会触发 webview 的 focus 事件）
+  // 不可见时不轮询，节省资源
   useEffect(() => {
     let lastRunning: boolean | null = null;
     let lastConfigJson: string | null = null;
@@ -245,6 +246,8 @@ export function useNativeEventListeners() {
 
     const doSync = async () => {
       if (syncing) return;
+      // 窗口不可见时跳过
+      if (document.visibilityState !== 'visible') return;
       syncing = true;
       try {
         const { useAppStore } = await import('../store/app-store');
@@ -268,6 +271,27 @@ export function useNativeEventListeners() {
         }
         lastRunning = running;
         lastConfigJson = cfgJson;
+
+        // 检查托盘待处理的前端动作（如打开设置页面）
+        try {
+          const pending = await (api as unknown as {
+            appEvents: { getPendingTrayAction: () => Promise<string | null> };
+          }).appEvents.getPendingTrayAction();
+          if (pending && pending.startsWith('navigate:')) {
+            const page = pending.slice('navigate:'.length);
+            const viewMap: Record<string, string> = {
+              settings: 'settings',
+              servers: 'server',
+              home: 'home',
+              rules: 'rules',
+            };
+            const view = viewMap[page] || 'home';
+            console.log(`[tray-sync] 导航到: ${view}`);
+            useAppStore.getState().setCurrentView(view);
+          }
+        } catch {
+          // 忽略
+        }
       } catch {
         // 静默失败
       } finally {
@@ -275,36 +299,15 @@ export function useNativeEventListeners() {
       }
     };
 
-    // 窗口获得焦点时同步
-    const onFocus = async () => {
-      await doSync();
-      // 检查托盘待处理的前端动作（如打开设置页面）
-      try {
-        const pending = await (api as unknown as {
-          appEvents: { getPendingTrayAction: () => Promise<string | null> };
-        }).appEvents.getPendingTrayAction();
-        if (pending && pending.startsWith('navigate:')) {
-          const page = pending.slice('navigate:'.length);
-          const { useAppStore } = await import('../store/app-store');
-          const viewMap: Record<string, string> = {
-            settings: 'settings',
-            servers: 'server',
-            home: 'home',
-            rules: 'rules',
-          };
-          const view = viewMap[page] || 'home';
-          console.log(`[tray-sync] 导航到: ${view}`);
-          useAppStore.getState().setCurrentView(view);
-        }
-      } catch {
-        // 忽略
-      }
-    };
+    // 可见时每 3 秒检查；窗口获得焦点时立即检查一次
+    const timer = setInterval(doSync, 3000);
+    const onFocus = () => doSync();
     window.addEventListener('focus', onFocus);
     // 启动后 3 秒做一次初始同步
     const initTimer = setTimeout(doSync, 3000);
 
     return () => {
+      clearInterval(timer);
       window.removeEventListener('focus', onFocus);
       clearTimeout(initTimer);
     };
