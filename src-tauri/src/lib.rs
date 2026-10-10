@@ -721,6 +721,13 @@ pub fn run() {
             });
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // 关闭窗口时最小化到托盘，不退出应用（与 Electron 版一致）
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_version,
             get_config,

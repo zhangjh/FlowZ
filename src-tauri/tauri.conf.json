@@ -30,7 +30,14 @@
     "resources": [
       "bundle-resources/**/*"
     ],
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese"
+        ]
+      }
+    }
   },
   "identifier": "com.flowz.app",
   "productName": "FlowZ",

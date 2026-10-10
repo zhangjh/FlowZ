@@ -497,34 +497,50 @@ export async function openReleasesPage(): Promise<ApiResponse<void>> {
 /**
  * Event listener functions
  */
+// 监听器清理函数表：key 为 event，value 为 Map<listener, unlisten>
+const listenerCleanups = new Map<string, Map<(...args: any[]) => void, () => void>>();
+
 export function addEventListener(event: string, listener: (...args: any[]) => void): void {
-  // 根据事件类型注册对应的监听器
+  // 根据事件类型注册对应的监听器，并保存清理函数
+  let unlisten: (() => void) | void = undefined;
   switch (event) {
     case 'proxyStarted':
-      api.proxy.onStarted(listener);
+      unlisten = api.proxy.onStarted(listener);
       break;
     case 'proxyStopped':
-      api.proxy.onStopped(listener);
+      unlisten = api.proxy.onStopped(listener);
       break;
     case 'proxyError':
-      api.proxy.onError(listener);
+      unlisten = api.proxy.onError(listener);
       break;
     case 'configChanged':
-      api.config.onChanged(listener);
+      unlisten = api.config.onChanged(listener);
       break;
     case 'logReceived':
-      api.logs.onReceived(listener);
+      unlisten = api.logs.onReceived(listener);
       break;
     case 'statsUpdated':
-      api.stats.onUpdated(listener);
+      unlisten = api.stats.onUpdated(listener);
       break;
     case 'connectionStateChanged':
-      api.connection.onStateChanged(listener);
+      unlisten = api.connection.onStateChanged(listener);
       break;
+  }
+  if (typeof unlisten === 'function') {
+    if (!listenerCleanups.has(event)) {
+      listenerCleanups.set(event, new Map());
+    }
+    listenerCleanups.get(event)!.set(listener, unlisten);
   }
 }
 
-export function removeEventListener(_event: string, _listener: (...args: any[]) => void): void {
-  // Tauri listen 的 unlisten 由返回的清理函数处理
-  // 这里保留接口兼容性
+export function removeEventListener(event: string, listener: (...args: any[]) => void): void {
+  const byEvent = listenerCleanups.get(event);
+  if (byEvent) {
+    const unlisten = byEvent.get(listener);
+    if (unlisten) {
+      unlisten();
+      byEvent.delete(listener);
+    }
+  }
 }

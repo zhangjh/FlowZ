@@ -335,6 +335,12 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
                 let mut mgr = proxy.lock().await;
                 let _ = mgr.shutdown(app).await;
             }
+            // 恢复系统代理设置，避免注册表残留导致断网
+            let sysproxy = app.state::<crate::SysProxyState>();
+            {
+                let mut sp = sysproxy.lock().await;
+                let _ = sp.disable_proxy().await;
+            }
             app.exit(0);
         }
         _ if id.starts_with("server:") => {
