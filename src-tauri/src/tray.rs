@@ -78,7 +78,7 @@ pub fn build_menu(app: &AppHandle, data: &TrayMenuData) -> Result<tauri::menu::M
     };
 
     // 状态文字不带 emoji：Win32 原生菜单（GDI）不支持彩色 emoji 字形，
-    // 颜色反馈改由 IconMenuItem 的彩色圆点图标提供（对应原 Electron 版
+    // 颜色反馈改由 IconMenuItem 的彩色圆点图标提供（对应原版
     // 🔵已连接/⚪已断开/🔴连接异常，那边靠 Chromium 渲染彩色 emoji）。
     let (status_label, status_icon_file) = if data.has_error {
         ("连接异常", "status-error.png")
