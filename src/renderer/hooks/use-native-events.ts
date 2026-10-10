@@ -272,6 +272,31 @@ export function useNativeEventListeners() {
         lastRunning = running;
         lastConfigJson = cfgJson;
 
+        // 同步托盘测速结果到服务器页面
+        try {
+          const results = await (api as unknown as {
+            appEvents: { getTraySpeedtestResults: () => Promise<Array<[string, number | null]>> };
+          }).appEvents.getTraySpeedtestResults();
+          if (results && results.length > 0) {
+            const { useAppStore } = await import('../store/app-store');
+            const store = useAppStore.getState();
+            // 转换为 ServerSpeedResult 格式
+            const speedResults = results.map(([serverId, latency]) => ({
+              serverId,
+              latency: latency ?? null,
+            }));
+            // 只有当结果变化时才更新，避免无限循环
+            const current = JSON.stringify(store.speedTestResults);
+            const next = JSON.stringify(speedResults);
+            if (current !== next) {
+              console.log('[tray-sync] 同步测速结果到服务器页面');
+              useAppStore.setState({ speedTestResults: speedResults as never });
+            }
+          }
+        } catch {
+          // 忽略
+        }
+
         // 检查托盘待处理的前端动作（如打开设置页面）
         try {
           const pending = await (api as unknown as {

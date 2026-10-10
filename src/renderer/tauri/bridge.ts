@@ -69,6 +69,8 @@ const appEventsApi = {
     onEvent('event:updateCheckResult', listener),
   getPendingTrayAction: (): Promise<string | null> =>
     invoke('get_pending_tray_action'),
+  getTraySpeedtestResults: (): Promise<Array<[string, number | null]>> =>
+    invoke('get_tray_speedtest_results'),
 };
 
 const configApi = {

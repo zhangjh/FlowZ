@@ -223,6 +223,17 @@ async fn proxy_start(
 }
 
 /// 停止代理：先禁用系统代理（best-effort），再停 sing-box。
+/// 获取托盘测速结果（供服务器页面同步）
+#[tauri::command]
+async fn get_tray_speedtest_results(
+    map: tauri::State<'_, tray::SpeedResultMap>,
+) -> Result<Vec<(String, Option<u64>)>, String> {
+    Ok(map
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default())
+}
+
 /// 获取并清空托盘待处理的前端动作
 #[tauri::command]
 async fn get_pending_tray_action(
@@ -825,6 +836,7 @@ pub fn run() {
             proxy_restart,
             proxy_get_status,
             get_pending_tray_action,
+            get_tray_speedtest_results,
             proxy_switch_server,
             logs_get,
             logs_clear,
