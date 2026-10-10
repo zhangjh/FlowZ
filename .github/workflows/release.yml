@@ -18,13 +18,16 @@ jobs:
         include:
           - os: windows-latest
             platform: win
-            args: '--bundles nsis'
+            target: x86_64-pc-windows-msvc
+            extraArgs: '--bundles nsis'
           - os: macos-14
             platform: mac
-            args: '--target aarch64-apple-darwin'
+            target: aarch64-apple-darwin
+            extraArgs: ''
           - os: ubuntu-22.04
             platform: linux
-            args: ''
+            target: x86_64-unknown-linux-gnu
+            extraArgs: '--bundles deb,rpm,appimage'
 
     steps:
       - name: Checkout code
@@ -38,6 +41,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
         if: matrix.platform == 'linux'
@@ -72,7 +77,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: ${{ matrix.args }}
+          args: '--target ${{ matrix.target }} ${{ matrix.extraArgs }}'
 
       - name: Collect artifacts to dist-package/
         run: node scripts/tauri-collect.mjs
@@ -86,6 +91,7 @@ jobs:
             dist-package/*.dmg
             dist-package/*.AppImage
             dist-package/*.deb
+            dist-package/*.rpm
           retention-days: 5
 
   create-release:
@@ -137,3 +143,4 @@ jobs:
             artifacts/**/*.dmg
             artifacts/**/*.AppImage
             artifacts/**/*.deb
+            artifacts/**/*.rpm
