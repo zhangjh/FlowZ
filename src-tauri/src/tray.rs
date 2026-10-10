@@ -51,22 +51,51 @@ fn truncate_label(s: &str, max: usize) -> String {
     }
 }
 
+/// 解析打包资源路径（bundle-resources 下）。
+/// 优先 resource_dir/bundle-resources/<name>（打包后布局），
+/// 回退 resource_dir/<name> 与源码运行时的 resources/<name>。
+fn resolve_resource(app: &AppHandle, name: &str) -> Option<std::path::PathBuf> {
+    let rd = app.path().resource_dir().ok()?;
+    let candidates = [
+        rd.join("bundle-resources").join(name),
+        rd.join(name),
+        std::path::PathBuf::from("resources").join(name),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// 加载 PNG 为 Tauri Image（RGBA）
+fn load_image(path: &std::path::Path) -> Option<tauri::image::Image<'static>> {
+    let rgba = image::open(path).ok()?.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some(tauri::image::Image::new_owned(rgba.into_raw(), w, h))
+}
+
 pub fn build_menu(app: &AppHandle, data: &TrayMenuData) -> Result<tauri::menu::Menu<tauri::Wry>, String> {
     use tauri::menu::{
-        CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+        CheckMenuItemBuilder, IconMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem,
+        SubmenuBuilder,
     };
 
-    let status_label = if data.has_error {
-        "🔴 连接异常"
+    // 状态文字不带 emoji：Win32 原生菜单（GDI）不支持彩色 emoji 字形，
+    // 颜色反馈改由 IconMenuItem 的彩色圆点图标提供（对应原 Electron 版
+    // 🔵已连接/⚪已断开/🔴连接异常，那边靠 Chromium 渲染彩色 emoji）。
+    let (status_label, status_icon_file) = if data.has_error {
+        ("连接异常", "status-error.png")
     } else if data.is_running {
-        "🔵 已连接"
+        ("已连接", "status-connected.png")
     } else {
-        "⚪ 已断开"
+        ("已断开", "status-disconnected.png")
     };
-    // 状态项不禁用，让 emoji 显示彩色（原版是 disabled 灰色，用户要求彩色反馈）
-    let status = MenuItemBuilder::with_id("status", status_label)
-        .build(app)
-        .map_err(|e| e.to_string())?;
+    let mut status_builder = IconMenuItemBuilder::with_id("status", status_label);
+    if let Some(p) = resolve_resource(app, status_icon_file) {
+        if let Some(img) = load_image(&p) {
+            status_builder = status_builder.icon(img);
+        }
+    } else {
+        eprintln!("[tray] 状态图标缺失: {}", status_icon_file);
+    }
+    let status = status_builder.build(app).map_err(|e| e.to_string())?;
 
     let toggle = MenuItemBuilder::with_id(
         "toggle",
@@ -228,27 +257,16 @@ pub fn update_tray_icon(app: &AppHandle, connected: bool) {
         }
     };
     let filename = if connected { "app.png" } else { "app-gray.png" };
-    // 路径解析与 setup_tray 一致：优先 resource_dir，其次回退到 resources/
-    let icon_path = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|r| r.join(filename))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("resources").join(filename));
-    eprintln!("[tray] update_tray_icon: connected={}, path={:?}, exists={}", connected, icon_path, icon_path.exists());
-    match image::open(&icon_path).map(|img| img.to_rgba8()) {
-        Ok(rgba) => {
-            let (w, h) = (rgba.width(), rgba.height());
-            let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
-            match tray.set_icon(Some(icon)) {
-                Ok(_) => eprintln!("[tray] update_tray_icon: 图标已更新"),
-                Err(e) => eprintln!("[tray] update_tray_icon: set_icon 失败: {}", e),
-            }
-        }
-        Err(e) => {
-            eprintln!("[tray] update_tray_icon: 加载失败: {}", e);
-        }
+    let Some(icon_path) = resolve_resource(app, filename) else {
+        eprintln!("[tray] update_tray_icon: 找不到图标资源 {}", filename);
+        return;
+    };
+    match load_image(&icon_path) {
+        Some(icon) => match tray.set_icon(Some(icon)) {
+            Ok(_) => eprintln!("[tray] update_tray_icon: 图标已更新 ({})", filename),
+            Err(e) => eprintln!("[tray] update_tray_icon: set_icon 失败: {}", e),
+        },
+        None => eprintln!("[tray] update_tray_icon: 加载失败: {:?}", icon_path),
     }
 }
 
@@ -256,25 +274,11 @@ pub fn update_tray_icon(app: &AppHandle, connected: bool) {
 pub fn setup_tray(app: &AppHandle) -> Result<(), String> {
     use tauri::tray::{MouseButton, TrayIconBuilder};
 
-    let icon_path = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|r| r.join("bundle-resources").join("app-gray.png"))
-        .filter(|p| p.exists())
-        .or_else(|| {
-            app.path()
-                .resource_dir()
-                .ok()
-                .map(|r| r.join("app-gray.png"))
-                .filter(|p| p.exists())
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("resources/app-gray.png"));
-    let rgba = image::open(&icon_path)
-        .map_err(|e| format!("加载托盘图标失败: {}", e))?
-        .to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+    let icon_path = resolve_resource(app, "app-gray.png")
+        .ok_or_else(|| "找不到托盘图标 app-gray.png".to_string())?;
+    let icon = load_image(&icon_path).ok_or_else(|| {
+        format!("加载托盘图标失败: {:?}", icon_path)
+    })?;
 
     let speeds = app
         .try_state::<SpeedResultMap>()

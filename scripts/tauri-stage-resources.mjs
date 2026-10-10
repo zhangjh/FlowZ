@@ -7,6 +7,7 @@
  *   bundle-resources/sing-box[.exe]
  *   bundle-resources/data/*.srs
  *   bundle-resources/app.png / app-gray.png
+ *   bundle-resources/status-{connected,disconnected,error}.png（托盘菜单状态圆点）
  */
 import { cpSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -35,7 +36,7 @@ mkdirSync(join(out, 'data'), { recursive: true });
 
 cpSync(binSrc, join(out, binName));
 cpSync(join(root, 'resources', 'data'), join(out, 'data'), { recursive: true });
-for (const icon of ['app.png', 'app-gray.png']) {
+for (const icon of ['app.png', 'app-gray.png', 'status-connected.png', 'status-disconnected.png', 'status-error.png']) {
   const src = join(root, 'resources', icon);
   if (existsSync(src)) cpSync(src, join(out, icon));
 }
