@@ -9,6 +9,8 @@
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 fn parse_resolv_conf(path: &str) -> Vec<String> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -74,7 +76,9 @@ fn get_linux_dns_servers() -> Vec<String> {
 #[cfg(target_os = "windows")]
 fn get_windows_dns_servers() -> Vec<String> {
     // 方法 1: PowerShell
-    if let Ok(out) = { let mut c = Command::new("powershell"); #[cfg(target_os = "windows")] c.creation_flags(0x08000000); c }
+    let mut ps_cmd = Command::new("powershell");
+    ps_cmd.creation_flags(0x08000000); // 不弹控制台
+    if let Ok(out) = ps_cmd
         .args(["-NoProfile", "-Command",
                "Get-DnsClientServerAddress -AddressFamily IPv4,IPv6 | Select-Object -ExpandProperty ServerAddresses"])
         .output()
@@ -90,7 +94,10 @@ fn get_windows_dns_servers() -> Vec<String> {
         }
     }
     // 方法 2: ipconfig /all
-    if let Ok(out) = { let mut c = Command::new("ipconfig"); c.arg("/all"); #[cfg(target_os = "windows")] c.creation_flags(0x08000000); c.output() } {
+    let mut ipconfig_cmd = Command::new("ipconfig");
+    ipconfig_cmd.arg("/all");
+    ipconfig_cmd.creation_flags(0x08000000); // 不弹控制台
+    if let Ok(out) = ipconfig_cmd.output() {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut servers = Vec::new();
         for line in text.lines() {
