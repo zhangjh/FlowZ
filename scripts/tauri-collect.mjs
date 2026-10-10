@@ -2,7 +2,7 @@
  * Tauri 打包后：把 src-tauri/target/<triple>/release/bundle/ 下的产物
  * 集中拷到根目录 dist-package/（与之前 electron-builder 的输出目录一致）。
  */
-import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { renameSync, mkdirSync, rmSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,7 +42,7 @@ for (const triple of triples) {
   const bundleDir = join(root, 'src-tauri', 'target', triple, 'release', 'bundle');
   for (const f of collectFiles(bundleDir, exts)) {
     const dest = join(outDir, basename(f));
-    cpSync(f, dest);
+    renameSync(f, dest);
     console.log(`[tauri-collect] ${f} -> ${dest}`);
     copied++;
   }
