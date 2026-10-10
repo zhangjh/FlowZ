@@ -147,7 +147,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
       }
 
-      await api.proxy.start(currentConfig);
+      // proxy_start 30 秒超时保护：避免后端 hang 住时前端无限卡"测速中"
+      const startTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('启动代理超时（30秒）：后端无响应，请检查日志')), 30000)
+      );
+      await Promise.race([api.proxy.start(currentConfig), startTimeout]);
       // 测试完成，进入连接阶段
       set({ proxyPhase: 'connecting' });
       // 启动成功后不立即设置 isLoading = false，而是等待状态轮询完成
@@ -380,16 +384,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const proxyStatus = await api.proxy.getStatus();
       const current = get().connectionStatus;
+      const ps = proxyStatus as { running: boolean; pid?: number; uptime?: number; error?: string };
       const next: ConnectionStatus = {
         proxyCore: {
-          running: proxyStatus.running,
-          pid: proxyStatus.pid,
-          uptime: proxyStatus.uptime,
-          error: proxyStatus.error,
+          running: ps.running,
+          pid: ps.pid,
+          uptime: ps.uptime,
+          error: ps.error,
         },
         proxy: {
-          enabled: proxyStatus.running,
-          server: proxyStatus.currentServer?.name,
+          enabled: ps.running,
+          server: (ps as { currentServer?: { name?: string } }).currentServer?.name,
         },
         proxyModeType: get().config?.proxyModeType || 'systemProxy',
       };
@@ -403,6 +408,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         current.proxyModeType !== next.proxyModeType
       ) {
         set({ connectionStatus: next });
+      }
+      // 代理实际在运行但 store 有残留 error（如超时后实际连上了），清除错误状态
+      if (next.proxyCore.running && get().error) {
+        set({ error: null });
       }
     } catch (error) {
       console.error('Failed to refresh connection status:', error);
@@ -569,7 +578,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadAutoSelectStatus: async () => {
     try {
       const status = await api.autoSelect.getStatus();
-      set({ autoSelectStatus: status });
+      set({ autoSelectStatus: status as never });
     } catch (error) {
       console.error('Failed to load auto-select status:', error);
     }
@@ -578,7 +587,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   testAllServers: async (serverIds?: string[]) => {
     set({ isSpeedTesting: true, error: null });
     try {
-      const results = await api.autoSelect.testServers(serverIds);
+      const results = (await api.autoSelect.testServers(serverIds)) as ServerSpeedResult[];
       set({ speedTestResults: results });
       // Also refresh auto-select status
       await get().loadAutoSelectStatus();

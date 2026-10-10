@@ -1,5 +1,5 @@
 /**
- * React hook for listening to IPC events from Electron main process
+ * React hook for listening to IPC events from Tauri backend
  */
 
 import { useEffect } from 'react';
@@ -189,6 +189,8 @@ export function useNativeEventListeners() {
           state.loadConfig();
         }
       }
+      // 托盘切换服务器/模式后，也要刷新连接状态（选中态、按钮状态联动）
+      useAppStore.getState().refreshConnectionStatus();
     });
   };
 
@@ -233,4 +235,139 @@ export function useNativeEventListeners() {
       }, RESTARTING_FALLBACK_MS);
     });
   });
+
+  // 托盘操作同步：窗口可见时每 3 秒检查一次配置/状态
+  // （托盘是原生菜单，操作时不会触发 webview 的 focus 事件）
+  // 不可见时不轮询，节省资源
+  useEffect(() => {
+    let lastRunning: boolean | null = null;
+    let lastConfigJson: string | null = null;
+    let syncing = false;
+
+    const doSync = async () => {
+      if (syncing) return;
+      // 窗口不可见时跳过
+      if (document.visibilityState !== 'visible') return;
+      syncing = true;
+      try {
+        const { useAppStore } = await import('../store/app-store');
+        const state = useAppStore.getState();
+        if (state.isLoading) return;
+
+        const status = (await api.proxy.getStatus()) as { running: boolean };
+        const running = !!status?.running;
+        const cfg = (await api.config.get()) as unknown;
+        const cfgJson = JSON.stringify(cfg);
+
+        const runningChanged = lastRunning !== null && lastRunning !== running;
+        const configChanged = lastConfigJson !== null && lastConfigJson !== cfgJson;
+
+        if (runningChanged || configChanged) {
+          console.log('[tray-sync] 检测到托盘操作，同步前端');
+          if (configChanged) {
+            useAppStore.setState({ config: cfg as never });
+          }
+          await state.refreshConnectionStatus();
+        }
+        lastRunning = running;
+        lastConfigJson = cfgJson;
+
+        // 同步托盘测速结果到服务器页面
+        try {
+          const results = await (api as unknown as {
+            appEvents: { getTraySpeedtestResults: () => Promise<Array<[string, number | null]>> };
+          }).appEvents.getTraySpeedtestResults();
+          if (results && results.length > 0) {
+            const { useAppStore } = await import('../store/app-store');
+            const store = useAppStore.getState();
+            // 转换为 ServerSpeedResult 格式
+            const speedResults = results.map(([serverId, latency]) => ({
+              serverId,
+              latency: latency ?? null,
+            }));
+            // 只有当结果变化时才更新，避免无限循环
+            const current = JSON.stringify(store.speedTestResults);
+            const next = JSON.stringify(speedResults);
+            if (current !== next) {
+              console.log('[tray-sync] 同步测速结果到服务器页面');
+              useAppStore.setState({ speedTestResults: speedResults as never });
+            }
+          }
+        } catch {
+          // 忽略
+        }
+
+        // 检查托盘待处理的前端动作（如打开设置页面）
+        try {
+          const pending = await (api as unknown as {
+            appEvents: { getPendingTrayAction: () => Promise<string | null> };
+          }).appEvents.getPendingTrayAction();
+          if (pending && pending.startsWith('navigate:')) {
+            const page = pending.slice('navigate:'.length);
+            const viewMap: Record<string, string> = {
+              settings: 'settings',
+              servers: 'server',
+              home: 'home',
+              rules: 'rules',
+            };
+            const view = viewMap[page] || 'home';
+            console.log(`[tray-sync] 导航到: ${view}`);
+            useAppStore.getState().setCurrentView(view);
+          }
+        } catch {
+          // 忽略
+        }
+      } catch {
+        // 静默失败
+      } finally {
+        syncing = false;
+      }
+    };
+
+    // 可见时每 3 秒检查；窗口获得焦点时立即检查一次
+    const timer = setInterval(async () => {
+      await doSync();
+      // 检查托盘测速是否完成（版本号变化则弹窗）
+      try {
+        const apiTyped = api as unknown as {
+          appEvents: {
+            getTraySpeedtestVersion: () => Promise<number>;
+            getTraySpeedtestResults: () => Promise<Array<[string, number | null]>>;
+          };
+        };
+        const version = await apiTyped.appEvents.getTraySpeedtestVersion();
+        const lastVersion = (window as unknown as { __lastSpeedtestVersion?: number }).__lastSpeedtestVersion ?? 0;
+        if (version > lastVersion) {
+          (window as unknown as { __lastSpeedtestVersion?: number }).__lastSpeedtestVersion = version;
+          console.log('[tray-sync] 检测到托盘测速完成，打开结果弹窗');
+          // 拉取结果并通过自定义事件通知 App 打开弹窗
+          const results = await apiTyped.appEvents.getTraySpeedtestResults();
+          // 需要服务器名称和协议，从配置里查
+          const { useAppStore } = await import('../store/app-store');
+          const cfg = useAppStore.getState().config;
+          const formatted = results.map(([serverId, latency]) => {
+            const srv = cfg?.servers?.find((s: { id: string }) => s.id === serverId);
+            return {
+              name: (srv as { name?: string })?.name || serverId,
+              protocol: ((srv as { protocol?: string })?.protocol || '').toUpperCase(),
+              latency,
+            };
+          });
+          window.dispatchEvent(new CustomEvent('tray-speedtest-done', { detail: formatted }));
+        }
+      } catch {
+        // 忽略
+      }
+    }, 3000);
+    const onFocus = () => doSync();
+    window.addEventListener('focus', onFocus);
+    // 启动后 3 秒做一次初始同步
+    const initTimer = setTimeout(doSync, 3000);
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      clearTimeout(initTimer);
+    };
+  }, []);
 }

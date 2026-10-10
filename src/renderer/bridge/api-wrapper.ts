@@ -1,9 +1,10 @@
 /**
  * API wrapper - 适配层
- * 将 Electron IPC API 适配为原 WPF 项目的 API 接口
+ * 将 Tauri IPC API 适配为原 WPF 项目的 API 接口
  */
 
-import { api } from '../ipc/api-client';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { api } from '../ipc';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 import type { ApiResponse, UserConfig, ServerConfig, DomainRule } from './types';
 
@@ -236,7 +237,7 @@ export async function getVersionInfo(): Promise<
  */
 export async function openExternal(url: string): Promise<ApiResponse<boolean>> {
   try {
-    await window.electron.ipcRenderer.invoke('shell:openExternal', url);
+    await openUrl(url);
     return { success: true, data: true };
   } catch (error: any) {
     return { success: false, error: error?.message };
@@ -432,40 +433,52 @@ export async function checkForUpdates(): Promise<
   }>
 > {
   try {
-    const result = await api.update.check();
+    const result = (await api.update.check()) as {
+      hasUpdate: boolean;
+      updateInfo?: {
+        version: string;
+        title: string;
+        releaseNotes: string;
+        downloadUrl: string;
+        fileSize: number;
+        publishedAt: string;
+        isPrerelease: boolean;
+        fileName: string;
+      };
+    } | undefined;
     return { success: true, data: result };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function downloadUpdate(updateInfo: any): Promise<ApiResponse<string>> {
+export async function downloadUpdate(_updateInfo: any): Promise<ApiResponse<string>> {
   try {
-    const result = await api.update.download(updateInfo);
-    if (result.success && result.filePath) {
-      return { success: true, data: result.filePath };
+    const result = await api.update.download();
+    if (result.success) {
+      return { success: true, data: '' };
     }
-    return { success: false, error: result.error || '下载失败' };
+    return { success: false, error: '下载失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function installUpdate(filePath: string): Promise<ApiResponse<void>> {
+export async function installUpdate(_filePath: string): Promise<ApiResponse<void>> {
   try {
-    const result = await api.update.install(filePath);
+    const result = await api.update.install();
     if (result.success) {
       return { success: true };
     }
-    return { success: false, error: result.error || '安装失败' };
+    return { success: false, error: '安装失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function skipUpdateVersion(version: string): Promise<ApiResponse<void>> {
+export async function skipUpdateVersion(_version: string): Promise<ApiResponse<void>> {
   try {
-    await api.update.skip(version);
+    await api.update.skip();
     return { success: true };
   } catch (error: any) {
     return { success: false, error: error?.message };
@@ -484,34 +497,56 @@ export async function openReleasesPage(): Promise<ApiResponse<void>> {
 /**
  * Event listener functions
  */
+// 监听器清理函数表：key 为 event，value 为 Map<listener, unlisten>
+const listenerCleanups = new Map<string, Map<(...args: any[]) => void, () => void>>();
+
 export function addEventListener(event: string, listener: (...args: any[]) => void): void {
-  // 根据事件类型注册对应的监听器
+  // 根据事件类型注册对应的监听器，并保存清理函数
+  let unlisten: (() => void) | void = undefined;
   switch (event) {
     case 'proxyStarted':
-      api.proxy.onStarted(listener);
+      unlisten = api.proxy.onStarted(listener);
       break;
     case 'proxyStopped':
-      api.proxy.onStopped(listener);
+      unlisten = api.proxy.onStopped(listener);
       break;
     case 'proxyError':
-      api.proxy.onError(listener);
+      unlisten = api.proxy.onError(listener);
       break;
     case 'configChanged':
-      api.config.onChanged(listener);
+      unlisten = api.config.onChanged(listener);
       break;
     case 'logReceived':
-      api.logs.onReceived(listener);
+      unlisten = api.logs.onReceived(listener);
       break;
     case 'statsUpdated':
-      api.stats.onUpdated(listener);
+      unlisten = api.stats.onUpdated(listener);
       break;
     case 'connectionStateChanged':
-      api.connection.onStateChanged(listener);
+      unlisten = api.connection.onStateChanged(listener);
       break;
+    case 'navigate':
+      unlisten = (api as any).appEvents.onNavigate(listener);
+      break;
+    case 'updateCheckResult':
+      unlisten = (api as any).appEvents.onUpdateCheckResult(listener);
+      break;
+  }
+  if (typeof unlisten === 'function') {
+    if (!listenerCleanups.has(event)) {
+      listenerCleanups.set(event, new Map());
+    }
+    listenerCleanups.get(event)!.set(listener, unlisten);
   }
 }
 
-export function removeEventListener(_event: string, _listener: (...args: any[]) => void): void {
-  // Electron IPC 的 removeListener 由返回的清理函数处理
-  // 这里保留接口兼容性
+export function removeEventListener(event: string, listener: (...args: any[]) => void): void {
+  const byEvent = listenerCleanups.get(event);
+  if (byEvent) {
+    const unlisten = byEvent.get(listener);
+    if (unlisten) {
+      unlisten();
+      byEvent.delete(listener);
+    }
+  }
 }

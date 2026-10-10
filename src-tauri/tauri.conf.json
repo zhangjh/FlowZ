@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "height": 800,
+        "title": "FlowZ",
+        "width": 1200
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "npm run tauri:sync-version && npm run tauri:stage && npm run build:renderer",
+    "beforeDevCommand": "npm run tauri:stage && npm run dev:renderer",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist/renderer",
+    "beforeBundleCommand": "npm run tauri:stage"
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "../build/icon.ico",
+      "../build/icon.icns",
+      "../build/icon.png"
+    ],
+    "targets": "all",
+    "resources": [
+      "bundle-resources/**/*"
+    ],
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "installerHooks": "./nsis-hooks.nsh",
+        "languages": [
+          "SimpChinese"
+        ],
+        "installerIcon": "../build/icon.ico",
+        "uninstallerIcon": "../build/icon.ico"
+      }
+    }
+  },
+  "identifier": "com.flowz.app",
+  "productName": "FlowZ",
+  "plugins": {}
+}
