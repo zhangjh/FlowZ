@@ -222,7 +222,10 @@ pub async fn refresh_tray_menu(app: &AppHandle) {
 pub fn update_tray_icon(app: &AppHandle, connected: bool) {
     let tray = match app.tray_by_id("main") {
         Some(t) => t,
-        None => return,
+        None => {
+            eprintln!("[tray] update_tray_icon: 找不到托盘");
+            return;
+        }
     };
     let filename = if connected { "app.png" } else { "app-gray.png" };
     // 从打包资源目录加载（与 setup_tray 一致）
@@ -231,10 +234,17 @@ pub fn update_tray_icon(app: &AppHandle, connected: bool) {
         .resource_dir()
         .map(|d| d.join(filename))
         .unwrap_or_else(|_| std::path::PathBuf::from("resources").join(filename));
-    if let Ok(rgba) = image::open(&icon_path).map(|img| img.to_rgba8()) {
-        let (w, h) = (rgba.width(), rgba.height());
-        let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
-        let _ = tray.set_icon(Some(icon));
+    eprintln!("[tray] update_tray_icon: connected={}, path={:?}, exists={}", connected, icon_path, icon_path.exists());
+    match image::open(&icon_path).map(|img| img.to_rgba8()) {
+        Ok(rgba) => {
+            let (w, h) = (rgba.width(), rgba.height());
+            let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
+            let _ = tray.set_icon(Some(icon));
+            eprintln!("[tray] update_tray_icon: 图标已更新");
+        }
+        Err(e) => {
+            eprintln!("[tray] update_tray_icon: 加载失败: {}", e);
+        }
     }
 }
 
