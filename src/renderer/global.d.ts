@@ -1,12 +1,10 @@
 /**
- * 全局类型声明
+ * 全局类型声明（Tauri）
  */
-
-import { ElectronAPI } from '../main/preload';
 
 declare global {
   interface Window {
-    electron: ElectronAPI;
+    __TAURI_INTERNALS__?: unknown;
   }
 }
 

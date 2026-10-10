@@ -380,16 +380,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const proxyStatus = await api.proxy.getStatus();
       const current = get().connectionStatus;
+      const ps = proxyStatus as { running: boolean; pid?: number; uptime?: number; error?: string };
       const next: ConnectionStatus = {
         proxyCore: {
-          running: proxyStatus.running,
-          pid: proxyStatus.pid,
-          uptime: proxyStatus.uptime,
-          error: proxyStatus.error,
+          running: ps.running,
+          pid: ps.pid,
+          uptime: ps.uptime,
+          error: ps.error,
         },
         proxy: {
-          enabled: proxyStatus.running,
-          server: proxyStatus.currentServer?.name,
+          enabled: ps.running,
+          server: (ps as { currentServer?: { name?: string } }).currentServer?.name,
         },
         proxyModeType: get().config?.proxyModeType || 'systemProxy',
       };
@@ -569,7 +570,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadAutoSelectStatus: async () => {
     try {
       const status = await api.autoSelect.getStatus();
-      set({ autoSelectStatus: status });
+      set({ autoSelectStatus: status as never });
     } catch (error) {
       console.error('Failed to load auto-select status:', error);
     }
@@ -578,7 +579,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   testAllServers: async (serverIds?: string[]) => {
     set({ isSpeedTesting: true, error: null });
     try {
-      const results = await api.autoSelect.testServers(serverIds);
+      const results = (await api.autoSelect.testServers(serverIds)) as ServerSpeedResult[];
       set({ speedTestResults: results });
       // Also refresh auto-select status
       await get().loadAutoSelectStatus();

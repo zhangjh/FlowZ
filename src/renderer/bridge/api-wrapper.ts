@@ -1,8 +1,9 @@
 /**
  * API wrapper - 适配层
- * 将 Electron IPC API 适配为原 WPF 项目的 API 接口
+ * 将 Tauri IPC API 适配为原 WPF 项目的 API 接口
  */
 
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { api } from '../ipc';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 import type { ApiResponse, UserConfig, ServerConfig, DomainRule } from './types';
@@ -236,7 +237,7 @@ export async function getVersionInfo(): Promise<
  */
 export async function openExternal(url: string): Promise<ApiResponse<boolean>> {
   try {
-    await window.electron.ipcRenderer.invoke('shell:openExternal', url);
+    await openUrl(url);
     return { success: true, data: true };
   } catch (error: any) {
     return { success: false, error: error?.message };
@@ -432,40 +433,52 @@ export async function checkForUpdates(): Promise<
   }>
 > {
   try {
-    const result = await api.update.check();
+    const result = (await api.update.check()) as {
+      hasUpdate: boolean;
+      updateInfo?: {
+        version: string;
+        title: string;
+        releaseNotes: string;
+        downloadUrl: string;
+        fileSize: number;
+        publishedAt: string;
+        isPrerelease: boolean;
+        fileName: string;
+      };
+    } | undefined;
     return { success: true, data: result };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function downloadUpdate(updateInfo: any): Promise<ApiResponse<string>> {
+export async function downloadUpdate(_updateInfo: any): Promise<ApiResponse<string>> {
   try {
-    const result = await api.update.download(updateInfo);
-    if (result.success && result.filePath) {
-      return { success: true, data: result.filePath };
+    const result = await api.update.download();
+    if (result.success) {
+      return { success: true, data: '' };
     }
-    return { success: false, error: result.error || '下载失败' };
+    return { success: false, error: '下载失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function installUpdate(filePath: string): Promise<ApiResponse<void>> {
+export async function installUpdate(_filePath: string): Promise<ApiResponse<void>> {
   try {
-    const result = await api.update.install(filePath);
+    const result = await api.update.install();
     if (result.success) {
       return { success: true };
     }
-    return { success: false, error: result.error || '安装失败' };
+    return { success: false, error: '安装失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function skipUpdateVersion(version: string): Promise<ApiResponse<void>> {
+export async function skipUpdateVersion(_version: string): Promise<ApiResponse<void>> {
   try {
-    await api.update.skip(version);
+    await api.update.skip();
     return { success: true };
   } catch (error: any) {
     return { success: false, error: error?.message };
@@ -512,6 +525,6 @@ export function addEventListener(event: string, listener: (...args: any[]) => vo
 }
 
 export function removeEventListener(_event: string, _listener: (...args: any[]) => void): void {
-  // Electron IPC 的 removeListener 由返回的清理函数处理
+  // Tauri listen 的 unlisten 由返回的清理函数处理
   // 这里保留接口兼容性
 }

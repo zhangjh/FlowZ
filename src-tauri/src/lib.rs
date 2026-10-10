@@ -672,6 +672,8 @@ pub fn run() {
     };
     builder
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_os::init())
         .manage(shared_logs)
         .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))

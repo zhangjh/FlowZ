@@ -27,6 +27,8 @@ percent-encoding = "2"
 tokio = { version = "1", features = ["process", "time", "sync", "rt", "io-util", "macros"] }
 libc = "0.2"
 tauri-plugin-autostart = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-os = "2"
 tauri-plugin-updater = "2"
 image = "0.25"
 regex = "1"

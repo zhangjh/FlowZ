@@ -11,8 +11,7 @@ import {
   installUpdate,
   openExternal,
 } from '@/bridge/api-wrapper';
-import { api } from '@/ipc/api-client';
-import type { UpdateProgress } from '@/ipc/api-client';
+import { api } from '@/ipc';
 
 interface VersionInfo {
   appVersion: string;
@@ -62,15 +61,16 @@ export function AboutSettings() {
     setDownloadProgress(0);
 
     // 订阅进度更新
-    progressUnsubscribeRef.current = api.update.onProgress((progress: UpdateProgress) => {
-      if (progress.status === 'downloading') {
-        setDownloadProgress(progress.percentage);
-      } else if (progress.status === 'downloaded') {
+    progressUnsubscribeRef.current = api.update.onProgress((progress: unknown) => {
+      const p = progress as { status: string; percentage?: number; error?: string; message?: string };
+      if (p.status === 'downloading') {
+        setDownloadProgress(p.percentage ?? 0);
+      } else if (p.status === 'downloaded') {
         setDownloadProgress(100);
-      } else if (progress.status === 'error') {
+      } else if (p.status === 'error') {
         setDownloading(false);
         toast.error('下载失败', {
-          description: progress.error || progress.message,
+          description: p.error || p.message,
           action: {
             label: '手动下载',
             onClick: () => openExternal(updateInfo.downloadUrl),

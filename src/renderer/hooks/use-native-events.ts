@@ -1,5 +1,5 @@
 /**
- * React hook for listening to IPC events from Electron main process
+ * React hook for listening to IPC events from Tauri backend
  */
 
 import { useEffect } from 'react';
