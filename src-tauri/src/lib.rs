@@ -761,8 +761,24 @@ async fn autoselect_test_all(
     autoselect: tauri::State<'_, AutoSelectState>,
 ) -> Result<Value, String> {
     let cfg = config::load_config()?;
-    let svc: Arc<autoselect::AutoSelectService> = autoselect.inner().clone();
-    let results = svc.test_all_servers(cfg.servers.clone()).await;
+    // 直接用正确的 sing-box 路径测速，不依赖 AutoSelectService 初始化时的开发期路径
+    let singbox_path = proxy::resolve_singbox_path(&app)?;
+    let work_dir = config::user_data_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let results = speedtest::test_multiple_servers(&cfg.servers, &singbox_path, &work_dir).await;
+    // 转换为 ServerSpeedResult 格式（与 AutoSelectService::test_all_servers 一致）
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mapped: Vec<autoselect::ServerSpeedResult> = results
+        .into_iter()
+        .map(|r| autoselect::ServerSpeedResult {
+            server_id: r.server_id,
+            latency: r.latency,
+            dial_latency: r.dial_latency,
+            last_test_time: now.clone(),
+            error: if r.latency.is_none() { Some("无法连接".to_string()) } else { r.error },
+        })
+        .collect();
+    let results = mapped;
+    let _svc: Arc<autoselect::AutoSelectService> = autoselect.inner().clone();
     // 测速结果同步到托盘延迟缓存
     if let Some(map) = app.try_state::<tray::SpeedResultMap>() {
         if let Ok(mut m) = map.lock() {
