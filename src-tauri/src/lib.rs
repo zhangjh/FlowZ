@@ -151,32 +151,51 @@ async fn proxy_start(
     sysproxy: tauri::State<'_, SysProxyState>,
     config: Option<Value>,
 ) -> Result<(), String> {
+    // 诊断日志：写入 LogManager，前端实时日志可见
+    let diag = |msg: &str| {
+        if let Some(logs) = app.try_state::<LogsState>() {
+            let entry = logs
+                .lock()
+                .map(|mut m| m.add_log(logs::LogLevel::Info, msg, "proxy_start"))
+                .ok()
+                .flatten();
+            if let Some(e) = entry {
+                let _ = app.emit("event:logReceived", &e);
+            }
+        }
+        eprintln!("[proxy_start] {}", msg);
+    };
+    diag("收到启动请求");
+
     let mut cfg: config::UserConfig = match config {
         Some(v) if !v.is_null() => {
             serde_json::from_value(v).map_err(|e| format!("配置格式错误: {}", e))?
         }
         _ => config::load_config()?,
     };
+    diag("配置解析完成");
     config::validate_config(&mut cfg)?;
+    diag(&format!("配置校验完成，模式: {}", cfg.proxy_mode_type));
 
-    eprintln!("[proxy_start] 开始启动代理，模式: {}", cfg.proxy_mode_type);
     proxy.lock().await.start(&app, &cfg).await?;
-    eprintln!("[proxy_start] sing-box 启动完成");
+    diag("sing-box 启动完成");
 
     // 系统代理模式：设置系统代理（失败不回滚 sing-box，与 Electron 一致）
     if cfg.proxy_mode_type.to_string().to_lowercase() == "systemproxy" {
-        eprintln!("[proxy_start] 设置系统代理...");
+        diag("设置系统代理...");
         if let Err(e) = sysproxy
             .lock()
             .await
             .enable_proxy("127.0.0.1", cfg.http_port, cfg.socks_port)
             .await
         {
-            eprintln!("[proxy] 设置系统代理失败: {}", e);
+            let msg = format!("设置系统代理失败: {}", e);
+            diag(&msg);
             return Err(e);
         }
-        eprintln!("[proxy_start] 系统代理设置完成");
+        diag("系统代理设置完成");
     }
+    diag("proxy_start 全部完成");
     // 自动选择服务：配置 + 代理启动后开始健康检查
     {
         let svc: Arc<autoselect::AutoSelectService> = app.state::<AutoSelectState>().inner().clone();
