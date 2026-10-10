@@ -516,10 +516,24 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
                 }
             }
         }
-        let _ = app.emit(
-            "event:speedTestCompleted",
-            serde_json::to_value(&results).unwrap_or_default(),
-        );
+        // 格式化为前端期望的格式（name, protocol, latency），通过 event:speedTestResult 通知
+        // 对应原版 Electron 的 webContents.send('speedTestResult', ...)
+        let formatted: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let server = cfg.servers.iter().find(|s| s.id == r.server_id);
+                let name = server.map(|s| s.name.clone()).unwrap_or_else(|| r.server_id.clone());
+                let protocol = server
+                    .map(|s| format!("{:?}", s.protocol).to_uppercase())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "name": name,
+                    "protocol": protocol,
+                    "latency": r.latency,
+                })
+            })
+            .collect();
+        let _ = app.emit("event:speedTestResult", &formatted);
         tray::refresh_tray_menu(&app).await;
     });
 }
