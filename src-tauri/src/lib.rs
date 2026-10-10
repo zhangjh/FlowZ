@@ -534,14 +534,26 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             })
             .collect();
         let _ = app.emit("event:speedTestResult", &formatted);
-        // 桌面通知：即使用户最小化了窗口也能看到结果
+        // 桌面通知：照搬原版 toast 格式，显示每个服务器的延迟
+        // 原版：`${r.name}（${r.protocol}）: ${r.latency}ms` 或 `超时`
         {
             use tauri_plugin_notification::NotificationExt;
-            let ok_count = results.iter().filter(|r| r.latency.is_some()).count();
-            let body = if ok_count == results.len() {
-                format!("{} 个服务器全部测速完成", results.len())
+            let mut lines: Vec<String> = Vec::new();
+            for f in &formatted {
+                let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let protocol = f.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+                let latency = f.get("latency");
+                let line = match latency.and_then(|v| v.as_u64()) {
+                    Some(ms) => format!("{}（{}）: {}ms", name, protocol, ms),
+                    None => format!("{}（{}）: 超时", name, protocol),
+                };
+                lines.push(line);
+            }
+            // 桌面通知有长度限制，取前 8 条，其余折叠
+            let body = if lines.len() > 8 {
+                format!("{}\n...等{}个", lines[..8].join("\n"), lines.len())
             } else {
-                format!("{} 个服务器测速完成，{} 个可用", results.len(), ok_count)
+                lines.join("\n")
             };
             let _ = app
                 .notification()
