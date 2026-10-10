@@ -147,7 +147,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
       }
 
-      await api.proxy.start(currentConfig);
+      // proxy_start 30 秒超时保护：避免后端 hang 住时前端无限卡"测速中"
+      const startTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('启动代理超时（30秒）：后端无响应，请检查日志')), 30000)
+      );
+      await Promise.race([api.proxy.start(currentConfig), startTimeout]);
       // 测试完成，进入连接阶段
       set({ proxyPhase: 'connecting' });
       // 启动成功后不立即设置 isLoading = false，而是等待状态轮询完成
