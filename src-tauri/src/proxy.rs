@@ -404,6 +404,8 @@ impl ProxyManager {
         cfg.selected_group_id = None;
         crate::config::validate_config(&mut cfg)?;
         crate::config::save_config(&cfg)?;
+        // 通知前端配置已变更（托盘切换）
+        let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
 
         if self.is_running() && self.hot_reload_config(app, &cfg).await {
             let _ = app.emit("event:proxyStarted", StartedPayload { pid: self.pid.unwrap_or(0), timestamp: now_iso() });

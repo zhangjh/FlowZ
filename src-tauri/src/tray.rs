@@ -161,7 +161,7 @@ pub fn build_menu(app: &AppHandle, data: &TrayMenuData) -> Result<tauri::menu::M
     let update = MenuItemBuilder::with_id("update", "检查更新")
         .build(app)
         .map_err(|e| e.to_string())?;
-    let speedtest = MenuItemBuilder::with_id("speedtest", "测试全部服务器速度")
+    let speedtest = MenuItemBuilder::with_id("speedtest", "服务器测速")
         .build(app)
         .map_err(|e| e.to_string())?;
     let quit = MenuItemBuilder::with_id("quit", "退出")

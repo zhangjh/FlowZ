@@ -406,6 +406,7 @@ pub(crate) async fn switch_group(app: &tauri::AppHandle, group_id: &str) -> Resu
     cfg.selected_server_id = None;
     config::validate_config(&mut cfg)?;
     config::save_config(&cfg)?;
+    let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
     let proxy = app.state::<ProxyState>();
     let mut mgr = proxy.lock().await;
     if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
@@ -420,6 +421,7 @@ pub(crate) async fn switch_proxy_mode(app: &tauri::AppHandle, mode: &str) -> Res
     cfg.proxy_mode = mode.parse().map_err(|e: String| e)?;
     config::validate_config(&mut cfg)?;
     config::save_config(&cfg)?;
+    let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": cfg }));
     let proxy = app.state::<ProxyState>();
     let mut mgr = proxy.lock().await;
     if mgr.is_running() && mgr.hot_reload_config(app, &cfg).await {
