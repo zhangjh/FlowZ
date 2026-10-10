@@ -241,8 +241,10 @@ pub fn update_tray_icon(app: &AppHandle, connected: bool) {
         Ok(rgba) => {
             let (w, h) = (rgba.width(), rgba.height());
             let icon = tauri::image::Image::new_owned(rgba.into_raw(), w, h);
-            let _ = tray.set_icon(Some(icon));
-            eprintln!("[tray] update_tray_icon: 图标已更新");
+            match tray.set_icon(Some(icon)) {
+                Ok(_) => eprintln!("[tray] update_tray_icon: 图标已更新"),
+                Err(e) => eprintln!("[tray] update_tray_icon: set_icon 失败: {}", e),
+            }
         }
         Err(e) => {
             eprintln!("[tray] update_tray_icon: 加载失败: {}", e);
@@ -354,6 +356,13 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
         "show" => {
             tray_log(app, "打开主窗口");
             show_main_window(app);
+            // 与"打开设置"一致：通过 PendingTrayAction 让前端导航到首页，给用户可见反馈
+            let _ = app.emit("event:navigate", serde_json::json!({ "page": "home" }));
+            if let Some(pending) = app.try_state::<crate::PendingTrayAction>() {
+                if let Ok(mut p) = pending.lock() {
+                    *p = Some("navigate:home".to_string());
+                }
+            }
         }
         "toggle" => {
             tray_log(app, "执行 toggle");
