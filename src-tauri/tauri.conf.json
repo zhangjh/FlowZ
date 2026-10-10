@@ -36,9 +36,6 @@
   "productName": "FlowZ",
   "version": "3.7.5",
   "plugins": {
-    "autostart": {
-      "active": true
-    },
     "updater": {
       "active": false,
       "endpoints": [
