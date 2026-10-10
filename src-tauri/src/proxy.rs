@@ -320,8 +320,23 @@ impl ProxyManager {
         let mut verify: Vec<(String, String)> = Vec::new();
         let result: Result<(), String> = async {
             if target_changed {
-                clash::set_selector("proxy", &new_target).await?;
-                verify.push(("proxy".to_string(), new_target.clone()));
+                // 先验证目标在运行配置中存在，避免 sing-box 报 not found
+                match clash::get_selector("proxy").await {
+                    Ok(Some(_)) => {
+                        // selector 存在，尝试切换
+                        if let Err(e) = clash::set_selector("proxy", &new_target).await {
+                            // 404 表示目标不存在，直接回退重启，不打吓人日志
+                            if e.contains("404") || e.contains("not found") {
+                                return Err("目标节点不在运行配置中，需重启".to_string());
+                            }
+                            return Err(e);
+                        }
+                        verify.push(("proxy".to_string(), new_target.clone()));
+                    }
+                    _ => {
+                        return Err("proxy selector 不存在，需重启".to_string());
+                    }
+                }
             }
             if mode_changed {
                 clash::update_mode_selectors(&new_config.proxy_mode).await?;
