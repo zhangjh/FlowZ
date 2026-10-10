@@ -534,6 +534,22 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
             })
             .collect();
         let _ = app.emit("event:speedTestResult", &formatted);
+        // 桌面通知：即使用户最小化了窗口也能看到结果
+        {
+            use tauri_plugin_notification::NotificationExt;
+            let ok_count = results.iter().filter(|r| r.latency.is_some()).count();
+            let body = if ok_count == results.len() {
+                format!("{} 个服务器全部测速完成", results.len())
+            } else {
+                format!("{} 个服务器测速完成，{} 个可用", results.len(), ok_count)
+            };
+            let _ = app
+                .notification()
+                .builder()
+                .title("FlowZ 服务器测速完成")
+                .body(&body)
+                .show();
+        }
         tray::refresh_tray_menu(&app).await;
     });
 }
@@ -805,6 +821,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(shared_logs)
         .manage(PendingTrayAction::default())
         .manage(Mutex::new(proxy_manager))
