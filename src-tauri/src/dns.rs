@@ -28,6 +28,8 @@ fn is_loopback(ip: &str) -> bool {
     ip.starts_with("127.") || ip == "::1"
 }
 
+/// 仅 Linux 路径使用
+#[cfg(target_os = "linux")]
 fn is_docker_bridge(ip: &str) -> bool {
     if !ip.contains('.') {
         return false;
@@ -119,6 +121,8 @@ fn get_windows_dns_servers() -> Vec<String> {
     Vec::new()
 }
 
+/// 仅 Windows 路径使用
+#[cfg(target_os = "windows")]
 fn dedup_ipv4_first(servers: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut unique: Vec<String> = servers.into_iter().filter(|s| seen.insert(s.clone())).collect();
@@ -147,7 +151,7 @@ fn mac_network_services() -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_mac_dns_from_scutil() -> Vec<String> {
+fn read_mac_dns_from_scutil(include_tun: bool) -> Vec<String> {
     let out = match Command::new("scutil").arg("--dns").output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),
@@ -170,14 +174,14 @@ fn read_mac_dns_from_scutil() -> Vec<String> {
         .into_iter()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .filter(|ip| is_valid_ip(ip) && !is_loopback(ip) && !is_tun_internal_address(ip))
+        .filter(|ip| is_valid_ip(ip) && !is_loopback(ip) && (include_tun || !is_tun_internal_address(ip)))
         .collect();
     valid.sort_by_key(|ip| ip.contains(':') as u8);
     valid
 }
 
 #[cfg(target_os = "macos")]
-fn read_mac_dns_from_networksetup() -> Vec<String> {
+fn read_mac_dns_from_networksetup(include_tun: bool) -> Vec<String> {
     let mut servers = Vec::new();
     for service in mac_network_services() {
         let out = match Command::new("networksetup")
@@ -195,7 +199,7 @@ fn read_mac_dns_from_networksetup() -> Vec<String> {
                 .or_else(|| t.strip_prefix("DNS Server:"))
                 .unwrap_or(t);
             for part in ips_part.split_whitespace() {
-                if is_valid_ip(part) && !is_loopback(part) && !is_tun_internal_address(part) {
+                if is_valid_ip(part) && !is_loopback(part) && (include_tun || !is_tun_internal_address(part)) {
                     servers.push(part.to_string());
                 }
             }
@@ -205,13 +209,29 @@ fn read_mac_dns_from_networksetup() -> Vec<String> {
 }
 
 /// 读取 macOS 当前实际生效的系统 DNS（优先 scutil，fallback networksetup）
+///
+/// 已过滤 TUN 劫持地址，供生成上游 DNS 配置使用。
 #[cfg(target_os = "macos")]
 pub fn read_mac_dns_servers() -> Vec<String> {
-    let from_scutil = read_mac_dns_from_scutil();
+    read_mac_dns_servers_impl(false)
+}
+
+/// 读取 macOS 系统 DNS 原始值（保留 TUN 劫持地址）
+///
+/// 用于判断系统 DNS 里是否残留上次 TUN 会话写入的劫持地址。
+#[cfg(target_os = "macos")]
+pub fn read_mac_dns_servers_raw() -> Vec<String> {
+    read_mac_dns_servers_impl(true)
+}
+
+/// `include_tun` 为 true 时保留 TUN 劫持地址
+#[cfg(target_os = "macos")]
+fn read_mac_dns_servers_impl(include_tun: bool) -> Vec<String> {
+    let from_scutil = read_mac_dns_from_scutil(include_tun);
     if !from_scutil.is_empty() {
         return from_scutil;
     }
-    read_mac_dns_from_networksetup()
+    read_mac_dns_from_networksetup(include_tun)
 }
 
 /// 设置/恢复 macOS 系统 DNS；servers 为空时恢复 DHCP（empty）
@@ -310,10 +330,8 @@ pub fn get_system_dns_servers() -> Vec<String> {
         if let Some(servers) = cached {
             return servers;
         }
-        let servers: Vec<String> = read_mac_dns_servers()
-            .into_iter()
-            .filter(|ip| !is_tun_internal_address(ip))
-            .collect();
+        // read_mac_dns_servers 已过滤 TUN 劫持地址
+        let servers = read_mac_dns_servers();
         let result = if servers.is_empty() {
             // 兜底公共 DNS，避免 dns-local 回退导致死循环
             vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()]

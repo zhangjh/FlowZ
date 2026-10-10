@@ -449,8 +449,9 @@ fn prepare_mac_tun_dns(logs: &SharedLogManager) {
             m.add_log(level, msg, "proxy");
         }
     };
-    let current = dns::read_mac_dns_servers();
-    if !current.is_empty() && current.iter().all(dns::is_tun_internal_address) {
+    // 用原始值判断（read_mac_dns_servers 会过滤掉 TUN 地址，无法用于残留检测）
+    let current = dns::read_mac_dns_servers_raw();
+    if !current.is_empty() && current.iter().all(|ip| dns::is_tun_internal_address(ip)) {
         log(LogLevel::Warn, "检测到系统 DNS 残留 TUN 地址，正在恢复 DHCP");
         if let Err(e) = dns::set_system_dns_servers(&[]) {
             log(LogLevel::Warn, &format!("恢复 DHCP 失败: {}", e));
