@@ -1,10 +1,8 @@
 /**
  * Tauri bridge — phase 3.
  *
- * 与 `src/renderer/ipc/api-client.ts` 的 `api` 同形（proxy/config/server/…
- * namespace），底层走 `invoke` / `listen`。
- * 由 `src/renderer/ipc/index.ts` 在运行时选择：Tauri webview 里用这个，
- * Electron 里用 api-client。
+ * Tauri 前端 API：proxy/config/server/… namespace，
+ * 底层走 `invoke` / `listen`。
  *
  * 已移植：proxy（start/stop/restart/getStatus + 事件）、config（get/save/
  * updateMode/getValue/setValue）、server（parseUrl/generateUrl/
@@ -185,6 +183,8 @@ const logsApi = {
 
 const autoSelectApi = {
   testAll: (): Promise<unknown[]> => invoke('autoselect_test_all'),
+  // 兼容旧接口：Rust 侧暂只支持全量测速，忽略 serverIds
+  testServers: (_serverIds?: string[]): Promise<unknown[]> => invoke('autoselect_test_all'),
   getStatus: (): Promise<unknown> => invoke('autoselect_get_status'),
   triggerFailover: (): Promise<void> => invoke('autoselect_trigger_failover'),
 };
@@ -256,3 +256,66 @@ export const api = {
 };
 
 export default api;
+
+// ---------------------------------------------------------------------------
+// ipcClient：事件订阅（兼容旧 Electron 通道名）
+// ---------------------------------------------------------------------------
+
+/** Electron 通道名 -> Tauri 事件名的映射 */
+const tauriEventMap: Record<string, string> = {
+  navigate: 'event:navigate',
+  speedTestResult: 'event:speedTestResult',
+};
+
+/** Rust 托盘发来的 { page } -> Electron 风格的路由字符串 */
+const navigatePageMap: Record<string, string> = {
+  servers: '/server',
+  settings: '/settings',
+  home: '/home',
+  rules: '/rules',
+};
+
+/**
+ * Tauri 下的事件订阅客户端：`on()` 走 @tauri-apps/api/event 的 listen，
+ * 并把 Rust 事件的 payload 适配成调用方期望的 Electron 格式。
+ */
+class TauriIpcClient {
+  on<T>(channel: string, listener: (data: T) => void): Unsubscribe {
+    const eventName = tauriEventMap[channel] ?? channel;
+    let unlisten: Unsubscribe | undefined;
+    listen<T>(eventName, (event) => {
+      let data = event.payload as T;
+      if (channel === 'navigate') {
+        const page = (event.payload as { page?: string } | null)?.page;
+        data = ((page && navigatePageMap[page]) || '/home') as unknown as T;
+      }
+      listener(data);
+    })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch((e) => {
+        console.warn(`[tauri ipcClient] listen(${eventName}) failed:`, e);
+      });
+    return () => {
+      unlisten?.();
+    };
+  }
+
+  once<T>(channel: string, listener: (data: T) => void): Unsubscribe {
+    const off = this.on<T>(channel, (data) => {
+      off();
+      listener(data);
+    });
+    return off;
+  }
+
+  off(): void {}
+  removeAllListeners(): void {}
+  getListenerCount(): number {
+    return 0;
+  }
+}
+
+/** 事件订阅客户端（App.tsx 等直接订阅事件的地方使用） */
+export const ipcClient = new TauriIpcClient();
