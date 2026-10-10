@@ -228,12 +228,14 @@ pub fn update_tray_icon(app: &AppHandle, connected: bool) {
         }
     };
     let filename = if connected { "app.png" } else { "app-gray.png" };
-    // 从打包资源目录加载（与 setup_tray 一致）
+    // 路径解析与 setup_tray 一致：优先 resource_dir，其次回退到 resources/
     let icon_path = app
         .path()
         .resource_dir()
-        .map(|d| d.join(filename))
-        .unwrap_or_else(|_| std::path::PathBuf::from("resources").join(filename));
+        .ok()
+        .map(|r| r.join(filename))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("resources").join(filename));
     eprintln!("[tray] update_tray_icon: connected={}, path={:?}, exists={}", connected, icon_path, icon_path.exists());
     match image::open(&icon_path).map(|img| img.to_rgba8()) {
         Ok(rgba) => {
