@@ -256,15 +256,15 @@ async fn proxy_stop(
     proxy: tauri::State<'_, ProxyState>,
     sysproxy: tauri::State<'_, SysProxyState>,
 ) -> Result<(), String> {
-    if let Err(e) = sysproxy.lock().await.disable_proxy().await {
-        eprintln!("[proxy] 禁用系统代理失败: {}", e);
-    }
-    proxy.lock().await.stop(&app).await?;
-    // 停止自动选择健康检查
+    // 先停自动选择健康检查：即使下方 stop 失败早退，也不能遗留后台任务触发故障转移重启
     {
         let svc: Arc<autoselect::AutoSelectService> = app.state::<AutoSelectState>().inner().clone();
         svc.stop();
     }
+    if let Err(e) = sysproxy.lock().await.disable_proxy().await {
+        eprintln!("[proxy] 禁用系统代理失败: {}", e);
+    }
+    proxy.lock().await.stop(&app).await?;
     update_tray_tooltip(&app, false).await;
     tray::refresh_tray_menu(&app).await;
     Ok(())
@@ -731,9 +731,18 @@ impl autoselect::ProxyControl for TauriProxyControl {
     {
         let app = self.app.clone();
         Box::pin(async move {
-            let proxy = app.state::<ProxyState>();
-            let mut guard = proxy.lock().await;
-            guard.restart(&app, config).await
+            // 故障转移等后台调用方绕过 proxy_restart 命令，重启成功后在这里同步托盘
+            //（托盘刷新放在锁外，refresh_tray_menu 内部会再获取 ProxyState 锁）
+            let result = {
+                let proxy = app.state::<ProxyState>();
+                let mut guard = proxy.lock().await;
+                guard.restart(&app, config).await
+            };
+            if result.is_ok() {
+                update_tray_tooltip(&app, true).await;
+                tray::refresh_tray_menu(&app).await;
+            }
+            result
         })
     }
 
@@ -852,9 +861,16 @@ pub fn run() {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    let state = app_handle.state::<ProxyState>();
-                    let mut mgr = state.lock().await;
-                    mgr.tick(&app_handle).await;
+                    // 托盘刷新必须放在锁外：refresh_tray_menu 内部会再获取 ProxyState 锁
+                    let restarted = {
+                        let state = app_handle.state::<ProxyState>();
+                        let mut mgr = state.lock().await;
+                        mgr.tick(&app_handle).await
+                    };
+                    if restarted {
+                        update_tray_tooltip(&app_handle, true).await;
+                        tray::refresh_tray_menu(&app_handle).await;
+                    }
                 }
             });
             Ok(())

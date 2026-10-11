@@ -294,6 +294,8 @@ impl ProxyManager {
         self.pid = None;
         self.start_instant = None;
         self.start_time_iso = None;
+        // 清空 last_config：手动停止后健康检查 tick 不再把"未运行"当作进程崩溃而自动重启
+        self.last_config = None;
         let _ = app.emit(
             "event:proxyStopped",
             StoppedPayload {
