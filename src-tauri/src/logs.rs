@@ -250,12 +250,14 @@ impl LogPipeline {
     fn parse_singbox_log(&self, line: &str) -> Option<(LogLevel, String)> {
         let m = self.level_re.find(line)?;
         let level = LogLevel::parse(m.as_str())?;
-        // 去掉时间戳和级别
-        let ts_re = Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}").unwrap();
-        let message = ts_re.replace(line, "");
-        let message = self.level_re.replace(&message, "");
-        let message = message.trim().trim_start_matches(|c| c == '[' || c == ']').trim();
-        Some((level, message.to_string()))
+        // 去掉时区、时间戳、级别和行首 [连接ID 耗时] 块，只留正文，
+        // 避免友好提示里嵌入重复的时间戳导致消息过长
+        let body_re = Regex::new(
+            r"^([+-]\d{2}:?\d{2}\s+)?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(?:DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s*(?:\[[^\]]*\]\s*)?",
+        )
+        .unwrap();
+        let message = body_re.replace(line, "").trim().to_string();
+        Some((level, message))
     }
 }
 
@@ -367,5 +369,22 @@ mod tests {
             assert!(p.process_line("2024-01-01 12:00:00 INFO started ok").is_some());
         }
         assert!(p.process_line("2024-01-01 12:00:00 INFO started ok").is_none());
+    }
+
+    #[test]
+    fn pipeline_strips_timezone_and_duration_prefix() {
+        let mut p = LogPipeline::new();
+        let r = p.process_line(
+            "+0800 2026-10-11 21:57:38 ERROR [915834609 819ms] connection: open connection to example.com:443 using outbound/selector[proxy]: quic: transport closed: recvmsg_x: connection refused",
+        );
+        assert!(r.is_some());
+        let (level, msg) = r.unwrap();
+        assert_eq!(level, LogLevel::Error);
+        assert!(msg.contains("连接被拒绝"));
+        // 嵌入的原始日志不应再包含时区/时间戳/耗时前缀
+        assert!(!msg.contains("+0800"));
+        assert!(!msg.contains("2026-10-11"));
+        assert!(!msg.contains("915834609"));
+        assert!(msg.contains("quic: transport closed"));
     }
 }

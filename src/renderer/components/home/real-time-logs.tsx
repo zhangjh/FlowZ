@@ -48,12 +48,12 @@ function LogRow({ log }: { log: LogEntry }) {
   })();
 
   return (
-    <div className="text-xs font-mono select-text" style={{ height: LOG_ENTRY_HEIGHT }}>
-      <span className="text-muted-foreground">[{timestamp}]</span>
-      <span className={`ml-2 font-semibold ${levelColor}`}>
+    <div className="flex items-center text-xs font-mono select-text" style={{ height: LOG_ENTRY_HEIGHT }}>
+      <span className="shrink-0 text-muted-foreground">[{timestamp}]</span>
+      <span className={`ml-2 shrink-0 font-semibold ${levelColor}`}>
         {log.level.toUpperCase()}:
       </span>
-      <span className="ml-2 truncate">{log.message}</span>
+      <span className="ml-2 min-w-0 flex-1 truncate">{log.message}</span>
     </div>
   );
 }
