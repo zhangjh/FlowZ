@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
@@ -8,6 +9,22 @@ import { api } from '@/ipc';
 export function GeneralSettings() {
   const config = useAppStore((state) => state.config);
   const saveConfig = useAppStore((state) => state.saveConfig);
+  // 开机自启以系统登录项的实际状态为准（config.autoStart 只是镜像，
+  // 用户可能在系统设置里手动增删登录项导致两者漂移）
+  const [autoStartEnabled, setAutoStartEnabled] = useState(config?.autoStart ?? false);
+
+  useEffect(() => {
+    let mounted = true;
+    api.autoStart
+      .getStatus()
+      .then((r) => {
+        if (mounted) setAutoStartEnabled(!!r?.enabled);
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const handleToggle = async (
     field: 'autoStart' | 'autoConnect' | 'minimizeToTray' | 'autoCheckUpdate',
@@ -19,6 +36,7 @@ export function GeneralSettings() {
       // 如果是开机启动，需要调用系统 API
       if (field === 'autoStart') {
         await api.autoStart.set(value);
+        setAutoStartEnabled(value);
       }
 
       const updatedConfig = {
@@ -48,7 +66,7 @@ export function GeneralSettings() {
         <div className="flex items-center space-x-2">
           <Checkbox
             id="autoStart"
-            checked={config.autoStart}
+            checked={autoStartEnabled}
             onCheckedChange={(checked) => handleToggle('autoStart', checked as boolean)}
           />
           <Label

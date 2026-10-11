@@ -118,12 +118,6 @@ ci_enum!(Security,
     None => "none",
     Tls => "tls",
     Reality => "reality");
-ci_enum!(LogLevel,
-    Debug => "debug",
-    Info => "info",
-    Warn => "warn",
-    Error => "error",
-    Fatal => "fatal");
 ci_enum!(RuleAction,
     Proxy => "proxy",
     Direct => "direct",
@@ -398,7 +392,6 @@ pub struct UserConfig {
     pub auto_check_update: bool,
     pub socks_port: u32,
     pub http_port: u32,
-    pub log_level: LogLevel,
     #[serde(default = "default_auto_select")]
     pub auto_select: AutoSelectConfig,
 }
@@ -444,7 +437,6 @@ pub fn default_config() -> UserConfig {
         auto_check_update: true,
         socks_port: 65534,
         http_port: 65533,
-        log_level: LogLevel::Info,
         auto_select: default_auto_select(),
     }
 }
@@ -691,7 +683,6 @@ mod tests {
         assert_eq!(v["proxyModeType"], "systemProxy");
         assert_eq!(v["socksPort"], 65534);
         assert_eq!(v["tunConfig"]["stack"], "system");
-        assert_eq!(v["logLevel"], "info");
         assert_eq!(v["autoSelect"]["mode"], "latency");
     }
 

@@ -3,7 +3,9 @@
  */
 
 import { useEffect } from 'react';
+import { toast } from 'sonner';
 import { api } from '../ipc';
+import { openExternal } from '../bridge/api-wrapper';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 
 // 定义事件数据类型
@@ -18,6 +20,15 @@ interface NativeEventData {
   proxyModeSwitchFailed: { success: boolean; error: string };
   autoConnect: Record<string, never>;
   proxyRestarting: Record<string, never>;
+  updateCheckResult: {
+    hasUpdate: boolean;
+    updateInfo?: {
+      version: string;
+      title?: string;
+      releasePage?: string;
+      downloadUrl?: string;
+    };
+  };
 }
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
@@ -79,6 +90,9 @@ export function useNativeEvent<K extends keyof NativeEventData>(
         break;
       case 'proxyRestarting':
         unsubscribe = api.proxy.onProxyRestarting(callback as any);
+        break;
+      case 'updateCheckResult':
+        unsubscribe = (api as any).appEvents.onUpdateCheckResult(callback as any);
         break;
       default:
         console.warn(`Unknown event: ${eventName}`);
@@ -208,6 +222,23 @@ export function useNativeEventListeners() {
   useNativeEvent('configChanged', handleConfigChanged);
   useNativeEvent('statsUpdated', handleStatsUpdated);
 
+  // 启动时/托盘自动检查更新：仅在发现新版本时提示（后端已过滤"无更新"事件）
+  const handleUpdateCheckResult = (data: NativeEventData['updateCheckResult']) => {
+    if (!data?.hasUpdate || !data.updateInfo) return;
+    const info = data.updateInfo;
+    toast.success(`发现新版本 ${info.version}`, {
+      description: info.title || '可以更新到最新版本',
+      action: {
+        label: '去下载',
+        onClick: () => {
+          const url = info.releasePage || info.downloadUrl;
+          if (url) openExternal(url);
+        },
+      },
+    });
+  };
+  useNativeEvent('updateCheckResult', handleUpdateCheckResult);
+
   // 自动连接事件：主进程请求渲染进程执行代理启动（含测速）
   useNativeEvent('autoConnect', () => {
     console.log('[NativeEvent] Auto-connect requested by main process');
@@ -240,7 +271,6 @@ export function useNativeEventListeners() {
   // （托盘是原生菜单，操作时不会触发 webview 的 focus 事件）
   // 不可见时不轮询，节省资源
   useEffect(() => {
-    let lastRunning: boolean | null = null;
     let lastConfigJson: string | null = null;
     let syncing = false;
 
@@ -259,17 +289,19 @@ export function useNativeEventListeners() {
         const cfg = (await api.config.get()) as unknown;
         const cfgJson = JSON.stringify(cfg);
 
-        const runningChanged = lastRunning !== null && lastRunning !== running;
+        // 连接状态与 store 实际值对比：启动时自动连接可能在挂载刷新之后、
+        // 事件监听就绪之前完成，若用本地基线做增量比较，首次采样会把真实
+        // 变化"吸收"掉导致按钮永久停留在旧状态。直接对 store 值刷新则无此问题。
+        const storeRunning = !!state.connectionStatus?.proxyCore?.running;
         const configChanged = lastConfigJson !== null && lastConfigJson !== cfgJson;
 
-        if (runningChanged || configChanged) {
-          console.log('[tray-sync] 检测到托盘操作，同步前端');
+        if (running !== storeRunning || configChanged) {
+          console.log('[tray-sync] 前后端状态不同步，刷新前端');
           if (configChanged) {
             useAppStore.setState({ config: cfg as never });
           }
           await state.refreshConnectionStatus();
         }
-        lastRunning = running;
         lastConfigJson = cfgJson;
 
         // 同步托盘测速结果到服务器页面
@@ -361,12 +393,18 @@ export function useNativeEventListeners() {
     }, 3000);
     const onFocus = () => doSync();
     window.addEventListener('focus', onFocus);
+    // 窗口从隐藏转为可见时立即同步（隐藏期间状态可能已变化，如启动时自动连接）
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') doSync();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     // 启动后 3 秒做一次初始同步
     const initTimer = setTimeout(doSync, 3000);
 
     return () => {
       clearInterval(timer);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
       clearTimeout(initTimer);
     };
   }, []);

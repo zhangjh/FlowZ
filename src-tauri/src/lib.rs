@@ -434,6 +434,97 @@ pub(crate) async fn proxy_stop_inner(app: &tauri::AppHandle) -> Result<(), Strin
     proxy_stop(app.clone(), proxy, sysproxy).await
 }
 
+/// 优雅退出：停代理与守护进程、恢复系统代理后退出应用。
+/// 托盘"退出"与 minimize_to_tray=false 时的关窗退出共用。
+pub(crate) async fn graceful_exit(app: &tauri::AppHandle) {
+    let proxy = app.state::<ProxyState>();
+    {
+        let mut mgr = proxy.lock().await;
+        let _ = mgr.shutdown(app).await;
+    }
+    // 恢复系统代理设置，避免系统残留代理导致断网
+    let sysproxy = app.state::<SysProxyState>();
+    {
+        let mut sp = sysproxy.lock().await;
+        let _ = sp.disable_proxy().await;
+    }
+    app.exit(0);
+}
+
+/// 启动时自动连接（迁移自 Electron 版 main/index.ts 的启动自动连接逻辑）。
+/// auto_connect 开启且已选择服务器时，走统一启动入口 proxy_start_inner，
+/// 系统代理、托盘菜单、自动选择服务由该入口一并同步。
+async fn auto_connect_on_launch(app: &tauri::AppHandle) -> Result<(), String> {
+    let cfg = config::load_config()?;
+    if !cfg.auto_connect {
+        return Ok(());
+    }
+    let log = |level: logs::LogLevel, msg: &str| {
+        if let Some(logs) = app.try_state::<LogsState>() {
+            let entry = logs
+                .lock()
+                .map(|mut m| m.add_log(level, msg, "autostart"))
+                .ok()
+                .flatten();
+            if let Some(e) = entry {
+                let _ = app.emit("event:logReceived", &e);
+            }
+        }
+    };
+
+    // 与启动流程的选中校验保持一致：选中单节点或选中非空分组都算有效
+    if crate::proxy::validate_selection(&cfg).is_err() {
+        log(
+            logs::LogLevel::Warn,
+            "启动时自动连接已启用，但未选择服务器或分组，跳过自动连接",
+        );
+        return Ok(());
+    }
+    // 与前端 autoConnect 事件的守卫一致：已在运行则不重复触发
+    if app.state::<ProxyState>().lock().await.is_running() {
+        log(logs::LogLevel::Info, "代理已在运行，跳过启动时自动连接");
+        return Ok(());
+    }
+
+    log(
+        logs::LogLevel::Info,
+        "启动时自动连接已启用，正在连接...",
+    );
+    if let Err(e) = proxy_start_inner(app, None).await {
+        log(
+            logs::LogLevel::Error,
+            &format!("启动时自动连接失败: {}", e),
+        );
+        return Err(e);
+    }
+    log(logs::LogLevel::Info, "启动时自动连接成功");
+    Ok(())
+}
+
+/// 启动时自动检查更新（迁移自 Electron 版 main/index.ts：延迟 5s，避免影响启动体验）。
+/// auto_check_update 开启时执行；仅在发现新版本时推送 event:updateCheckResult，
+/// 避免每次启动都打扰（"已是最新"不提示）。
+async fn auto_check_update_on_launch(app: &tauri::AppHandle) {
+    let enabled = match config::load_config() {
+        Ok(c) => c.auto_check_update,
+        Err(_) => return,
+    };
+    if !enabled {
+        return;
+    }
+    match update_check_inner(false).await {
+        Ok(r) => {
+            let has_update = r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false);
+            if has_update {
+                let _ = app.emit("event:updateCheckResult", &r);
+            }
+        }
+        Err(e) => {
+            eprintln!("[autoupdate] 启动时检查更新失败: {}", e);
+        }
+    }
+}
+
 /// 切换分组（托盘菜单）
 pub(crate) async fn switch_group(app: &tauri::AppHandle, group_id: &str) -> Result<(), String> {
     let mut cfg = config::load_config()?;
@@ -838,7 +929,7 @@ pub fn run() {
     ));
 
     let builder = tauri::Builder::default();
-    builder
+    let app = builder
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
@@ -873,13 +964,35 @@ pub fn run() {
                     }
                 }
             });
+            // 启动时自动连接（迁移自 Electron）：延迟 2s 等待服务与窗口初始化完成
+            let app_handle_auto = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if let Err(e) = auto_connect_on_launch(&app_handle_auto).await {
+                    eprintln!("[autostart] 启动时自动连接失败: {}", e);
+                }
+            });
+            // 启动时自动检查更新（迁移自 Electron）：延迟 5s，避免影响启动体验
+            let app_handle_update = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                auto_check_update_on_launch(&app_handle_update).await;
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭窗口时最小化到托盘，不退出应用
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                // minimize_to_tray=true（默认）：阻止关闭、隐藏到托盘；
+                // false：允许关闭窗口——退出清理由下方 RunEvent::ExitRequested 统一处理
+                //（最后一个窗口关闭会触发 code=None 的退出请求，阻止默认退出后
+                // 先停 sing-box、恢复系统代理，再真正退出，避免清理任务随进程被杀）
+                let minimize_to_tray = config::load_config()
+                    .map(|c| c.minimize_to_tray)
+                    .unwrap_or(true);
+                if minimize_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -915,6 +1028,27 @@ pub fn run() {
             update_download_install,
             update_open_releases,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // 退出清理的一次性标志：必须在闭包外创建并 move 进去。
+    // 若在闭包体内创建，每次事件都是全新状态，prevent_exit 会在
+    // "app.exit → ExitRequested → 再 prevent" 之间无限循环，应用永远退不出去
+    let cleanup_started = std::sync::atomic::AtomicBool::new(false);
+    app.run(move |app, event| {
+        use std::sync::atomic::Ordering;
+        // 所有退出路径（最后一个窗口关闭、托盘退出、Cmd+Q）统一走一次清理：
+        // 停 sing-box 与守护进程、恢复系统代理，完成后再真正退出。
+        // 进程直接退出会杀掉异步清理任务，导致 sing-box 残留、代理继续生效
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if !cleanup_started.swap(true, Ordering::SeqCst) {
+                api.prevent_exit();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    graceful_exit(&app).await;
+                });
+                // graceful_exit 末尾的 app.exit(0) 会再触发一次 ExitRequested，
+                // 此时标志已置位，直接放行真正退出
+            }
+        }
+    });
 }

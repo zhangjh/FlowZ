@@ -307,8 +307,12 @@ impl ProxyManager {
 
     /// App 退出前调用：停止代理并退出特权守护进程
     pub async fn shutdown(&mut self, app: &AppHandle) -> Result<(), String> {
+        // 先取出 supervisor：stop() 会将其置 None，若不先取出，
+        // 下方等待 sing-box 真正退出的 shutdown 会被跳过，退出后 sing-box 仍在运行
+        let mut sup = self.supervisor.take();
         self.stop(app).await?;
-        if let Some(mut sup) = self.supervisor.take() {
+        if let Some(sup) = sup.as_mut() {
+            // quit 流程会停止 sing-box 并等待守护进程退出（内含 SIGTERM→SIGKILL）
             let _ = sup.shutdown().await;
         }
         Ok(())
@@ -584,7 +588,7 @@ impl ProxyManager {
 }
 
 /// 选中校验（与 TS start() 的 hasActive 检查一致）
-fn validate_selection(cfg: &UserConfig) -> Result<(), String> {
+pub(crate) fn validate_selection(cfg: &UserConfig) -> Result<(), String> {
     let has_active = cfg.selected_server_id.is_some()
         || cfg.selected_group_id.as_ref().map(|gid| {
             cfg.server_groups

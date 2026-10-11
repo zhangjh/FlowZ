@@ -11,6 +11,7 @@ import { Trash2, ArrowDown, ArrowDownToLine, Filter, Search, X } from 'lucide-re
 import { getLogs, clearLogs, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
 import type { LogEntry, LogLevel } from '@/bridge/types';
 
+// 行高估算值/最小值：长内容换行后由虚拟列表按实际尺寸动态测量
 const LOG_ENTRY_HEIGHT = 20;
 const MAX_LOGS = 500;
 const LOG_LEVELS: { value: LogLevel | 'all'; label: string }[] = [
@@ -48,12 +49,12 @@ function LogRow({ log }: { log: LogEntry }) {
   })();
 
   return (
-    <div className="flex items-center text-xs font-mono select-text" style={{ height: LOG_ENTRY_HEIGHT }}>
+    <div className="flex items-center text-xs font-mono select-text" style={{ minHeight: LOG_ENTRY_HEIGHT }}>
       <span className="shrink-0 text-muted-foreground">[{timestamp}]</span>
       <span className={`ml-2 shrink-0 font-semibold ${levelColor}`}>
         {log.level.toUpperCase()}:
       </span>
-      <span className="ml-2 min-w-0 flex-1 truncate">{log.message}</span>
+      <span className="ml-2 min-w-0 flex-1 whitespace-pre-wrap break-words">{log.message}</span>
     </div>
   );
 }
@@ -311,7 +312,9 @@ export function RealTimeLogs() {
             >
               {virtualizer.getVirtualItems().map((virtualItem) => (
                 <div
-                  key={virtualItem.key}
+                  key={virtualItem.index}
+                  ref={virtualizer.measureElement}
+                  data-index={virtualItem.index}
                   style={{
                     position: 'absolute',
                     top: 0,
