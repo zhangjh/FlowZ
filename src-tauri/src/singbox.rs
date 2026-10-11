@@ -348,12 +348,35 @@ fn parse_resolv_conf(path: &str) -> Vec<String> {
         .collect()
 }
 
+/// 兜底公共 DNS：任何平台都探测不到系统上游 DNS 时使用。
+///
+/// 必须让「dns-local 上游」「TUN route_exclude_address」「上游 DNS 直连规则」
+/// 三处取自同一份列表：否则会出现 dns-local 用了某个 IP、但该 IP 既未被 TUN 排除、
+/// 也无直连规则的情况，DNS 查询会绕回 TUN 形成死循环或被代理。
+pub const FALLBACK_DNS_SERVERS: [&str; 2] = ["223.5.5.5", "119.29.29.29"];
+
 /// 系统上游 DNS。
 ///
 /// 关键：TUN 模式下 dns-local 必须用「显式上游」，而这里就是那个上游的来源。
-/// Linux 走本模块的 resolv.conf 解析；macOS/Windows 复用 dns 模块
-/// （macOS 会过滤 TUN 劫持地址，拿不到真实上游时回退到公共 DNS，保证永不为空）。
+/// Linux 走本模块的 resolv.conf 解析；macOS/Windows 复用 dns 模块。
+/// 无论哪个平台，探测结果为空时统一回退到 [`FALLBACK_DNS_SERVERS`]，保证永不为空。
 pub fn get_system_dns_servers() -> Vec<String> {
+    apply_dns_fallback(detect_system_dns_servers())
+}
+
+fn apply_dns_fallback(detected: Vec<String>) -> Vec<String> {
+    if detected.is_empty() {
+        FALLBACK_DNS_SERVERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        detected
+    }
+}
+
+/// 各平台实际探测逻辑（可能返回空）
+fn detect_system_dns_servers() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
         let usable = |ip: &str| !is_loopback_ip(ip) && !is_docker_bridge_ip(ip);
@@ -493,7 +516,7 @@ fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
         let upstream = system_dns
             .first()
             .cloned()
-            .unwrap_or_else(|| "223.5.5.5".to_string());
+            .unwrap_or_else(|| FALLBACK_DNS_SERVERS[0].to_string());
         servers.push(SingBoxDnsServer {
             tag: "dns-local".to_string(),
             server_type: "udp".to_string(),
@@ -1198,6 +1221,68 @@ mod tests {
         assert_eq!(ip_version("1.2.3.4"), 4);
         assert_eq!(ip_version("::1"), 6);
         assert_eq!(ip_version("example.com"), 0);
+    }
+
+    #[test]
+    fn dns_fallback_applied_when_detection_empty() {
+        let fallback: Vec<String> = FALLBACK_DNS_SERVERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(apply_dns_fallback(vec![]), fallback);
+        assert!(!get_system_dns_servers().is_empty());
+    }
+
+    #[test]
+    fn dns_fallback_keeps_detected_servers() {
+        let detected = vec!["10.0.0.1".to_string(), "8.8.8.8".to_string()];
+        assert_eq!(apply_dns_fallback(detected.clone()), detected);
+    }
+
+    /// 回归：dns-local 上游必须同时出现在 TUN 排除地址与「上游 DNS 直连」规则中。
+    /// 三处取自同一份列表，避免探测失败时上游 IP 未被排除/直连，DNS 查询绕回 TUN。
+    #[test]
+    fn tun_dns_upstream_consistent_across_exclude_and_route() {
+        let mut cfg = sample_config();
+        cfg.proxy_mode_type = crate::config::ProxyModeType::Tun;
+        let sb = generate_singbox_config(&cfg, &sample_ctx()).unwrap();
+
+        let upstream = sb
+            .dns
+            .as_ref()
+            .unwrap()
+            .servers
+            .iter()
+            .find(|s| s.tag == "dns-local")
+            .unwrap()
+            .server
+            .clone()
+            .unwrap();
+        let expected = if upstream.contains(':') {
+            format!("{}/128", upstream)
+        } else {
+            format!("{}/32", upstream)
+        };
+
+        let tun = sb
+            .inbounds
+            .iter()
+            .find(|i| i.inbound_type == "tun")
+            .unwrap();
+        let exclude = tun.route_exclude_address.as_ref().unwrap();
+        assert!(
+            exclude.contains(&expected),
+            "TUN route_exclude_address 缺少上游 DNS {}: {:?}",
+            expected,
+            exclude
+        );
+
+        let route = sb.route.as_ref().unwrap();
+        let covered = route.rules.iter().any(|r| {
+            r.outbound.as_deref() == Some("direct")
+                && r.ip_cidr
+                    .as_ref()
+                    .map(|v| v.contains(&expected))
+                    .unwrap_or(false)
+        });
+        assert!(covered, "缺少上游 DNS {} 的直连路由规则", expected);
     }
 }
 

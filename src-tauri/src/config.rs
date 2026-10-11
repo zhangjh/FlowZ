@@ -6,11 +6,43 @@
 //! identifier 路径。
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+// ---------------------------------------------------------------------------
+// id 迁移辅助
+// ---------------------------------------------------------------------------
+
+/// 生成缺失的 id。前端规则用 `rule_<ts>_<rand>`，后端统一用 uuid；
+/// id 仅作稳定标识，不参与业务语义。
+fn generate_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// 检测原始 JSON 中 servers / serverGroups / customRules 是否存在缺失或空的 id。
+/// 这些字段在历史版本（Electron 期）或外部编辑后可能缺失，必须兼容加载，
+/// 否则整份配置会加载失败并连带测速、UI 一起失效。
+fn has_missing_id(raw: &Value) -> bool {
+    fn arr_has_missing(v: Option<&Value>) -> bool {
+        v.and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter().any(|item| {
+                    item.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true)
+                })
+            })
+            .unwrap_or(false)
+    }
+    arr_has_missing(raw.get("servers"))
+        || arr_has_missing(raw.get("serverGroups"))
+        || arr_has_missing(raw.get("customRules"))
+}
 
 // ---------------------------------------------------------------------------
 // 大小写不敏感的枚举反序列化（对应 TS 里随处可见的 `.toLowerCase()` 比较）
@@ -251,6 +283,7 @@ pub struct Hysteria2Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
+    #[serde(default = "generate_id")]
     pub id: String,
     pub name: String,
     pub protocol: Protocol,
@@ -291,6 +324,7 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerGroup {
+    #[serde(default = "generate_id")]
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +345,7 @@ pub struct ServerGroup {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainRule {
+    #[serde(default = "generate_id")]
     pub id: String,
     pub domains: Vec<String>,
     pub action: RuleAction,
@@ -419,9 +454,9 @@ pub fn default_config() -> UserConfig {
 // ---------------------------------------------------------------------------
 
 pub fn validate_config(cfg: &mut UserConfig) -> Result<(), String> {
-    for s in &cfg.servers {
-        if s.id.is_empty() {
-            return Err("Server id is required and must be a string".into());
+    for s in &mut cfg.servers {
+        if s.id.trim().is_empty() {
+            s.id = generate_id();
         }
         if s.name.is_empty() {
             return Err("Server name is required and must be a string".into());
@@ -455,8 +490,8 @@ pub fn validate_config(cfg: &mut UserConfig) -> Result<(), String> {
 
     // 分组兼容字段补齐（对应 TS 的三处 if (!Array.isArray(...))）
     for g in &mut cfg.server_groups {
-        if g.id.is_empty() {
-            return Err("Group id is required and must be a string".into());
+        if g.id.trim().is_empty() {
+            g.id = generate_id();
         }
         if g.name.is_empty() {
             return Err("Group name is required and must be a string".into());
@@ -511,9 +546,9 @@ pub fn validate_config(cfg: &mut UserConfig) -> Result<(), String> {
         return Err("tunConfig.mtu must be a number between 1280 and 65535".into());
     }
 
-    for r in &cfg.custom_rules {
-        if r.id.is_empty() {
-            return Err("Rule id is required and must be a string".into());
+    for r in &mut cfg.custom_rules {
+        if r.id.trim().is_empty() {
+            r.id = generate_id();
         }
         if r.domains.is_empty() || r.domains.iter().any(|d| d.trim().is_empty()) {
             return Err("Rule domains is required and must be a non-empty array".into());
@@ -588,6 +623,18 @@ pub fn config_path() -> Result<PathBuf, String> {
 // 加载 / 保存
 // ---------------------------------------------------------------------------
 
+/// 解析配置文本，返回 (配置, 是否发生了 id 迁移)。
+/// 抽成纯函数以便测试「缺 id 的历史配置仍可加载」。
+fn parse_config(content: &str) -> Result<(UserConfig, bool), String> {
+    let raw: Value =
+        serde_json::from_str(content).map_err(|e| format!("配置文件损坏: {}", e))?;
+    let migrated = has_missing_id(&raw);
+    let mut cfg: UserConfig =
+        serde_json::from_value(raw).map_err(|e| format!("配置文件损坏: {}", e))?;
+    validate_config(&mut cfg).map_err(|e| format!("配置验证失败: {}", e))?;
+    Ok((cfg, migrated))
+}
+
 pub fn load_config() -> Result<UserConfig, String> {
     let path = config_path()?;
     if !path.exists() {
@@ -597,9 +644,11 @@ pub fn load_config() -> Result<UserConfig, String> {
     }
     let content =
         fs::read_to_string(&path).map_err(|e| format!("读取配置文件失败: {}", e))?;
-    let mut cfg: UserConfig =
-        serde_json::from_str(&content).map_err(|e| format!("配置文件损坏: {}", e))?;
-    validate_config(&mut cfg).map_err(|e| format!("配置验证失败: {}", e))?;
+    let (cfg, migrated) = parse_config(&content)?;
+    if migrated {
+        // 补齐 id 后立即回写，保证 id 稳定（否则每次加载都会生成新 id）
+        save_config(&cfg)?;
+    }
     Ok(cfg)
 }
 
@@ -699,5 +748,59 @@ mod tests {
         let p: Protocol = serde_json::from_str("\"VLESS\"").unwrap();
         assert_eq!(p, Protocol::Vless);
         assert_eq!(serde_json::to_string(&Protocol::Hysteria2).unwrap(), "\"hysteria2\"");
+    }
+
+    fn rule_with_id(id: &str) -> DomainRule {
+        DomainRule {
+            id: id.into(),
+            domains: vec!["zhangjh.cn".into()],
+            action: RuleAction::Proxy,
+            enabled: true,
+            bypass_fake_ip: None,
+        }
+    }
+
+    #[test]
+    fn has_missing_id_detects_absent_and_empty() {
+        let mut cfg = default_config();
+        cfg.custom_rules.push(rule_with_id("rule_1"));
+        let raw = serde_json::to_value(&cfg).unwrap();
+        assert!(!has_missing_id(&raw), "全部有 id 时不应误报");
+
+        let mut absent = raw.clone();
+        absent["customRules"][0].as_object_mut().unwrap().remove("id");
+        assert!(has_missing_id(&absent), "缺 id 应被检出");
+
+        let mut empty = raw.clone();
+        empty["customRules"][0]["id"] = serde_json::json!("");
+        assert!(has_missing_id(&empty), "空 id 应被检出");
+    }
+
+    /// 回归：历史配置里规则缺 id（线上报错场景）时，整份配置仍应能加载，
+    /// 并标记为需要迁移、自动补齐非空 id；回写后 id 稳定、不再触发迁移。
+    #[test]
+    fn missing_rule_id_is_backfilled_on_load() {
+        let mut cfg = default_config();
+        cfg.custom_rules.push(rule_with_id("rule_1"));
+        let mut raw = serde_json::to_value(&cfg).unwrap();
+        raw["customRules"][0].as_object_mut().unwrap().remove("id");
+        let text = serde_json::to_string_pretty(&raw).unwrap();
+
+        let (loaded, migrated) = parse_config(&text).unwrap();
+        assert!(migrated, "应标记为需要迁移并回写");
+        assert!(!loaded.custom_rules[0].id.trim().is_empty());
+        assert_eq!(loaded.custom_rules[0].domains, vec!["zhangjh.cn".to_string()]);
+
+        let text2 = serde_json::to_string_pretty(&loaded).unwrap();
+        let (_again, migrated2) = parse_config(&text2).unwrap();
+        assert!(!migrated2, "回写后 id 已稳定，不应再次迁移");
+    }
+
+    #[test]
+    fn empty_rule_id_is_filled_by_validate() {
+        let mut cfg = default_config();
+        cfg.custom_rules.push(rule_with_id(""));
+        validate_config(&mut cfg).unwrap();
+        assert!(!cfg.custom_rules[0].id.trim().is_empty());
     }
 }

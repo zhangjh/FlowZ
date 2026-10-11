@@ -448,6 +448,7 @@ impl SystemProxyManager {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sh_quote_escapes() {
         assert_eq!(
@@ -456,6 +457,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unquote_strips() {
         assert_eq!(SystemProxyManager::unquote("'manual'"), "manual");

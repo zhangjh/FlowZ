@@ -6,7 +6,8 @@
  *
  * 已移植：proxy（start/stop/restart/getStatus + 事件）、config（get/save/
  * updateMode/getValue/setValue）、server（parseUrl/generateUrl/
- * parseSubscription/纯配置类 CRUD）、version.getInfo。
+ * parseSubscription/纯配置类 CRUD）、group（纯配置类 CRUD + 分享）、
+ * rules（纯配置类 CRUD）、version.getInfo。
  * 其余：invoke 类抛 honest 错误；事件订阅类 warn + 空卸载（避免 App 挂载时崩）。
  */
 
@@ -143,6 +144,205 @@ const serverApi = {
 };
 
 // ---------------------------------------------------------------------------
+// rules（纯配置类 CRUD 走 config get/save，语义对齐 Electron rules-handlers.ts）
+// ---------------------------------------------------------------------------
+const rulesApi = {
+  getAll: async (): Promise<any[]> => (await configApi.get()).customRules ?? [],
+  add: async (rule: any): Promise<any> => {
+    const cfg = await configApi.get();
+    const created = {
+      ...rule,
+      id: rule.id || `rule_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
+    };
+    if (!cfg.customRules) cfg.customRules = [];
+    // 追加到末尾：列表顺序即匹配优先级（自定义规则整体早于智能分流规则）
+    cfg.customRules.push(created);
+    await configApi.save(cfg);
+    return created;
+  },
+  update: async (rule: any): Promise<void> => {
+    const cfg = await configApi.get();
+    if (!cfg.customRules) throw new Error('[tauri bridge] rules.update: no rules found');
+    const i = cfg.customRules.findIndex((r: any) => r.id === rule.id);
+    if (i < 0) throw new Error(`[tauri bridge] rules.update: rule not found: ${rule.id}`);
+    cfg.customRules[i] = rule;
+    await configApi.save(cfg);
+  },
+  delete: async (ruleId: string): Promise<void> => {
+    const cfg = await configApi.get();
+    cfg.customRules = (cfg.customRules ?? []).filter((r: any) => r.id !== ruleId);
+    await configApi.save(cfg);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// group（纯配置类 CRUD 走 config get/save，语义对齐 Electron server-handlers.ts）
+// ---------------------------------------------------------------------------
+
+/** 生成服务器去重特征键（用于订阅刷新时判断同一节点） */
+function buildServerKey(server: any): string {
+  return [
+    server.protocol?.toLowerCase(),
+    server.address,
+    server.port,
+    server.uuid || '',
+    server.password || '',
+    server.flow || '',
+    server.network || '',
+    server.wsSettings?.path || '',
+    server.grpcSettings?.serviceName || '',
+    server.tlsSettings?.serverName || '',
+  ].join('|');
+}
+
+/**
+ * 将服务器加入指定分组（作为手动成员）。
+ * 一个节点只能属于一个分组：会从其它分组移除其成员身份。
+ */
+function addServerToGroup(cfg: any, group: any, serverId: string): void {
+  const server = (cfg.servers ?? []).find((s: any) => s.id === serverId);
+  if (!server) return;
+  if (!Array.isArray(group.manualServerIds)) group.manualServerIds = [];
+  if (!Array.isArray(group.excludedSubscriptionKeys)) group.excludedSubscriptionKeys = [];
+  if (group.serverIds.includes(serverId)) {
+    server.groupId = group.id;
+    return;
+  }
+  for (const other of cfg.serverGroups) {
+    if (other.id === group.id) continue;
+    removeServerFromGroup(cfg, other, serverId);
+  }
+  server.groupId = group.id;
+  if (!group.manualServerIds.includes(serverId)) group.manualServerIds.push(serverId);
+  if (!group.serverIds.includes(serverId)) group.serverIds.push(serverId);
+}
+
+/**
+ * 将服务器从指定分组移除。
+ * 若该节点是订阅成员，则加入排除列表，下次订阅刷新时不会被自动加回。
+ */
+function removeServerFromGroup(cfg: any, group: any, serverId: string): void {
+  const server = (cfg.servers ?? []).find((s: any) => s.id === serverId);
+  if (!server) return;
+  if (!Array.isArray(group.manualServerIds)) group.manualServerIds = [];
+  if (!Array.isArray(group.subscriptionServerIds)) group.subscriptionServerIds = [];
+  if (!Array.isArray(group.excludedSubscriptionKeys)) group.excludedSubscriptionKeys = [];
+  if (!Array.isArray(group.serverIds)) group.serverIds = [];
+  const wasSubscriptionMember = group.subscriptionServerIds.includes(serverId);
+  group.serverIds = group.serverIds.filter((id: string) => id !== serverId);
+  group.manualServerIds = group.manualServerIds.filter((id: string) => id !== serverId);
+  group.subscriptionServerIds = group.subscriptionServerIds.filter((id: string) => id !== serverId);
+  if (wasSubscriptionMember) {
+    const key = buildServerKey(server);
+    if (!group.excludedSubscriptionKeys.includes(key)) group.excludedSubscriptionKeys.push(key);
+  }
+  if (server.groupId === group.id) delete server.groupId;
+}
+
+const groupApi = {
+  getAll: async (): Promise<any[]> => (await configApi.get()).serverGroups ?? [],
+  create: async (input: { name: string; serverIds?: string[] }): Promise<any> => {
+    const cfg = await configApi.get();
+    const now = new Date().toISOString();
+    const group = {
+      id: crypto.randomUUID(),
+      name: input.name,
+      serverIds: [],
+      subscriptionServerIds: [],
+      manualServerIds: [],
+      excludedSubscriptionKeys: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (!Array.isArray(cfg.serverGroups)) cfg.serverGroups = [];
+    cfg.serverGroups.push(group);
+    if (input.serverIds) {
+      for (const id of input.serverIds) addServerToGroup(cfg, group, id);
+    }
+    await configApi.save(cfg);
+    return group;
+  },
+  // 单个原子更新：改名 + 批量增删成员（一次保存，避免重复触发代理重启）
+  update: async (input: {
+    groupId: string;
+    name?: string;
+    addServerIds?: string[];
+    removeServerIds?: string[];
+  }): Promise<any> => {
+    const cfg = await configApi.get();
+    const group = (cfg.serverGroups ?? []).find((g: any) => g.id === input.groupId);
+    if (!group) throw new Error(`[tauri bridge] group.update: 分组不存在: ${input.groupId}`);
+    if (input.name !== undefined && input.name.trim()) group.name = input.name.trim();
+    if (input.addServerIds) {
+      for (const id of input.addServerIds) addServerToGroup(cfg, group, id);
+    }
+    if (input.removeServerIds) {
+      for (const id of input.removeServerIds) removeServerFromGroup(cfg, group, id);
+    }
+    group.updatedAt = new Date().toISOString();
+    await configApi.save(cfg);
+    return group;
+  },
+  delete: async (groupId: string): Promise<void> => {
+    const cfg = await configApi.get();
+    const i = (cfg.serverGroups ?? []).findIndex((g: any) => g.id === groupId);
+    if (i < 0) throw new Error(`[tauri bridge] group.delete: 分组不存在: ${groupId}`);
+    cfg.serverGroups.splice(i, 1);
+    for (const s of cfg.servers ?? []) {
+      if (s.groupId === groupId) delete s.groupId;
+    }
+    if (cfg.selectedGroupId === groupId) cfg.selectedGroupId = null;
+    await configApi.save(cfg);
+  },
+  select: async (groupId: string | null): Promise<void> => {
+    const cfg = await configApi.get();
+    if (groupId !== null) {
+      const group = (cfg.serverGroups ?? []).find((g: any) => g.id === groupId);
+      if (!group || group.serverIds.length === 0) {
+        throw new Error('[tauri bridge] group.select: 分组不存在或没有成员服务器');
+      }
+      cfg.selectedGroupId = groupId;
+      cfg.selectedServerId = null;
+    } else {
+      cfg.selectedGroupId = null;
+    }
+    await configApi.save(cfg);
+  },
+  addServers: async (input: { serverIds: string[]; groupId: string }): Promise<void> => {
+    const cfg = await configApi.get();
+    const group = (cfg.serverGroups ?? []).find((g: any) => g.id === input.groupId);
+    if (!group) throw new Error(`[tauri bridge] group.addServers: 分组不存在: ${input.groupId}`);
+    for (const id of input.serverIds) addServerToGroup(cfg, group, id);
+    await configApi.save(cfg);
+  },
+  // 移动节点到指定分组（自动从旧分组移除）
+  moveServer: async (input: { serverId: string; targetGroupId: string }): Promise<void> => {
+    const cfg = await configApi.get();
+    const target = (cfg.serverGroups ?? []).find((g: any) => g.id === input.targetGroupId);
+    if (!target) throw new Error(`[tauri bridge] group.moveServer: 目标分组不存在: ${input.targetGroupId}`);
+    const server = (cfg.servers ?? []).find((s: any) => s.id === input.serverId);
+    if (!server) throw new Error(`[tauri bridge] group.moveServer: 服务器不存在: ${input.serverId}`);
+    for (const other of cfg.serverGroups) {
+      if (other.id === target.id) continue;
+      removeServerFromGroup(cfg, other, input.serverId);
+    }
+    addServerToGroup(cfg, target, input.serverId);
+    target.updatedAt = new Date().toISOString();
+    await configApi.save(cfg);
+  },
+  // 生成分组分享文本：组内每个成员生成一个协议链接，换行拼接
+  generateShareUrl: async (groupId: string): Promise<string> => {
+    const cfg = await configApi.get();
+    const group = (cfg.serverGroups ?? []).find((g: any) => g.id === groupId);
+    if (!group) throw new Error(`[tauri bridge] group.generateShareUrl: 分组不存在: ${groupId}`);
+    const members = (cfg.servers ?? []).filter((s: any) => group.serverIds.includes(s.id));
+    if (members.length === 0) throw new Error('该分组暂无成员，无法生成分享');
+    const urls = await Promise.all(members.map((s: any) => serverApi.generateUrl(s)));
+    return urls.join('\n');
+  },
+};
+
+// ---------------------------------------------------------------------------
 // version
 // ---------------------------------------------------------------------------
 const versionApi = {
@@ -255,8 +455,8 @@ export const api = {
   proxy: proxyApi,
   config: configApi,
   server: serverApi,
-  group: stubNamespace('group'),
-  rules: stubNamespace('rules'),
+  group: groupApi,
+  rules: rulesApi,
   logs: logsApi,
   systemProxy: systemProxyApi,
   autoStart: autoStartApi,

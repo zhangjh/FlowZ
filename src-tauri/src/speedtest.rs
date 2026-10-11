@@ -418,10 +418,27 @@ mod tests {
 
     #[test]
     fn config_passes_singbox_check() {
-        // 用仓库自带的 sing-box 二进制做真实校验；没有二进制时跳过
+        // 用仓库自带的 sing-box 二进制做真实校验；没有当前平台二进制时跳过。
+        // 必须按宿主平台选目录，否则在非 Linux 上会拿到 Linux 二进制，报 "cannot execute binary file"。
+        let bin_name = if cfg!(target_os = "windows") {
+            "sing-box.exe"
+        } else {
+            "sing-box"
+        };
+        let dir = if cfg!(target_os = "windows") {
+            "resources/win"
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "resources/mac-arm64"
+            } else {
+                "resources/mac-x64"
+            }
+        } else {
+            "resources/linux-x64"
+        };
         let candidates = [
-            "../resources/linux-x64/sing-box",
-            "resources/linux-x64/sing-box",
+            format!("../{}/{}", dir, bin_name),
+            format!("{}/{}", dir, bin_name),
         ];
         let bin = candidates.iter().find(|p| std::path::Path::new(p).exists());
         let bin = match bin {

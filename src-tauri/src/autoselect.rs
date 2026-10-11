@@ -473,10 +473,9 @@ mod tests {
     fn configure_disables_with_group_selected() {
         let logs = crate::logs::new_shared();
         let svc = AutoSelectService::new(logs, PathBuf::from("/tmp"), PathBuf::from("/tmp"));
-        let mut cfg = match crate::config::load_config() {
-            Ok(c) => c,
-            Err(_) => return, // 无配置文件时跳过
-        };
+        // 必须用内存构造的配置：load_config() 会读写真实用户数据目录，
+        // 测试不得触碰（且迁移逻辑会回写文件）。
+        let mut cfg = crate::config::default_config();
         cfg.auto_select.enabled = true;
         cfg.selected_group_id = Some("g1".to_string());
         svc.configure(cfg);
