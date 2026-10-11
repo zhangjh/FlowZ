@@ -212,7 +212,7 @@ impl SystemProxyManager {
         self.set_int("org.gnome.system.proxy.https", "port", s.https_port).await?;
         self.set_string("org.gnome.system.proxy.socks", "host", &s.socks_host).await?;
         self.set_int("org.gnome.system.proxy.socks", "port", s.socks_port).await?;
-        self.set_raw("org.gnome.system.proxy", "ignore-hosts", &Self::sh_quote(&s.ignore_hosts)).await?;
+        self.set_raw("org.gnome.system.proxy", "ignore-hosts", &s.ignore_hosts).await?;
         self.set_string("org.gnome.system.proxy", "mode", &s.mode).await?;
         Ok(())
     }
@@ -237,7 +237,7 @@ impl SystemProxyManager {
             self.set_raw(
                 "org.gnome.system.proxy",
                 "ignore-hosts",
-                &Self::sh_quote("['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']"),
+                "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']",
             ).await?;
             self.set_string("org.gnome.system.proxy", "mode", "manual").await?;
             Ok::<(), String>(())
