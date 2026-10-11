@@ -174,7 +174,10 @@ impl ProxyManager {
         }
 
         if tun {
-            self.start_tun(app, &ctx, &singbox).await?;
+            if let Err(e) = self.start_tun(app, &ctx, &singbox).await {
+                self.add_log(LogLevel::Error, &format!("TUN 模式启动失败: {}", e));
+                return Err(e);
+            }
         } else {
             let mut child = spawn_with_retry(&singbox, &config_path).await?;
             // 转发 stdout/stderr：解析后写入日志管理器并推送前端
@@ -199,6 +202,8 @@ impl ProxyManager {
         // Clash API 就绪后设置初始模式 selector（异步，不阻塞启动返回）
         let mode = cfg.proxy_mode.clone();
         let logs = self.logs.clone();
+        let probe_cfg = cfg.clone();
+        let probe_app = app.clone();
         tokio::spawn(async move {
             if clash::wait_for_api(Duration::from_secs(10)).await {
                 if let Err(e) = clash::update_mode_selectors(&mode).await {
@@ -206,6 +211,8 @@ impl ProxyManager {
                         m.add_log(LogLevel::Warn, &format!("初始化模式选择器失败: {}", e), "proxy");
                     }
                 }
+                // 启动即探测：确认当前选中的出站真的能出网
+                probe_selected_outbound(&probe_app, &logs, &probe_cfg).await;
             } else if let Ok(mut m) = logs.lock() {
                 m.add_log(LogLevel::Warn, "Clash API 在 10s 内未就绪", "proxy");
             }
@@ -220,7 +227,6 @@ impl ProxyManager {
         ctx: &GenContext,
         singbox: &std::path::Path,
     ) -> Result<(), String> {
-        let _ = app;
         let pid_file = ctx.user_data_dir.join("singbox.pid");
         let mut sup = PrivilegedSupervisor::new(
             singbox.to_path_buf(),
@@ -229,16 +235,29 @@ impl ProxyManager {
             pid_file,
         );
         if !sup.ensure_started().await? {
-            return Err("特权守护进程未能启动（用户可能取消了授权）".to_string());
+            let msg = "特权守护进程未能启动：管理员授权被取消，或授权后守护进程未在超时内就绪";
+            self.add_log(LogLevel::Error, msg);
+            return Err(msg.to_string());
         }
+        self.add_log(LogLevel::Info, "特权守护进程已就绪");
         sup.send_command(supervisor::CMD_START)?;
-        let pid = sup
-            .wait_for_singbox_pid(Duration::from_secs(10))
-            .await
-            .ok_or_else(|| "sing-box 未能启动（PID 文件未出现）".to_string())?;
+        let pid = match sup.wait_for_singbox_pid(Duration::from_secs(10)).await {
+            Some(pid) => pid,
+            None => {
+                let msg = "sing-box 未能启动（10s 内未生成 PID 文件），详见 flowz_supervisor.log";
+                self.add_log(LogLevel::Error, msg);
+                return Err(msg.to_string());
+            }
+        };
+        self.add_log(
+            LogLevel::Info,
+            &format!("TUN 模式启动完成，sing-box PID={}", pid),
+        );
         self.pid = Some(pid);
         self.direct_child = None;
         self.supervisor = Some(sup);
+        // TUN 模式下 sing-box 日志写在文件里，跟随文件推送给前端实时日志
+        Self::follow_singbox_log(app, self.logs.clone(), &ctx.user_data_dir);
         Ok(())
     }
 
@@ -736,8 +755,149 @@ async fn spawn_singbox(singbox: &PathBuf, config_path: &PathBuf) -> Result<Child
         .map_err(|e| format!("启动 sing-box 失败: {}", e))
 }
 
+/// 启动后探测「当前实际生效的出站」能否真正出网。
+///
+/// 只确认 sing-box 进程在跑是不够的：节点不可用时进程状态依然正常，
+/// 界面照样显示「已连接」，但所有流量都出不去（策略组内节点全部失败时尤其如此）。
+/// 这里用 Clash API 的延迟测试接口，让 sing-box 自己经该出站访问一次 generate_204，
+/// 结果写进实时日志并广播事件；失败时给出可操作的原因。
+async fn probe_selected_outbound(
+    app: &AppHandle,
+    logs: &SharedLogManager,
+    cfg: &crate::config::UserConfig,
+) {
+    let emit_log = |level: LogLevel, msg: &str| {
+        let entry = logs
+            .lock()
+            .map(|mut m| m.add_log(level, msg, "proxy"))
+            .ok()
+            .flatten();
+        if let Some(entry) = entry {
+            let _ = app.emit("event:logReceived", &entry);
+        }
+    };
+
+    if matches!(cfg.proxy_mode, crate::config::ProxyMode::Direct) {
+        emit_log(LogLevel::Info, "直连模式下跳过节点可用性探测");
+        return;
+    }
+
+    // 实际生效的出站：优先取运行时的 proxy selector，取不到再按配置推算
+    let tag = match clash::get_selector("proxy").await {
+        Ok(Some(t)) if !t.is_empty() => t,
+        _ => singbox::get_proxy_target_tag(cfg),
+    };
+    let via_group = tag.starts_with("group-");
+
+    // 稍等再探测：启动瞬间 sing-box 自己的策略组健康检查正在跑（成员全部不可用时尤其占时），
+    // 过早探测会被干扰出现误报；随后最多探测 3 次，尽量排除偶发失败
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let mut delay = None;
+    for attempt in 0..3 {
+        if let Some(ms) = clash::probe_delay(&tag, 8000).await {
+            delay = Some(ms);
+            break;
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    match delay {
+        Some(ms) => {
+            let msg = format!(
+                "节点探测通过：{}{}，延迟 {} ms",
+                tag,
+                if via_group { "（策略组，组内已有可用节点）" } else { "" },
+                ms
+            );
+            emit_log(LogLevel::Info, &msg);
+            let _ = app.emit(
+                "event:proxyProbe",
+                serde_json::json!({ "ok": true, "tag": tag, "delay": ms, "message": msg }),
+            );
+        }
+        None => {
+            let msg = if via_group {
+                format!(
+                    "节点探测失败：策略组 {} 内没有可用节点，境外流量无法出网。请在节点页把可用节点加入该分组，或直接选择单个可用节点。",
+                    tag
+                )
+            } else {
+                format!(
+                    "节点探测失败：{} 无法出网（多次探测均未成功访问 generate_204），当前流量都会受影响，请更换节点或检查该服务器。",
+                    tag
+                )
+            };
+            emit_log(LogLevel::Error, &msg);
+            let _ = app.emit(
+                "event:proxyProbe",
+                serde_json::json!({ "ok": false, "tag": tag, "message": msg }),
+            );
+        }
+    }
+}
+
 /// 排空子进程的 stdout/stderr，防止管道写满阻塞
 impl ProxyManager {
+    /// TUN 模式日志跟随：sing-box 由提权守护进程启动，stdout 抓不到，
+    /// 它把日志写进 singbox.log（见 generate_log_config）。这里跟随该文件，
+    /// 复用与非 TUN 模式完全相同的日志管线，保证前端实时日志在 TUN 模式下也有内容。
+    fn follow_singbox_log(app: &AppHandle, logs: SharedLogManager, user_data_dir: &std::path::Path) {
+        use std::io::{Read, Seek, SeekFrom};
+        static FOLLOWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if FOLLOWING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return; // 每个进程只跟随一次
+        }
+        let path = user_data_dir.join("singbox.log");
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut pipeline = logs::LogPipeline::new();
+            let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            loop {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let len = meta.len();
+                    if len < pos {
+                        pos = 0; // 文件被截断（sing-box 重新打开日志）
+                    }
+                    if len > pos {
+                        // 积压过多时只取尾部，避免长时间占用
+                        if len - pos > 512 * 1024 {
+                            pos = len - 128 * 1024;
+                        }
+                        if let Ok(mut file) = std::fs::File::open(&path) {
+                            if file.seek(SeekFrom::Start(pos)).is_ok() {
+                                let mut bytes = Vec::new();
+                                if Read::take(file, len - pos).read_to_end(&mut bytes).is_ok() {
+                                    // 只消费到最后一个换行（按字节定位，避免半行/多字节边界影响偏移量）
+                                    if let Some(idx) = bytes.iter().rposition(|&b| b == b'\n') {
+                                        let complete = &bytes[..=idx];
+                                        pos += complete.len() as u64;
+                                        let text = String::from_utf8_lossy(complete);
+                                        for line in text.lines() {
+                                            if let Some((level, message)) = pipeline.process_line(line)
+                                            {
+                                                let entry = logs
+                                                    .lock()
+                                                    .map(|mut m| m.add_log(level, &message, "sing-box"))
+                                                    .ok()
+                                                    .flatten();
+                                                if let Some(entry) = entry {
+                                                    let _ = app.emit("event:logReceived", &entry);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+    }
+
     /// sing-box stdout/stderr 转发：解析 → 日志管理器 → 前端事件
     /// （对应 ProxyManager.handleProcessOutput + parseAndLogLine 流水线）
     fn forward_logs(child: &mut Child, logs: SharedLogManager, app: &AppHandle) {

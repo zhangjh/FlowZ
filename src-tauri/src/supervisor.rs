@@ -110,10 +110,19 @@ pub fn build_unix_script(
         "  stop_singbox",
         "  cleanup_stale",
         "  log \"starting sing-box\"",
-        "  \"$SINGBOX_PATH\" run -c \"$CONFIG_PATH\" >/dev/null 2>&1 &",
+        "  # stdout/stderr 落盘：否则启动期致命错误（配置被拒、端口占用等）会被完全丢弃，",
+        "  # 表现成「点了开启没反应、日志里什么都没有」",
+        "  \"$SINGBOX_PATH\" run -c \"$CONFIG_PATH\" >\"$USERDATA/singbox_stderr.log\" 2>&1 &",
         "  SBPID=$!",
         "  echo \"$SBPID\" > \"$PID_FILE\" 2>/dev/null || true",
         "  chmod 644 \"$PID_FILE\" 2>/dev/null || true",
+        "  sleep 1",
+        "  if ! kill -0 \"$SBPID\" 2>/dev/null; then",
+        "    log \"sing-box exited right after start, see $USERDATA/singbox_stderr.log\"",
+        "    rm -f \"$PID_FILE\" 2>/dev/null",
+        "    SBPID=\"\"",
+        "    return",
+        "  fi",
         "  log \"sing-box started PID=$SBPID\"",
         "}",
         "",
@@ -352,7 +361,14 @@ impl PrivilegedSupervisor {
     fn is_process_alive(&self, pid: u32) -> bool {
         #[cfg(unix)]
         {
-            unsafe { libc::kill(pid as i32, 0) == 0 }
+            // 提权守护进程与 sing-box 都以 root 运行，普通用户对其发送 signal 0 会返回 EPERM。
+            // EPERM 同样意味着进程存在，必须按「存活」处理：
+            // 否则 is_supervisor_alive/wait_for_ready 永远为 false，会反复重新拉起守护进程且从不复用，
+            // 启动命令也永远不会下发（表现为「点开启就报错，日志里没有有效信息」）。
+            if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                return true;
+            }
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         }
         #[cfg(target_os = "windows")]
         {

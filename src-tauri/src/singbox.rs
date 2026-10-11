@@ -348,7 +348,11 @@ fn parse_resolv_conf(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// 系统上游 DNS（对应 getSystemDnsServers 的 Linux 分支；其他平台返回空走 type:'local'）
+/// 系统上游 DNS。
+///
+/// 关键：TUN 模式下 dns-local 必须用「显式上游」，而这里就是那个上游的来源。
+/// Linux 走本模块的 resolv.conf 解析；macOS/Windows 复用 dns 模块
+/// （macOS 会过滤 TUN 劫持地址，拿不到真实上游时回退到公共 DNS，保证永不为空）。
 pub fn get_system_dns_servers() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
@@ -366,7 +370,7 @@ pub fn get_system_dns_servers() -> Vec<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        vec![]
+        crate::dns::get_system_dns_servers()
     }
 }
 
@@ -480,12 +484,20 @@ fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
     let system_dns = get_system_dns_servers();
 
     let mut servers = Vec::new();
-    if tun && !system_dns.is_empty() {
-        // TUN 模式必须用 type:'udp' + 显式上游，避免 DNS 死循环（见 TS 注释）
+    if tun {
+        // TUN 模式下系统 DNS 已被指向 TUN 劫持地址，此时若用 type:'local'，
+        // 解析会绕回 sing-box 自己形成死循环（代理服务器域名解析超时、direct 拿到 fakeip 而连不通）。
+        // 必须使用 type:'udp' + 显式上游，上游查询走路由规则（国内 DNS 命中 geoip-cn → direct 出网）。
+        // 注意：detour 不能指定 "direct" —— sing-box 会以
+        // "detour to an empty direct outbound makes no sense" 直接致命退出（启动即崩）。
+        let upstream = system_dns
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "223.5.5.5".to_string());
         servers.push(SingBoxDnsServer {
             tag: "dns-local".to_string(),
             server_type: "udp".to_string(),
-            server: Some(system_dns[0].clone()),
+            server: Some(upstream),
             detour: None,
             inet4_range: None,
             inet6_range: None,

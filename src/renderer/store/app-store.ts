@@ -125,8 +125,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   startProxy: async () => {
     set({ isLoading: true, error: null, proxyPhase: 'testing' });
     try {
-      // 获取当前配置
-      const currentConfig = get().config;
+      // 以后端已保存的配置为准：内存里的选择可能滞后（例如托盘切节点后旧分组残留），
+      // 而后端对「单节点/分组」有互斥校验（分组优先），传旧配置会导致启动沿用旧选择
+      let currentConfig = get().config;
+      try {
+        currentConfig = await api.config.get();
+      } catch (e) {
+        console.warn('[StartProxy] 读取后端配置失败，退回内存配置:', e);
+      }
       if (!currentConfig) {
         throw new Error('配置未加载');
       }
@@ -367,7 +373,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Update local config
       const currentConfig = get().config;
       if (currentConfig) {
-        set({ config: { ...currentConfig, selectedServerId: serverId } });
+        // 单节点与分组互斥：选了节点必须同时清掉分组，
+        // 否则后端「分组优先」的校验会让这次切换被静默忽略（选了也白选）
+        set({
+          config: { ...currentConfig, selectedServerId: serverId, selectedGroupId: null },
+        });
       }
       // Refresh connection status
       await get().refreshConnectionStatus();
