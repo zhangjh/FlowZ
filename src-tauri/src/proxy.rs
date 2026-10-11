@@ -1,13 +1,13 @@
 //! ProxyManager 移植（对应 `src/main/services/ProxyManager.ts` 的核心流程）。
 //!
-//! phase-3 范围：
-//! - sing-box 配置生成 + 写入（systemProxy 模式）
+//! 已移植：
+//! - sing-box 配置生成 + 写入（systemProxy / TUN 模式，见 singbox.rs）
 //! - 进程启动 / 停止 / 重启（含重试、健康检查、自动重启冷却）
+//! - TUN 模式：经 PrivilegedSupervisor 单次授权、常驻守护进程接管（见 supervisor.rs）
+//! - macOS TUN DNS 接管与恢复（见 dns.rs）
 //! - 状态查询与事件推送
-//! - TUN 模式：诚实报错（提权守护进程是 phase-4）
-//!
-//! 未移植（phase-4+）：PrivilegedSupervisor 提权流程、macOS TUN DNS、
-//! Clash API  selector 热切换、日志流式解析。
+//! - Clash API 模式 selector 设置与校验（见 clash.rs）
+//! - sing-box 日志流式解析并推送前端（见 logs.rs）
 
 use crate::config::{self, UserConfig};
 use crate::clash;
