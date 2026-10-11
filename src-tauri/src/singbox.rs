@@ -355,6 +355,11 @@ fn parse_resolv_conf(path: &str) -> Vec<String> {
 /// 也无直连规则的情况，DNS 查询会绕回 TUN 形成死循环或被代理。
 pub const FALLBACK_DNS_SERVERS: [&str; 2] = ["223.5.5.5", "119.29.29.29"];
 
+/// TUN 模式下 dns-local 的加密上游（DNSPod DoH，IP 直连免 bootstrap）。
+///
+/// 必须用 DoH 而非明文 UDP：明文 53 的响应可能被链路注入
+pub const TUN_DNS_DOH_SERVER: &str = "120.53.53.53";
+
 /// 系统上游 DNS。
 ///
 /// 关键：TUN 模式下 dns-local 必须用「显式上游」，而这里就是那个上游的来源。
@@ -504,23 +509,19 @@ fn generate_log_config(config: &UserConfig, ctx: &GenContext) -> SingBoxLogConfi
 
 fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
     let tun = is_tun_mode(&config.proxy_mode_type.to_string());
-    let system_dns = get_system_dns_servers();
 
     let mut servers = Vec::new();
     if tun {
         // TUN 模式下系统 DNS 已被指向 TUN 劫持地址，此时若用 type:'local'，
         // 解析会绕回 sing-box 自己形成死循环（代理服务器域名解析超时、direct 拿到 fakeip 而连不通）。
-        // 必须使用 type:'udp' + 显式上游，上游查询走路由规则（国内 DNS 命中 geoip-cn → direct 出网）。
+        // 上游用 DoH 加密查询（IP 直连免 bootstrap）而非明文 UDP：既防明文 53 的
+        // 链路注入，也不依赖可能返回陈旧/被污染记录的单一明文上游。
         // 注意：detour 不能指定 "direct" —— sing-box 会以
         // "detour to an empty direct outbound makes no sense" 直接致命退出（启动即崩）。
-        let upstream = system_dns
-            .first()
-            .cloned()
-            .unwrap_or_else(|| FALLBACK_DNS_SERVERS[0].to_string());
         servers.push(SingBoxDnsServer {
             tag: "dns-local".to_string(),
-            server_type: "udp".to_string(),
-            server: Some(upstream),
+            server_type: "https".to_string(),
+            server: Some(TUN_DNS_DOH_SERVER.to_string()),
             detour: None,
             inet4_range: None,
             inet6_range: None,
@@ -634,6 +635,8 @@ fn generate_inbounds(config: &UserConfig) -> Vec<SingBoxInbound> {
     if is_tun_mode(&config.proxy_mode_type.to_string()) {
         let tun = &config.tun_config;
         let mut exclude = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
+        // dns-local 的 DoH 上游必须排除在 TUN 路由之外，避免 DNS 查询绕回 TUN
+        exclude.push(format!("{}/32", TUN_DNS_DOH_SERVER));
         for ip in get_system_dns_servers() {
             exclude.push(if ip.contains(':') {
                 format!("{}/128", ip)
@@ -995,6 +998,7 @@ fn generate_route_config(config: &UserConfig, ctx: &GenContext) -> SingBoxRouteC
 
     // 上游 DNS IP 直连（防 TUN 死循环）
     let mut dns_cidrs: HashSet<String> = HashSet::new();
+    dns_cidrs.insert(format!("{}/32", TUN_DNS_DOH_SERVER));
     for ip in get_system_dns_servers() {
         dns_cidrs.insert(if ip.contains(':') {
             format!("{}/128", ip)
