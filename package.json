@@ -19,14 +19,14 @@
     "release:prepare": "npm run build && npm run package:all",
     "tauri": "tauri",
     "dev:tauri": "tauri dev",
-    "package:tauri": "tauri build && node scripts/tauri-collect.mjs",
-    "package:tauri:win": "tauri build --bundles nsis --target x86_64-pc-windows-msvc && node scripts/tauri-collect.mjs",
-    "package:tauri:linux": "tauri build --target x86_64-unknown-linux-gnu && node scripts/tauri-collect.mjs",
-    "package:tauri:mac": "tauri build --target aarch64-apple-darwin && node scripts/tauri-collect.mjs",
-    "package:tauri:mac-intel": "tauri build --target x86_64-apple-darwin && node scripts/tauri-collect.mjs",
-    "tauri:stage": "node scripts/tauri-stage-resources.mjs",
-    "tauri:collect": "node scripts/tauri-collect.mjs",
-    "tauri:sync-version": "node scripts/sync-version.mjs"
+    "package": "tauri build && node scripts/tauri-collect.mjs",
+    "package:win": "tauri build --bundles nsis --target x86_64-pc-windows-msvc && node scripts/tauri-collect.mjs",
+    "package:linux": "tauri build --target x86_64-unknown-linux-gnu && node scripts/tauri-collect.mjs",
+    "package:mac": "tauri build --target aarch64-apple-darwin && node scripts/tauri-collect.mjs",
+    "package:mac-intel": "tauri build --target x86_64-apple-darwin && node scripts/tauri-collect.mjs",
+    "stage": "node scripts/tauri-stage-resources.mjs",
+    "collect": "node scripts/tauri-collect.mjs",
+    "sync-version": "node scripts/sync-version.mjs"
   },
   "keywords": [
     "proxy",

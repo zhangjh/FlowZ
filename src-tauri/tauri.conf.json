@@ -13,11 +13,11 @@
     ]
   },
   "build": {
-    "beforeBuildCommand": "npm run tauri:sync-version && npm run tauri:stage && npm run build:renderer",
-    "beforeDevCommand": "npm run tauri:stage && npm run dev:renderer",
+    "beforeBuildCommand": "npm run sync-version && npm run stage && npm run build:renderer",
+    "beforeDevCommand": "npm run stage && npm run dev:renderer",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist/renderer",
-    "beforeBundleCommand": "npm run tauri:stage"
+    "beforeBundleCommand": "npm run stage"
   },
   "bundle": {
     "active": true,
