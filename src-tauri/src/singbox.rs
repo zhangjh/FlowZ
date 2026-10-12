@@ -1017,6 +1017,14 @@ fn generate_route_config(config: &UserConfig, ctx: &GenContext) -> SingBoxRouteC
         });
     }
 
+    // GitHub API 直连：更新检查走直连，避免走代理节点共享 IP 触发 GitHub 未认证限流（60 次/小时·IP）
+    rules.push(SingBoxRouteRule {
+        domain: Some(vec!["api.github.com".to_string()]),
+        action: "route".to_string(),
+        outbound: Some("direct".to_string()),
+        ..Default::default()
+    });
+
     // 智能分流（顺序与 TS 一致：geosite-cn → geosite-!cn → geoip-cn → fallback）
     rules.push(SingBoxRouteRule {
         rule_set: Some("geosite-cn".to_string()),
