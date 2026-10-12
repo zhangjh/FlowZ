@@ -122,6 +122,11 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
 
+          # actions/checkout 在 tag push 事件下最后一步会用 +<sha>:refs/tags/<tag>
+          # 把 annotated tag 强制覆盖成指向 commit 的轻量 tag，%(contents) 只能读到
+          # commit message。这里重新 fetch 恢复真正的 annotated tag 对象。
+          git fetch --force origin "+refs/tags/v${VERSION}:refs/tags/v${VERSION}"
+
           # 优先使用 tag 注释中携带的 Release Notes（push-release.js 交互输入）
           NOTES=$(git tag -l "v${VERSION}" --format='%(contents)')
           # 旧脚本创建的默认注释视为无内容
