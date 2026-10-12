@@ -2,7 +2,7 @@
 
 简洁现代的跨平台代理客户端，基于 sing-box 核心，支持 VLESS、Trojan和hysteria2协议（当前主流最安全好用的协议），主打配置简单，规则明确，体验优良所见即所得。
 
-<img width="1464" height="941" alt="image" src="https://github.com/user-attachments/assets/fe8709c6-fb80-4084-b73f-8bcb83c9f4b8" />
+<img width="1503" height="1039" alt="image" src="https://github.com/user-attachments/assets/2229eefb-1f05-4472-9e05-9c8863eb9c46" />
 
 ## ✨ 功能特性
 
