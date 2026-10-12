@@ -41,17 +41,48 @@ fn get_config() -> Result<Value, String> {
 }
 
 /// 保存用户配置（对应 ConfigManager.saveConfig，含验证）。
+/// 配置变更后，若代理正在运行，尝试热切换；不能热切或热切失败则完整重启。
+/// 对齐 Electron main/index.ts 中 MAIN_EVENTS.CONFIG_CHANGED 的处理路径：
+/// saveConfig → 广播 configChanged → 托盘刷新 → 热更新 / 重启。
 #[tauri::command]
-fn save_config(app: tauri::AppHandle, config: Value) -> Result<(), String> {
+async fn save_config(
+    app: tauri::AppHandle,
+    proxy: tauri::State<'_, ProxyState>,
+    autoselect: tauri::State<'_, AutoSelectState>,
+    config: Value,
+) -> Result<(), String> {
     let mut cfg: config::UserConfig =
         serde_json::from_value(config).map_err(|e| format!("配置格式错误: {}", e))?;
     config::validate_config(&mut cfg)?;
     config::save_config(&cfg)?;
-    // UI 修改配置后刷新托盘菜单，保持选中态一致
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tray::refresh_tray_menu(&app_clone).await;
-    });
+
+    // 广播配置变更事件到渲染进程（对齐 Electron config-handlers 的 sendToAll）
+    let _ = app.emit("event:configChanged", serde_json::json!({ "newValue": &cfg }));
+
+    // 更新自动选择服务配置（对齐 Electron 的 autoSelectService.updateConfig）。
+    // 关闭自动选择时立即停止健康检查；开启时配置已更新，下次代理启动时由
+    // notify_proxy_started 启动健康检查（热切换路径下不重启代理）。
+    autoselect.inner().configure(cfg.clone());
+
+    // 代理正在运行时，尝试热切换；不能热切或热切失败则完整重启。
+    // 锁必须在 tray::refresh_tray_menu 之前释放，避免与托盘内部取 ProxyState 锁死锁。
+    let restarted = {
+        let mut mgr = proxy.lock().await;
+        if !mgr.is_running() {
+            false
+        } else if mgr.can_hot_reload(&cfg) && mgr.hot_reload_config(&app, &cfg).await {
+            false
+        } else {
+            mgr.restart(&app, &cfg).await?;
+            true
+        }
+    };
+
+    // 刷新托盘菜单（内部会获取 ProxyState 锁，故在锁外调用）
+    tray::refresh_tray_menu(&app).await;
+    if restarted {
+        update_tray_tooltip(&app, true).await;
+    }
     Ok(())
 }
 

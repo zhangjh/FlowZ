@@ -127,9 +127,9 @@ const serverApi = {
     const cfg = await configApi.get();
     cfg.selectedServerId = serverId;
     cfg.selectedGroupId = null;
+    // save_config 现在内置了热切换 / 重启逻辑（对齐 Electron 的 CONFIG_CHANGED 处理），
+    // 不再需要在这里显式调用 proxyApi.restart，否则会导致双重重启或代理未运行时被意外启动
     await configApi.save(cfg);
-    // 切换节点后重启代理
-    await proxyApi.restart(cfg);
   },
   parseUrl: (url: string): Promise<any> => invoke('parse_protocol_url', { url }),
   addFromUrl: async (url: string, name?: string): Promise<any> => {

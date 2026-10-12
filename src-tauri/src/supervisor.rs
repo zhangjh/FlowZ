@@ -547,6 +547,7 @@ impl PrivilegedSupervisor {
             );
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW：外层 powershell 也是控制台程序，不隐藏会闪黑窗
                 .spawn()
                 .map_err(|e| format!("PowerShell UAC 启动失败: {}", e))?;
         }

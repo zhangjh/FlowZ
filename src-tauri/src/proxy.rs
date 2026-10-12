@@ -20,6 +20,7 @@ use crate::singbox::{self, GenContext};
 use crate::supervisor::{self, PrivilegedSupervisor};
 use chrono::Utc;
 use serde::Serialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -318,6 +319,16 @@ impl ProxyManager {
         Ok(())
     }
 
+    /// 判断是否可以热切换（对应 TS canHotReload）。
+    /// 仅当 proxyMode / selectedServerId / selectedGroupId 之外的字段未变时为 true。
+    /// 用于 save_config 路径：能热切就热切，否则回退到完整重启。
+    pub fn can_hot_reload(&self, new_config: &UserConfig) -> bool {
+        let Some(current) = &self.last_config else {
+            return false;
+        };
+        config_fingerprint(current) == config_fingerprint(new_config)
+    }
+
     /// 运行时热切换（对应 hotReloadConfig）：只切换了服务器/代理模式时走
     /// Clash API，成功则无需重启；失败返回 false 由调用方回退到重启。
     pub async fn hot_reload_config(
@@ -585,6 +596,55 @@ impl ProxyManager {
         }
         false
     }
+}
+
+/// 计算用于判断是否需要重启的"静态指纹"（对应 TS buildHotReloadFingerprint）。
+/// 仅比较会影响运行中出站的内容：
+/// - 排除 proxyMode / selectedServerId / selectedGroupId（由运行时 Clash API 热切换处理）
+/// - 排除 serverGroups 结构本身（仅当前生效分组的成员列表参与比较）
+/// - 排除 server 上派生的 groupId（已由生效分组成员覆盖）
+/// - 排除 autoStart / autoConnect / minimizeToTray / autoCheckUpdate / autoSelect
+///   （非运行时偏好，由各服务自行处理，改变不应触发代理重启）
+fn config_fingerprint(cfg: &UserConfig) -> Value {
+    let active_group_members: Vec<String> = cfg
+        .selected_group_id
+        .as_ref()
+        .and_then(|gid| cfg.server_groups.iter().find(|g| &g.id == gid))
+        .map(|g| g.server_ids.clone())
+        .unwrap_or_default();
+
+    let mut v = serde_json::to_value(cfg).unwrap_or(Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        // 运行时可切换字段：固定为常量参与比较，等价于排除
+        obj.insert("proxyMode".to_string(), Value::String("smart".to_string()));
+        obj.remove("selectedServerId");
+        obj.remove("selectedGroupId");
+        // 分组结构不影响运行时（仅生效分组成员影响）
+        obj.insert(
+            "serverGroups".to_string(),
+            Value::Array(Vec::new()),
+        );
+        obj.insert(
+            "activeGroupMemberIds".to_string(),
+            serde_json::to_value(&active_group_members).unwrap_or(Value::Null),
+        );
+        // servers: 排除派生字段 groupId
+        if let Some(servers) = obj.get_mut("servers").and_then(|s| s.as_array_mut()) {
+            for s in servers {
+                if let Some(so) = s.as_object_mut() {
+                    so.remove("groupId");
+                }
+            }
+        }
+        // 非运行时偏好：改变不应触发代理重启
+        obj.remove("autoStart");
+        obj.remove("autoConnect");
+        obj.remove("minimizeToTray");
+        obj.remove("autoCheckUpdate");
+        // autoSelect 由 AutoSelectService 独立更新，不影响 sing-box 配置
+        obj.remove("autoSelect");
+    }
+    v
 }
 
 /// 选中校验（与 TS start() 的 hasActive 检查一致）
