@@ -101,6 +101,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # 完整历史：Generate Release Notes 兜底分支需要 git log 区间
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -117,13 +120,22 @@ jobs:
       - name: Generate Release Notes
         id: release_notes
         run: |
-          if [ -f CHANGELOG.md ]; then
-            VERSION=${{ steps.version.outputs.VERSION }}
+          VERSION=${{ steps.version.outputs.VERSION }}
+
+          # 优先使用 tag 注释中携带的 Release Notes（push-release.js 交互输入）
+          NOTES=$(git tag -l "v${VERSION}" --format='%(contents)')
+          # 旧脚本创建的默认注释视为无内容
+          if [ "$NOTES" = "Release ${VERSION}" ]; then
+            NOTES=""
+          fi
+
+          # 其次使用 CHANGELOG.md 对应版本段落
+          if [ -z "$NOTES" ] && [ -f CHANGELOG.md ]; then
             NOTES=$(sed -n "/## \[*${VERSION}\]*/,/## \[*/p" CHANGELOG.md | sed '$d')
-            if [ -z "$NOTES" ]; then
-              NOTES="Release $VERSION"
-            fi
-          else
+          fi
+
+          # 兜底：上一个 tag 以来的提交列表
+          if [ -z "$NOTES" ]; then
             NOTES=$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"- %s" || git log --pretty=format:"- %s")
             NOTES="## What's Changed
 

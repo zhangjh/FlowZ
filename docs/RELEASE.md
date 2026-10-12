@@ -84,6 +84,13 @@
    ```
 
 3. **创建并推送 tag**
+
+   推荐使用脚本，可在推送前交互输入多行 Release Notes（Ctrl+D 结束，跳过则使用提交列表兜底）：
+   ```bash
+   npm run release:tag
+   ```
+
+   或手动创建：
    ```bash
    git tag -a v1.0.1 -m "Release 1.0.1"
    git push origin v1.0.1
