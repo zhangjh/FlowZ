@@ -70,6 +70,8 @@ const appEventsApi = {
     onEvent('event:updateCheckResult', listener),
   getPendingTrayAction: (): Promise<string | null> =>
     invoke('get_pending_tray_action'),
+  getPendingUpdateResult: (): Promise<unknown | null> =>
+    invoke('get_pending_update_result'),
   getTraySpeedtestResults: (): Promise<Array<[string, number | null]>> =>
     invoke('get_tray_speedtest_results'),
   getTraySpeedtestVersion: (): Promise<number> =>
@@ -405,12 +407,19 @@ const autoSelectApi = {
 const updateApi = {
   check: (includePrerelease = false): Promise<unknown> =>
     invoke('update_check', { includePrerelease }),
-  download: (): Promise<{ success: boolean }> =>
-    invoke('update_download_install'),
-  install: (): Promise<{ success: boolean }> =>
-    Promise.resolve({ success: true }),
-  skip: (): Promise<{ success: boolean }> =>
-    Promise.resolve({ success: true }),
+  download: (updateInfo: {
+    downloadUrl: string;
+    fileName: string;
+    fileSize?: number;
+  }): Promise<{ success: boolean; filePath?: string; error?: string }> =>
+    invoke('update_download', {
+      downloadUrl: updateInfo.downloadUrl,
+      fileName: updateInfo.fileName,
+      fileSize: updateInfo.fileSize ?? 0,
+    }),
+  install: (filePath: string): Promise<{ success: boolean; error?: string }> =>
+    invoke('update_install', { filePath }),
+  skip: (_version?: string): Promise<{ success: boolean }> => Promise.resolve({ success: true }),
   openReleases: (): Promise<{ success: boolean }> => invoke('update_open_releases'),
   onProgress: (listener: (progress: unknown) => void): (() => void) => {
     let unlisten: (() => void) | null = null;

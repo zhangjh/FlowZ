@@ -147,6 +147,8 @@ pub(crate) type LogsState = logs::SharedLogManager;
 pub(crate) type AutoSelectState = Arc<autoselect::AutoSelectService>;
 /// 托盘待处理的前端动作（事件不可靠时的轮询兜底）
 pub(crate) type PendingTrayAction = Arc<std::sync::Mutex<Option<String>>>;
+/// 启动时/托盘检查更新得到的待提示结果（事件在监听器注册前发出时会丢，需轮询兜底）
+pub(crate) type PendingUpdateResult = Arc<std::sync::Mutex<Option<Value>>>;
 
 /// 生成 sing-box 配置（调试用；start 内部也会生成）。
 #[tauri::command]
@@ -278,6 +280,14 @@ async fn get_tray_speedtest_results(
 async fn get_pending_tray_action(
     pending: tauri::State<'_, PendingTrayAction>,
 ) -> Result<Option<String>, String> {
+    Ok(pending.lock().map(|mut p| p.take()).unwrap_or(None))
+}
+
+/// 获取并清空待处理的更新检查结果（启动/托盘检查更新的前端兜底）
+#[tauri::command]
+async fn get_pending_update_result(
+    pending: tauri::State<'_, PendingUpdateResult>,
+) -> Result<Option<Value>, String> {
     Ok(pending.lock().map(|mut p| p.take()).unwrap_or(None))
 }
 
@@ -465,9 +475,9 @@ pub(crate) async fn proxy_stop_inner(app: &tauri::AppHandle) -> Result<(), Strin
     proxy_stop(app.clone(), proxy, sysproxy).await
 }
 
-/// 优雅退出：停代理与守护进程、恢复系统代理后退出应用。
-/// 托盘"退出"与 minimize_to_tray=false 时的关窗退出共用。
-pub(crate) async fn graceful_exit(app: &tauri::AppHandle) {
+/// 停止代理与守护进程、恢复系统代理（不退出应用）。
+/// 供优雅退出与安装更新前清理复用。
+pub(crate) async fn shutdown_resources(app: &tauri::AppHandle) {
     let proxy = app.state::<ProxyState>();
     {
         let mut mgr = proxy.lock().await;
@@ -479,6 +489,12 @@ pub(crate) async fn graceful_exit(app: &tauri::AppHandle) {
         let mut sp = sysproxy.lock().await;
         let _ = sp.disable_proxy().await;
     }
+}
+
+/// 优雅退出：停代理与守护进程、恢复系统代理后退出应用。
+/// 托盘"退出"与 minimize_to_tray=false 时的关窗退出共用。
+pub(crate) async fn graceful_exit(app: &tauri::AppHandle) {
+    shutdown_resources(app).await;
     app.exit(0);
 }
 
@@ -532,6 +548,20 @@ async fn auto_connect_on_launch(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 写一条更新检查日志到 LogManager（对应 Electron UpdateService 的日志）。
+fn log_update(app: &tauri::AppHandle, level: logs::LogLevel, msg: &str) {
+    if let Some(logs) = app.try_state::<LogsState>() {
+        let entry = logs
+            .lock()
+            .map(|mut m| m.add_log(level, msg, "UpdateService"))
+            .ok()
+            .flatten();
+        if let Some(e) = entry {
+            let _ = app.emit("event:logReceived", &e);
+        }
+    }
+}
+
 /// 启动时自动检查更新（迁移自 Electron 版 main/index.ts：延迟 5s，避免影响启动体验）。
 /// auto_check_update 开启时执行；仅在发现新版本时推送 event:updateCheckResult，
 /// 避免每次启动都打扰（"已是最新"不提示）。
@@ -543,15 +573,35 @@ async fn auto_check_update_on_launch(app: &tauri::AppHandle) {
     if !enabled {
         return;
     }
+    log_update(app, logs::LogLevel::Info, "正在自动检查更新...");
     match update_check_inner(false).await {
         Ok(r) => {
             let has_update = r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false);
             if has_update {
+                let version = r
+                    .get("updateInfo")
+                    .and_then(|i| i.get("version"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                log_update(app, logs::LogLevel::Info, &format!("发现新版本: {}", version));
+                // 事件可能在 webview 注册监听器之前发出而被丢弃，
+                // 因此同时存一份待处理结果供前端挂载时轮询兜底（对齐托盘动作的处理）。
+                if let Some(pending) = app.try_state::<PendingUpdateResult>() {
+                    if let Ok(mut slot) = pending.lock() {
+                        *slot = Some(r.clone());
+                    }
+                }
                 let _ = app.emit("event:updateCheckResult", &r);
+            } else {
+                log_update(app, logs::LogLevel::Info, "当前已是最新版本");
             }
         }
         Err(e) => {
-            eprintln!("[autoupdate] 启动时检查更新失败: {}", e);
+            log_update(
+                app,
+                logs::LogLevel::Warn,
+                &format!("启动时检查更新失败: {}", e),
+            );
         }
     }
 }
@@ -673,11 +723,11 @@ pub(crate) fn run_tray_speedtest(app: &tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// 自动更新：GitHub Release 检查（无签名）
+// 自动更新：GitHub Release 检查 + 下载 + 安装（对齐 Electron UpdateService）
 // ---------------------------------------------------------------------------
 // 检查 https://api.github.com/repos/zhangjh/FlowZ/releases/latest，
-// 对比当前版本，有新版则返回下载链接，前端弹窗提示用户去下载。
-// 不需要签名，用户手动下载安装包安装。
+// 对比当前版本，有新版则返回下载链接；前端触发后应用内下载安装包（带进度事件），
+// 下载完成再启动安装程序并退出应用，无需用户手动操作。
 
 const GITHUB_REPO: &str = "zhangjh/FlowZ";
 
@@ -760,11 +810,10 @@ pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value
         return Ok(serde_json::json!({ "hasUpdate": false }));
     }
 
-    // 按当前平台选安装包
-    let asset = pick_asset(&release.assets);
-    let (download_url, file_name, file_size) = match asset {
+    // 按当前平台选安装包；未找到对应平台安装包时视为无更新（对齐 Electron）
+    let (download_url, file_name, file_size) = match pick_asset(&release.assets) {
         Some(a) => (a.browser_download_url.clone(), a.name.clone(), a.size),
-        None => (release.html_url.clone(), String::new(), 0),
+        None => return Ok(serde_json::json!({ "hasUpdate": false })),
     };
 
     Ok(serde_json::json!({
@@ -802,10 +851,163 @@ fn pick_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
     })
 }
 
+/// 下载更新安装包（对应 Electron UpdateService.downloadUpdate）。
+/// 通过 `event:updateProgress` 上报进度，返回 { success, filePath }。
 #[tauri::command]
-async fn update_download_install(_app: tauri::AppHandle) -> Result<Value, String> {
-    // 无签名机制下不做自动下载安装，前端拿到 downloadUrl 后打开浏览器让用户手动下载
-    Err("当前版本不支持自动下载安装，请前往 GitHub Release 页面手动下载".to_string())
+async fn update_download(
+    app: tauri::AppHandle,
+    download_url: String,
+    file_name: String,
+    file_size: u64,
+) -> Result<Value, String> {
+    use std::io::Write;
+
+    let emit_progress = |status: &str, percentage: u32, message: &str| {
+        let _ = app.emit(
+            "event:updateProgress",
+            serde_json::json!({
+                "status": status,
+                "percentage": percentage,
+                "message": message,
+            }),
+        );
+    };
+
+    emit_progress("downloading", 0, "正在下载更新...");
+
+    let client = reqwest::Client::builder()
+        .user_agent("FlowZ-updater")
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let mut resp = client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| {
+            emit_progress("error", 0, "下载失败");
+            format!("下载失败: {}", e)
+        })?;
+
+    if !resp.status().is_success() {
+        emit_progress("error", 0, "下载失败");
+        return Err(format!("下载失败: HTTP {}", resp.status().as_u16()));
+    }
+
+    let total = if file_size > 0 {
+        file_size
+    } else {
+        resp.content_length().unwrap_or(0)
+    };
+
+    let file_path = std::env::temp_dir().join(&file_name);
+    if file_path.exists() {
+        let _ = std::fs::remove_file(&file_path);
+    }
+    let mut file = std::fs::File::create(&file_path).map_err(|e| {
+        emit_progress("error", 0, "创建文件失败");
+        format!("创建文件失败: {}", e)
+    })?;
+
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        emit_progress("error", 0, "下载失败");
+        format!("下载数据失败: {}", e)
+    })? {
+        file.write_all(&chunk).map_err(|e| {
+            emit_progress("error", 0, "写入文件失败");
+            format!("写入文件失败: {}", e)
+        })?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let percentage = ((downloaded.saturating_mul(100)) / total).min(100) as u32;
+            let message = format!(
+                "{:.1} MB / {:.1} MB",
+                downloaded as f64 / 1024.0 / 1024.0,
+                total as f64 / 1024.0 / 1024.0
+            );
+            emit_progress("downloading", percentage, &message);
+        }
+    }
+    file.flush().map_err(|e| format!("刷新文件失败: {}", e))?;
+    drop(file);
+
+    emit_progress("downloaded", 100, "下载完成");
+
+    Ok(serde_json::json!({
+        "success": true,
+        "filePath": file_path.to_string_lossy(),
+    }))
+}
+
+/// 安装更新（对应 Electron UpdateService.installUpdate）。
+/// 先停止代理与守护进程（避免 Windows 文件占用），再启动安装程序并退出应用。
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle, file_path: String) -> Result<Value, String> {
+    let path = std::path::PathBuf::from(&file_path);
+    if !path.exists() {
+        return Err(format!("安装包不存在: {}", file_path));
+    }
+
+    // 安装前清理代理进程，避免安装包/文件被占用导致安装失败
+    shutdown_resources(&app).await;
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        // VBScript：等待 2 秒确保应用退出后（正常窗口）启动安装程序，并删除自身
+        let script = format!(
+            "WScript.Sleep 2000\r\n\
+             Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
+             WshShell.Run \"\"\"{}\"\"\", 1, False\r\n\
+             Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+             fso.DeleteFile WScript.ScriptFullName, True\r\n",
+            file_path
+        );
+        let vbs_path = std::env::temp_dir().join("flowz_update.vbs");
+        std::fs::write(&vbs_path, script).map_err(|e| format!("写入更新脚本失败: {}", e))?;
+        std::process::Command::new("wscript.exe")
+            .arg(&vbs_path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 等待应用退出后打开 DMG，用户拖拽安装
+        let script_path = std::env::temp_dir().join("flowz_update.sh");
+        let script = format!("#!/bin/bash\nsleep 2\nopen \"{}\"\n", file_path);
+        std::fs::write(&script_path, script).map_err(|e| format!("写入更新脚本失败: {}", e))?;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("设置脚本权限失败: {}", e))?;
+        std::process::Command::new("/bin/bash")
+            .arg(&script_path)
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&file_path)
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {}", e))?;
+    }
+
+    // 给安装程序启动留出时间后退出应用（退出路径会再次走 graceful_exit，幂等）
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        app2.exit(0);
+    });
+
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
@@ -969,6 +1171,7 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .manage(shared_logs)
         .manage(PendingTrayAction::default())
+        .manage(PendingUpdateResult::default())
         .manage(tray::SpeedtestVersion::default())
         .manage(Mutex::new(proxy_manager))
         .manage(Mutex::new(sysproxy::SystemProxyManager::new()))
@@ -1042,6 +1245,7 @@ pub fn run() {
             proxy_restart,
             proxy_get_status,
             get_pending_tray_action,
+            get_pending_update_result,
             get_tray_speedtest_results,
             get_tray_speedtest_version,
             proxy_switch_server,
@@ -1059,7 +1263,8 @@ pub fn run() {
             autoselect_get_status,
             autoselect_trigger_failover,
             update_check,
-            update_download_install,
+            update_download,
+            update_install,
             update_open_releases,
         ])
         .build(tauri::generate_context!())

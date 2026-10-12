@@ -452,25 +452,25 @@ export async function checkForUpdates(): Promise<
   }
 }
 
-export async function downloadUpdate(_updateInfo: any): Promise<ApiResponse<string>> {
+export async function downloadUpdate(updateInfo: any): Promise<ApiResponse<string>> {
   try {
-    const result = await api.update.download();
-    if (result.success) {
-      return { success: true, data: '' };
+    const result = await api.update.download(updateInfo);
+    if (result.success && result.filePath) {
+      return { success: true, data: result.filePath };
     }
-    return { success: false, error: '下载失败' };
+    return { success: false, error: result.error || '下载失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
 }
 
-export async function installUpdate(_filePath: string): Promise<ApiResponse<void>> {
+export async function installUpdate(filePath: string): Promise<ApiResponse<void>> {
   try {
-    const result = await api.update.install();
+    const result = await api.update.install(filePath);
     if (result.success) {
       return { success: true };
     }
-    return { success: false, error: '安装失败' };
+    return { success: false, error: result.error || '安装失败' };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }

@@ -423,6 +423,14 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
             tray_log(app, "开始检查更新...");
             match crate::update_check_inner(false).await {
                 Ok(r) => {
+                    // 同时存一份待处理结果，事件丢失时前端轮询兜底
+                    if r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if let Some(pending) = app.try_state::<crate::PendingUpdateResult>() {
+                            if let Ok(mut slot) = pending.lock() {
+                                *slot = Some(r.clone());
+                            }
+                        }
+                    }
                     tray_log(app, "检查更新完成，已发送事件");
                     let _ = app.emit("event:updateCheckResult", &r);
                 }

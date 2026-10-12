@@ -5,7 +5,7 @@
 import { useEffect } from 'react';
 import { toast } from 'sonner';
 import { api } from '../ipc';
-import { openExternal } from '../bridge/api-wrapper';
+import { openExternal, downloadUpdate, installUpdate } from '../bridge/api-wrapper';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 
 // 定义事件数据类型
@@ -27,11 +27,16 @@ interface NativeEventData {
       title?: string;
       releasePage?: string;
       downloadUrl?: string;
+      fileName?: string;
+      fileSize?: number;
     };
   };
 }
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
+
+// 已提示过更新的版本：事件通道与待处理结果兜底可能重复投递同一版本，据此去重。
+const handledUpdateVersions = new Set<string>();
 
 // "重启中"状态的兜底定时器：
 // 重启开始事件（proxyRestarting）与结束事件（processStarted/processStopped）是两个独立 IPC，
@@ -226,18 +231,87 @@ export function useNativeEventListeners() {
   const handleUpdateCheckResult = (data: NativeEventData['updateCheckResult']) => {
     if (!data?.hasUpdate || !data.updateInfo) return;
     const info = data.updateInfo;
+    // 事件与轮询兜底可能投递同一版本，去重避免重复弹窗
+    if (handledUpdateVersions.has(info.version)) return;
+    handledUpdateVersions.add(info.version);
+
+    const downloadAndInstall = async () => {
+      const manualUrl = info.downloadUrl || info.releasePage;
+      const toastId = toast.loading('正在下载更新... 0%');
+      let unsubscribe: (() => void) | null = null;
+      if (info.downloadUrl && info.fileName) {
+        unsubscribe = api.update.onProgress((progress) => {
+          const p = progress as { status: string; percentage: number };
+          if (p.status === 'downloading') {
+            toast.loading(`正在下载更新... ${p.percentage}%`, { id: toastId });
+          }
+        });
+      }
+
+      try {
+        const result = await downloadUpdate(info);
+        unsubscribe?.();
+        unsubscribe = null;
+        if (result.success && result.data) {
+          toast.success('下载完成，正在安装...', { id: toastId });
+          await installUpdate(result.data);
+        } else {
+          toast.error('下载失败', {
+            id: toastId,
+            description: result.error,
+            action: manualUrl
+              ? { label: '手动下载', onClick: () => openExternal(manualUrl) }
+              : undefined,
+          });
+        }
+      } catch (error) {
+        unsubscribe?.();
+        toast.error('下载失败', {
+          id: toastId,
+          description: error instanceof Error ? error.message : '未知错误',
+          action: manualUrl
+            ? { label: '手动下载', onClick: () => openExternal(manualUrl) }
+            : undefined,
+        });
+      }
+    };
+
     toast.success(`发现新版本 ${info.version}`, {
       description: info.title || '可以更新到最新版本',
       action: {
-        label: '去下载',
-        onClick: () => {
-          const url = info.releasePage || info.downloadUrl;
-          if (url) openExternal(url);
-        },
+        label: '立即更新',
+        onClick: () => downloadAndInstall(),
       },
     });
   };
   useNativeEvent('updateCheckResult', handleUpdateCheckResult);
+
+  // 启动时检查更新的事件可能在 webview 注册监听器之前发出而丢失；
+  // 挂载后在前 30s 内轮询待处理结果兜底（后端取出即清，配合版本去重避免重复提示）。
+  useEffect(() => {
+    let cancelled = false;
+    let attempts = 0;
+    const timer = setInterval(async () => {
+      attempts += 1;
+      try {
+        const pending = await (api as unknown as {
+          appEvents: {
+            getPendingUpdateResult: () => Promise<NativeEventData['updateCheckResult'] | null>;
+          };
+        }).appEvents.getPendingUpdateResult();
+        if (!cancelled && pending?.hasUpdate) {
+          handleUpdateCheckResult(pending);
+        }
+      } catch {
+        // 忽略：兜底失败不影响事件通道
+      }
+      if (attempts >= 15) clearInterval(timer);
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   // 自动连接事件：主进程请求渲染进程执行代理启动（含测速）
   useNativeEvent('autoConnect', () => {
