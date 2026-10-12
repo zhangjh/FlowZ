@@ -720,8 +720,11 @@ async fn update_check(_app: tauri::AppHandle, include_prerelease: bool) -> Resul
 }
 
 pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value, String> {
+    // no_proxy：绕过系统代理/环境变量代理直连 GitHub API，
+    // 避免走代理节点导致共享 IP 触发 GitHub 未认证限流（60 次/小时）
     let client = reqwest::Client::builder()
         .user_agent("FlowZ-updater")
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
