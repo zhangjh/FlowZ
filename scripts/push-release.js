@@ -85,9 +85,9 @@ async function main() {
   npm run release:tag -- -y -u  # 跳过确认并强制更新
 
 Release Notes:
-  推送前可交互输入多行 Release Notes（写入 tag 注释，
-  GitHub Actions 会将其作为 GitHub Release 正文），
-  输入完成后在新行按 Ctrl+D 结束；直接 Ctrl+D 跳过则
+  推送前（最终确认之前）先交互输入多行 Release Notes
+  （写入 tag 注释，GitHub Actions 会将其作为 GitHub Release
+  正文），输入完成后在新行按 Ctrl+D 结束；直接 Ctrl+D 跳过则
   使用默认标题 "Release <version>"。
 `);
     process.exit(0);
@@ -128,18 +128,9 @@ Release Notes:
     process.exit(1);
   }
 
-  if (!skipConfirm) {
-    const action = remoteTagExists ? '强制更新' : '创建并推送';
-    const answer = await prompt(`${action} tag ${tag}? (y/N): `);
-    if (answer !== 'y') {
-      log('已取消', colors.yellow);
-      process.exit(0);
-    }
-  }
-
   console.log('');
 
-  // 输入 Release Notes（多行，Ctrl+D 结束）
+  // 先收集 Release Notes（多行，Ctrl+D 结束），再执行后续步骤（确认、删除/创建/推送 tag）
   let notes = null;
   if (process.stdin.isTTY) {
     notes = await promptMultiline(
@@ -149,10 +140,18 @@ Release Notes:
   const tagMessage = notes || `Release ${version}`;
 
   if (notes) {
-    console.log('');
     log('Release Notes:', colors.blue);
     console.log(notes.split('\n').map((l) => `  ${l}`).join('\n'));
     console.log('');
+  }
+
+  if (!skipConfirm) {
+    const action = remoteTagExists ? '强制更新' : '创建并推送';
+    const answer = await prompt(`${action} tag ${tag}? (y/N): `);
+    if (answer !== 'y') {
+      log('已取消', colors.yellow);
+      process.exit(0);
+    }
   }
 
   // 删除已存在的 tag
