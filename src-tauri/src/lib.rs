@@ -833,8 +833,16 @@ pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value
 
     let status = resp.status();
     if !status.is_success() {
+        // 403/429 通常是 GitHub 对当前出口 IP 的未认证限流（60 次/小时，按 IP 计数）：
+        // 命中时给出可操作的中文提示，避免直接把原始 JSON 抛给用户
+        if matches!(status.as_u16(), 403 | 429) {
+            return Err(
+                "GitHub 接口访问过于频繁，请稍后再试（未登录状态下每小时限额 60 次）"
+                    .to_string(),
+            );
+        }
         let body = resp.text().await.unwrap_or_default();
-        // 404 = 还没有发布过 release；403 = API 限流；其他按原文返回
+        // 404 = 还没有发布过 release；其他按原文返回
         if status.as_u16() == 404 {
             return Ok(serde_json::json!({ "hasUpdate": false }));
         }
