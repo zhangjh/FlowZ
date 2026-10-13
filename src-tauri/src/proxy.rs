@@ -778,6 +778,7 @@ fn is_retryable(msg: &str) -> bool {
         "eperm",
         "配置文件格式错误",
         "invalid config",
+        "关机",
     ] {
         if m.contains(pat) {
             return false;
@@ -807,6 +808,10 @@ async fn spawn_with_retry(singbox: &PathBuf, config_path: &PathBuf) -> Result<Ch
 }
 
 async fn spawn_singbox(singbox: &PathBuf, config_path: &PathBuf) -> Result<Child, String> {
+    // 关机中无法创建进程，直接放弃（否则会弹出 0xc0000142 错误框）
+    if crate::platform::system_is_shutting_down() {
+        return Err("系统正在关机，跳过启动 sing-box".to_string());
+    }
     let mut cmd = Command::new(singbox);
     cmd.arg("run")
         .arg("-c")

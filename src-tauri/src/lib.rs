@@ -11,6 +11,7 @@ mod clash;
 mod config;
 mod dns;
 mod logs;
+mod platform;
 mod protocol;
 mod proxy;
 mod singbox;
@@ -477,6 +478,7 @@ pub(crate) async fn proxy_stop_inner(app: &tauri::AppHandle) -> Result<(), Strin
 
 /// 停止代理与守护进程、恢复系统代理（不退出应用）。
 /// 供优雅退出与安装更新前清理复用。
+/// 同时供信号处理（spawn_signal_handler）复用，对齐 Electron 版 `cleanupResources`。
 pub(crate) async fn shutdown_resources(app: &tauri::AppHandle) {
     let proxy = app.state::<ProxyState>();
     {
@@ -496,6 +498,49 @@ pub(crate) async fn shutdown_resources(app: &tauri::AppHandle) {
 pub(crate) async fn graceful_exit(app: &tauri::AppHandle) {
     shutdown_resources(app).await;
     app.exit(0);
+}
+
+/// 屏蔽 SIGTERM/SIGINT：必须在创建任何后台线程之前调用，
+/// 使其后所有线程继承该屏蔽，信号统一交由 `spawn_signal_handler` 的线程接管。
+#[cfg(unix)]
+fn install_signal_mask() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// 对齐原 Electron 版 `process.on('SIGINT'/'SIGTERM')`。
+/// Linux 注销/重启时系统发送 SIGTERM，tao 不会将其转成 `RunEvent::Exit`，
+/// 故在专用线程 `sigwait`：收到信号后执行与退出相同的清理（停 sing-box、恢复系统代理）再退出；
+/// 若清理期间再次收到信号则强制退出，避免卡死无法终止。
+#[cfg(unix)]
+fn spawn_signal_handler(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CLEANING: AtomicBool = AtomicBool::new(false);
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            loop {
+                let mut sig: libc::c_int = 0;
+                if libc::sigwait(&set, &mut sig) != 0 {
+                    break;
+                }
+                if CLEANING.swap(true, Ordering::SeqCst) {
+                    // 清理中再次收到信号：立即退出
+                    std::process::exit(1);
+                }
+                tauri::async_runtime::block_on(shutdown_resources(&app));
+                std::process::exit(0);
+            }
+        }
+    });
 }
 
 /// 启动时自动连接（迁移自 Electron 版 main/index.ts 的启动自动连接逻辑）。
@@ -1153,6 +1198,10 @@ async fn autoselect_trigger_failover(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 创建任何后台线程前屏蔽 SIGTERM/SIGINT，使信号统一由专用线程处理
+    //（Linux 注销/重启只会发 SIGTERM，不会触发 RunEvent::Exit）
+    #[cfg(unix)]
+    install_signal_mask();
     let shared_logs = logs::new_shared();
     let proxy_manager = proxy::ProxyManager::new(shared_logs.clone());
     // 自动选择服务（后台健康检查 + 故障转移）
@@ -1178,6 +1227,11 @@ pub fn run() {
         .manage(autoselect)
         .manage(tray::SpeedResultMap::default())
         .setup(|app| {
+            // 启动自愈：上次异常退出（注销/重启/被杀）可能残留系统代理，先恢复
+            sysproxy::restore_stale_system_proxy(false);
+            // 注销/重启（SIGTERM/SIGINT）时同步清理，对齐原 Electron 版信号处理
+            #[cfg(unix)]
+            spawn_signal_handler(app.handle().clone());
             // 托盘（动态菜单）
             if let Err(e) = tray::setup_tray(app.handle()) {
                 eprintln!("[tray] {}", e);
@@ -1275,19 +1329,27 @@ pub fn run() {
     let cleanup_started = std::sync::atomic::AtomicBool::new(false);
     app.run(move |app, event| {
         use std::sync::atomic::Ordering;
-        // 所有退出路径（最后一个窗口关闭、托盘退出、Cmd+Q）统一走一次清理：
-        // 停 sing-box 与守护进程、恢复系统代理，完成后再真正退出。
-        // 进程直接退出会杀掉异步清理任务，导致 sing-box 残留、代理继续生效
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
-            if !cleanup_started.swap(true, Ordering::SeqCst) {
-                api.prevent_exit();
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    graceful_exit(&app).await;
-                });
-                // graceful_exit 末尾的 app.exit(0) 会再触发一次 ExitRequested，
-                // 此时标志已置位，直接放行真正退出
+        match event {
+            // 正常退出路径（最后一个窗口关闭、托盘退出、Cmd+Q）统一走一次清理：
+            // 停 sing-box 与守护进程、恢复系统代理，完成后再真正退出。
+            // 进程直接退出会杀掉异步清理任务，导致 sing-box 残留、代理继续生效
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !cleanup_started.swap(true, Ordering::SeqCst) {
+                    api.prevent_exit();
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        graceful_exit(&app).await;
+                    });
+                    // graceful_exit 末尾的 app.exit(0) 会再触发一次 ExitRequested，
+                    // 此时标志已置位，直接放行真正退出
+                }
             }
+            // 系统注销/重启不触发 ExitRequested，仅触发 Exit；此时异步清理已来不及，
+            // 同步兜底恢复系统代理，避免重启后浏览器残留代理导致无法上网
+            tauri::RunEvent::Exit => {
+                sysproxy::restore_stale_system_proxy(true);
+            }
+            _ => {}
         }
     });
 }

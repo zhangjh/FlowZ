@@ -545,6 +545,10 @@ impl PrivilegedSupervisor {
                 "Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '{}'",
                 arg_str.replace('\'', "''")
             );
+            // 关机中无法创建 powershell，跳过（否则弹出 0xc0000142 错误框）
+            if crate::platform::system_is_shutting_down() {
+                return Ok(());
+            }
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW：外层 powershell 也是控制台程序，不隐藏会闪黑窗

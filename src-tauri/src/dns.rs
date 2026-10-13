@@ -77,6 +77,10 @@ fn get_linux_dns_servers() -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 fn get_windows_dns_servers() -> Vec<String> {
+    // 关机中无法创建 powershell/ipconfig，直接返回空（否则弹出 0xc0000142 错误框）
+    if crate::platform::system_is_shutting_down() {
+        return Vec::new();
+    }
     // 方法 1: PowerShell
     let mut ps_cmd = Command::new("powershell");
     ps_cmd.creation_flags(0x08000000); // 不弹控制台

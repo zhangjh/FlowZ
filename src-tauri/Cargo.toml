@@ -31,3 +31,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-os = "2"
 image = "0.25"
 regex = "1"
+
+[target.'cfg(windows)'.dependencies]
+# 系统代理退出/自愈路径用进程内读写注册表（详见 src/sysproxy.rs reg_query_sync）
+winreg = "0.56"
