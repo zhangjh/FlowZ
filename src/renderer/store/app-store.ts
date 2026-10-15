@@ -125,8 +125,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   startProxy: async () => {
     set({ isLoading: true, error: null, proxyPhase: 'testing' });
     try {
-      // 获取当前配置
-      const currentConfig = get().config;
+      // 以后端已保存的配置为准：内存里的选择可能滞后（例如托盘切节点后旧分组残留），
+      // 而后端对「单节点/分组」有互斥校验（分组优先），传旧配置会导致启动沿用旧选择
+      let currentConfig = get().config;
+      try {
+        currentConfig = await api.config.get();
+      } catch (e) {
+        console.warn('[StartProxy] 读取后端配置失败，退回内存配置:', e);
+      }
       if (!currentConfig) {
         throw new Error('配置未加载');
       }
@@ -147,7 +153,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
       }
 
-      await api.proxy.start(currentConfig);
+      // proxy_start 30 秒超时保护：避免后端 hang 住时前端无限卡"测速中"
+      const startTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('启动代理超时（30秒）：后端无响应，请检查日志')), 30000)
+      );
+      await Promise.race([api.proxy.start(currentConfig), startTimeout]);
       // 测试完成，进入连接阶段
       set({ proxyPhase: 'connecting' });
       // 启动成功后不立即设置 isLoading = false，而是等待状态轮询完成
@@ -363,7 +373,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Update local config
       const currentConfig = get().config;
       if (currentConfig) {
-        set({ config: { ...currentConfig, selectedServerId: serverId } });
+        // 单节点与分组互斥：选了节点必须同时清掉分组，
+        // 否则后端「分组优先」的校验会让这次切换被静默忽略（选了也白选）
+        set({
+          config: { ...currentConfig, selectedServerId: serverId, selectedGroupId: null },
+        });
       }
       // Refresh connection status
       await get().refreshConnectionStatus();
@@ -380,16 +394,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const proxyStatus = await api.proxy.getStatus();
       const current = get().connectionStatus;
+      const ps = proxyStatus as { running: boolean; pid?: number; uptime?: number; error?: string };
       const next: ConnectionStatus = {
         proxyCore: {
-          running: proxyStatus.running,
-          pid: proxyStatus.pid,
-          uptime: proxyStatus.uptime,
-          error: proxyStatus.error,
+          running: ps.running,
+          pid: ps.pid,
+          uptime: ps.uptime,
+          error: ps.error,
         },
         proxy: {
-          enabled: proxyStatus.running,
-          server: proxyStatus.currentServer?.name,
+          enabled: ps.running,
+          server: (ps as { currentServer?: { name?: string } }).currentServer?.name,
         },
         proxyModeType: get().config?.proxyModeType || 'systemProxy',
       };
@@ -403,6 +418,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         current.proxyModeType !== next.proxyModeType
       ) {
         set({ connectionStatus: next });
+      }
+      // 代理实际在运行但 store 有残留 error（如超时后实际连上了），清除错误状态
+      if (next.proxyCore.running && get().error) {
+        set({ error: null });
       }
     } catch (error) {
       console.error('Failed to refresh connection status:', error);
@@ -569,7 +588,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadAutoSelectStatus: async () => {
     try {
       const status = await api.autoSelect.getStatus();
-      set({ autoSelectStatus: status });
+      set({ autoSelectStatus: status as never });
     } catch (error) {
       console.error('Failed to load auto-select status:', error);
     }
@@ -578,7 +597,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   testAllServers: async (serverIds?: string[]) => {
     set({ isSpeedTesting: true, error: null });
     try {
-      const results = await api.autoSelect.testServers(serverIds);
+      const results = (await api.autoSelect.testServers(serverIds)) as ServerSpeedResult[];
       set({ speedTestResults: results });
       // Also refresh auto-select status
       await get().loadAutoSelectStatus();

@@ -11,8 +11,7 @@ import {
   installUpdate,
   openExternal,
 } from '@/bridge/api-wrapper';
-import { api } from '@/ipc/api-client';
-import type { UpdateProgress } from '@/ipc/api-client';
+import { api } from '@/ipc';
 
 interface VersionInfo {
   appVersion: string;
@@ -21,6 +20,20 @@ interface VersionInfo {
   singBoxVersion: string;
   copyright: string;
   repositoryUrl: string;
+}
+
+interface UpdateProgress {
+  status:
+    | 'idle'
+    | 'checking'
+    | 'downloading'
+    | 'downloaded'
+    | 'error'
+    | 'no-update'
+    | 'update-available';
+  percentage: number;
+  message: string;
+  error?: string;
 }
 
 export function AboutSettings() {
@@ -62,15 +75,16 @@ export function AboutSettings() {
     setDownloadProgress(0);
 
     // 订阅进度更新
-    progressUnsubscribeRef.current = api.update.onProgress((progress: UpdateProgress) => {
-      if (progress.status === 'downloading') {
-        setDownloadProgress(progress.percentage);
-      } else if (progress.status === 'downloaded') {
+    progressUnsubscribeRef.current = api.update.onProgress((progress) => {
+      const p = progress as UpdateProgress;
+      if (p.status === 'downloading') {
+        setDownloadProgress(p.percentage);
+      } else if (p.status === 'downloaded') {
         setDownloadProgress(100);
-      } else if (progress.status === 'error') {
+      } else if (p.status === 'error') {
         setDownloading(false);
         toast.error('下载失败', {
-          description: progress.error || progress.message,
+          description: p.error || p.message,
           action: {
             label: '手动下载',
             onClick: () => openExternal(updateInfo.downloadUrl),
@@ -119,9 +133,9 @@ export function AboutSettings() {
     try {
       setCheckingUpdate(true);
       toast.info('正在检查更新...');
-      
+
       const response = await checkForUpdates();
-      
+
       if (!response || !response.success) {
         toast.error('检查更新失败', {
           description: response?.error || '无法连接到更新服务器',

@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { Home, Server, ListFilter, Settings } from 'lucide-react';
+import { platform } from '@tauri-apps/plugin-os';
 import { cn } from '@/lib/utils';
 
 interface SidebarProps {
@@ -13,9 +15,14 @@ const navItems = [
   { id: 'settings', label: '设置', icon: Settings },
 ];
 
-const isMac = window.electron?.platform === 'darwin';
-
 export function Sidebar({ currentView, onViewChange }: SidebarProps) {
+  const [isMac] = useState(() => {
+    try {
+      return platform() === 'macos';
+    } catch {
+      return false;
+    }
+  });
   return (
     <div className="w-[200px] border-r bg-card h-full flex flex-col">
       <div className={cn('p-4 border-b', isMac && 'pt-8')}>

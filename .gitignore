@@ -48,3 +48,11 @@ Desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Tauri
+src-tauri/target/
+src-tauri/bundle-resources/
+src-tauri/WixTools/
+src-tauri/gen
+
+.workbuddy

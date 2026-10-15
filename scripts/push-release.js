@@ -45,6 +45,23 @@ function prompt(question) {
   });
 }
 
+/**
+ * 多行输入，以 Ctrl+D（EOF）结束
+ * 返回去掉首尾空行的文本；空输入返回 null
+ */
+function promptMultiline(hint) {
+  return new Promise((resolve) => {
+    console.log(hint);
+    const lines = [];
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('line', (line) => lines.push(line));
+    rl.on('close', () => {
+      const text = lines.join('\n').trim();
+      resolve(text || null);
+    });
+  });
+}
+
 async function main() {
   const skipConfirm = process.argv.includes('-y') || process.argv.includes('--yes');
   // 使用 -u/--update 替代 -f/--force，因为 npm 会拦截 -f
@@ -66,6 +83,12 @@ async function main() {
   npm run release:tag           # 创建并推送 tag
   npm run release:tag -- -u     # 强制更新已存在的 tag
   npm run release:tag -- -y -u  # 跳过确认并强制更新
+
+Release Notes:
+  推送前（最终确认之前）先交互输入多行 Release Notes
+  （写入 tag 注释，GitHub Actions 会将其作为 GitHub Release
+  正文），输入完成后在新行按 Ctrl+D 结束；直接 Ctrl+D 跳过则
+  使用默认标题 "Release <version>"。
 `);
     process.exit(0);
   }
@@ -105,6 +128,23 @@ async function main() {
     process.exit(1);
   }
 
+  console.log('');
+
+  // 先收集 Release Notes（多行，Ctrl+D 结束），再执行后续步骤（确认、删除/创建/推送 tag）
+  let notes = null;
+  if (process.stdin.isTTY) {
+    notes = await promptMultiline(
+      `${colors.cyan}📝 请输入 Release Notes（多行文本，新行按 Ctrl+D 结束，直接 Ctrl+D 跳过）:${colors.reset}`
+    );
+  }
+  const tagMessage = notes || `Release ${version}`;
+
+  if (notes) {
+    log('Release Notes:', colors.blue);
+    console.log(notes.split('\n').map((l) => `  ${l}`).join('\n'));
+    console.log('');
+  }
+
   if (!skipConfirm) {
     const action = remoteTagExists ? '强制更新' : '创建并推送';
     const answer = await prompt(`${action} tag ${tag}? (y/N): `);
@@ -113,8 +153,6 @@ async function main() {
       process.exit(0);
     }
   }
-
-  console.log('');
 
   // 删除已存在的 tag
   if (forceUpdate) {
@@ -128,10 +166,11 @@ async function main() {
     }
   }
 
-  // 创建 tag
+  // 创建 tag（-F - 从 stdin 读取多行注释，避免命令行转义问题；
+  // --cleanup=verbatim 防止 # 开头的 Markdown 标题被当注释剥离）
   if (!localTagExists || forceUpdate) {
     log(`创建 tag ${tag}...`, colors.blue);
-    exec(`git tag -a ${tag} -m "Release ${version}"`, true);
+    execSync(`git tag -a --cleanup=verbatim ${tag} -F -`, { encoding: 'utf-8', input: tagMessage, stdio: 'pipe' });
   }
 
   // 推送 tag

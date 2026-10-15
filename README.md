@@ -2,7 +2,7 @@
 
 简洁现代的跨平台代理客户端，基于 sing-box 核心，支持 VLESS、Trojan和hysteria2协议（当前主流最安全好用的协议），主打配置简单，规则明确，体验优良所见即所得。
 
-<img width="1503" height="1039" alt="image" src="https://github.com/user-attachments/assets/2229eefb-1f05-4472-9e05-9c8863eb9c46" />
+<img width="1503" height="1039" alt="image" src="https://github.com/user-attachments/assets/83b77694-d343-4fc7-aace-cd3d28ad3059" />
 
 ## ✨ 功能特性
 
@@ -48,7 +48,7 @@ npm run package:win   # Windows
 npm run package:mac   # macOS
 ```
 
-macOS Intel 用户需要修改 `electron-builder.json` 中的 `mac.target.arch` 为 `["x64"]`。
+macOS Intel 用户打包前确认 Rust target 为 `x86_64-apple-darwin`。
 
 ### mac下若打开提示“软件已损坏”，可在终端执行`xattr -cr /Applications/FLowZ.app`后再打开
 
@@ -82,7 +82,7 @@ macOS Intel 用户需要修改 `electron-builder.json` 中的 `mac.target.arch` 
 
 ## 🔧 技术栈
 
-- Electron
+- Tauri 2 （Rust 后端）
 - React 18 + TypeScript
 - sing-box 核心
 - Tailwind CSS + shadcn/ui

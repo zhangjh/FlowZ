@@ -45,7 +45,7 @@ resources/
 
 ## 打包配置
 
-在 `electron-builder` 配置中，需要将 `resources` 目录包含到打包产物中：
+在 `tauri.conf.json` 的 `bundle.resources` 配置中，需要将 `resources` 目录包含到打包产物中：
 
 ```json
 {
@@ -68,7 +68,7 @@ resources/
 1. **可执行权限**: macOS 的 sing-box 文件需要可执行权限（`chmod +x`）
 2. **文件大小**: sing-box 可执行文件较大（~30-35MB），会影响安装包大小
 3. **更新**: GeoIP/GeoSite 数据文件需要定期更新以获得最新的路由规则
-4. **图标复用**: 托盘图标直接复用应用图标（app.ico/app.icns），Electron 会自动处理不同平台和 DPI 的适配
+4. **图标复用**: 托盘图标直接复用应用图标（app.ico/app.icns），Tauri 会处理不同平台的适配
 
 ## sing-box 版本
 

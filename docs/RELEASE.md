@@ -1,6 +1,6 @@
 # 发布指南
 
-本文档描述了如何发布 FlowZ Electron 的新版本。
+本文档描述了如何发布 FlowZ 的新版本。
 
 ## 前置要求
 
@@ -84,6 +84,13 @@
    ```
 
 3. **创建并推送 tag**
+
+   推荐使用脚本，可在推送前交互输入多行 Release Notes（Ctrl+D 结束，跳过则使用提交列表兜底）：
+   ```bash
+   npm run release:tag
+   ```
+
+   或手动创建：
    ```bash
    git tag -a v1.0.1 -m "Release 1.0.1"
    git push origin v1.0.1
@@ -201,7 +208,7 @@ GitHub Actions 使用以下环境变量：
 
 ## 参考资料
 
-- [Electron Builder 文档](https://www.electron.build/)
+- [Tauri 文档](https://tauri.app/)
 - [GitHub CLI 文档](https://cli.github.com/manual/)
 - [GitHub Actions 文档](https://docs.github.com/en/actions)
 - [语义化版本规范](https://semver.org/lang/zh-CN/)
