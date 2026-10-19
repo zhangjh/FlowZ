@@ -95,9 +95,9 @@ export function RealTimeLogs() {
   useEffect(() => {
     const loadInitialLogs = async () => {
       try {
-        const response = await getLogs(500);
+        const response = await getLogs(MAX_LOGS);
         if (response && response.success && response.data) {
-          setLogs(response.data);
+          setLogs((response.data as LogEntry[]).slice(-MAX_LOGS));
         }
       } catch (error) {
         console.error('Failed to load initial logs:', error);
@@ -115,16 +115,24 @@ export function RealTimeLogs() {
 
     addEventListener('logReceived', handleLogReceived);
 
-    // 轮询兜底：每 2 秒拉取新日志，防止事件丢失导致不更新
-    let lastCount = 0;
+    // 轮询兜底：每 2 秒拉取新日志，防止事件丢失导致不更新。
+    // 注意：环形缓冲写满后 getLogs(MAX_LOGS) 会稳定返回 MAX_LOGS 条，
+    // 只比较长度会让列表在满 MAX_LOGS 条后永久停止刷新，
+    // 因此改为按“最后一条日志内容”判断是否有新日志。
+    const signatureOf = (list: LogEntry[]): string => {
+      const last = list[list.length - 1];
+      return last ? `${list.length}:${last.timestamp}:${last.source}:${last.message}` : '0';
+    };
+    let lastSignature = '';
     const pollTimer = setInterval(async () => {
       try {
-        const response = await getLogs(500);
+        const response = await getLogs(MAX_LOGS);
         if (response && response.success && response.data) {
-          const logs = response.data as LogEntry[];
-          if (logs.length !== lastCount) {
-            lastCount = logs.length;
-            setLogs(logs.slice(-MAX_LOGS));
+          const fetched = response.data as LogEntry[];
+          const signature = signatureOf(fetched);
+          if (signature !== lastSignature) {
+            lastSignature = signature;
+            setLogs(fetched.slice(-MAX_LOGS));
           }
         }
       } catch {
@@ -194,9 +202,11 @@ export function RealTimeLogs() {
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-baseline gap-2">
             <CardTitle>实时日志</CardTitle>
-            <span className="text-xs text-muted-foreground">
-              {filteredLogs.length}/{logs.length} 条
-            </span>
+            {searchQuery.trim() && (
+              <span className="text-xs text-muted-foreground">
+                搜索结果 {filteredLogs.length} 条
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
