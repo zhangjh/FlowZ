@@ -448,7 +448,10 @@ export async function checkForUpdates(): Promise<
     } | undefined;
     return { success: true, data: result };
   } catch (error: any) {
-    return { success: false, error: error?.message };
+    return {
+      success: false,
+      error: typeof error === 'string' ? error : error?.message,
+    };
   }
 }
 

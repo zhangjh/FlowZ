@@ -619,7 +619,7 @@ async fn auto_check_update_on_launch(app: &tauri::AppHandle) {
         return;
     }
     log_update(app, logs::LogLevel::Info, "正在自动检查更新...");
-    match update_check_inner(false).await {
+    match update_check_inner(app, false).await {
         Ok(r) => {
             let has_update = r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false);
             if has_update {
@@ -809,20 +809,77 @@ fn is_newer(latest: &str, current: &str) -> bool {
     parse(latest) > parse(current)
 }
 
-#[tauri::command]
-async fn update_check(_app: tauri::AppHandle, include_prerelease: bool) -> Result<Value, String> {
-    update_check_inner(include_prerelease).await
+/// 更新请求使用的 HTTP 客户端，与“代理设置”保持一致：
+/// - 代理未运行时直连（no_proxy，避免受系统/环境变量代理影响）；
+/// - 代理运行时经由 sing-box 本地 HTTP 代理（127.0.0.1:http_port），
+///   降低 GitHub API 按出口 IP 未认证限流（60 次/小时）的概率。
+async fn build_update_http_client(
+    app: &tauri::AppHandle,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent("FlowZ-updater")
+        .timeout(timeout);
+
+    let proxy_url = {
+        let running = match app.try_state::<ProxyState>() {
+            Some(state) => state.lock().await.is_running(),
+            None => false,
+        };
+        if running {
+            config::load_config()
+                .ok()
+                .map(|c| format!("http://127.0.0.1:{}", c.http_port))
+        } else {
+            None
+        }
+    };
+
+    builder = match proxy_url {
+        Some(url) => {
+            let http = reqwest::Proxy::http(&url).map_err(|e| format!("设置代理失败: {}", e))?;
+            let https =
+                reqwest::Proxy::https(&url).map_err(|e| format!("设置代理失败: {}", e))?;
+            builder.proxy(http).proxy(https)
+        }
+        None => builder.no_proxy(),
+    };
+
+    builder
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))
 }
 
-pub(crate) async fn update_check_inner(include_prerelease: bool) -> Result<Value, String> {
-    // no_proxy：绕过系统代理/环境变量代理直连 GitHub API，
-    // 避免走代理节点导致共享 IP 触发 GitHub 未认证限流（60 次/小时）
-    let client = reqwest::Client::builder()
-        .user_agent("FlowZ-updater")
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle, include_prerelease: bool) -> Result<Value, String> {
+    log_update(&app, logs::LogLevel::Info, "开始检查更新...");
+    match update_check_inner(&app, include_prerelease).await {
+        Ok(r) => {
+            let has_update = r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false);
+            if has_update {
+                let version = r
+                    .get("updateInfo")
+                    .and_then(|i| i.get("version"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                log_update(&app, logs::LogLevel::Info, &format!("发现新版本: {}", version));
+            } else {
+                log_update(&app, logs::LogLevel::Info, "当前已是最新版本");
+            }
+            Ok(r)
+        }
+        Err(e) => {
+            log_update(&app, logs::LogLevel::Warn, &format!("检查更新失败: {}", e));
+            Err(e)
+        }
+    }
+}
+
+pub(crate) async fn update_check_inner(
+    app: &tauri::AppHandle,
+    include_prerelease: bool,
+) -> Result<Value, String> {
+    let client = build_update_http_client(app, std::time::Duration::from_secs(10)).await?;
 
     let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
     let resp = client
@@ -928,11 +985,7 @@ async fn update_download(
 
     emit_progress("downloading", 0, "正在下载更新...");
 
-    let client = reqwest::Client::builder()
-        .user_agent("FlowZ-updater")
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let client = build_update_http_client(&app, std::time::Duration::from_secs(600)).await?;
 
     let mut resp = client
         .get(&download_url)

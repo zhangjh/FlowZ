@@ -421,7 +421,7 @@ async fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         "update" => {
             tray_log(app, "开始检查更新...");
-            match crate::update_check_inner(false).await {
+            match crate::update_check_inner(app, false).await {
                 Ok(r) => {
                     // 同时存一份待处理结果，事件丢失时前端轮询兜底
                     if r.get("hasUpdate").and_then(|v| v.as_bool()).unwrap_or(false) {
