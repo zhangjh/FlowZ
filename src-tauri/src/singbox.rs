@@ -22,7 +22,14 @@ const PRIVATE_IP_CIDRS: &[&str] = &[
     "224.0.0.0/4",
     "240.0.0.0/4",
     "::1/128",
-    "fc00::/7",
+    // 不能用 fc00::/7：fakeip 的 inet6_range 是 fc00::/18，完全落在 fc00::/7 内，
+    // TUN 模式下 IPv6-first 站点（如 Google、login.microsoftonline.com）的 AAAA fakeip
+    // 连接会被这条私有段规则吞成 direct，拨一个不可路由的 ULA 地址 → 挂；
+    // 走 IPv4 fakeip 198.18/15 的请求不受影响，所以症状是偶发而非全挂。
+    // fd00::/8 与 fc00::/18 完全不重叠，且实际 ULA 部署几乎都用 fd00::/8
+    // （fc00::/8 的 L=0 未定义），内网 IPv6 直连能力保留。
+    // 与 Android 端 SingBoxConfigGenerator.PRIVATE_IP_CIDRS 保持一致（commit dfccbf3）。
+    "fd00::/8",
     "fe80::/10",
     "ff00::/8",
 ];
@@ -1088,6 +1095,7 @@ fn generate_route_config(config: &UserConfig, ctx: &GenContext) -> SingBoxRouteC
 mod tests {
     use super::*;
     use crate::config::default_config;
+    use std::net::Ipv6Addr;
 
     pub fn sample_ctx() -> GenContext {
         GenContext {
@@ -1296,5 +1304,69 @@ mod tests {
         });
         assert!(covered, "缺少上游 DNS {} 的直连路由规则", expected);
     }
-}
 
+    /// 回归：私有段不得吞掉 fakeip 的 IPv6 地址（历史坑是 fc00::/7 ⊇ fc00::/18）。
+    /// 断言的是不变量而非字面量——任何 direct 的 ip_cidr 规则都不能覆盖 fakeip v6 段内
+    /// 地址，否则 TUN 模式下 IPv6-first 的连接会被判成私有地址直连、拨不可路由的 ULA；
+    /// 同时内网 ULA（fd00::/8）直连能力必须保留。
+    #[test]
+    fn private_ip_direct_rule_must_not_swallow_fakeip_v6() {
+        let mut cfg = sample_config();
+        cfg.proxy_mode_type = crate::config::ProxyModeType::Tun;
+        let sb = generate_singbox_config(&cfg, &sample_ctx()).unwrap();
+
+        let inet6 = sb
+            .dns
+            .as_ref()
+            .unwrap()
+            .servers
+            .iter()
+            .find(|s| s.server_type == "fakeip")
+            .and_then(|s| s.inet6_range.clone())
+            .expect("fakeip inet6_range 缺失");
+        assert_eq!(inet6, "fc00::/18");
+
+        let direct_cidrs: Vec<String> = sb
+            .route
+            .as_ref()
+            .unwrap()
+            .rules
+            .iter()
+            .filter(|r| r.outbound.as_deref() == Some("direct"))
+            .flat_map(|r| r.ip_cidr.clone().unwrap_or_default())
+            .collect();
+
+        assert!(
+            !direct_cidrs
+                .iter()
+                .any(|c| cidr6_contains(c, FAKEIP_V6_PROBE)),
+            "direct ip_cidr 覆盖了 fakeip IPv6 地址，TUN 下会被吞成直连：{:?}",
+            direct_cidrs
+        );
+        assert!(
+            direct_cidrs.iter().any(|c| cidr6_contains(c, ULA_PROBE)),
+            "私有段应保留 fd00::/8 内网 ULA 直连：{:?}",
+            direct_cidrs
+        );
+    }
+
+    const FAKEIP_V6_PROBE: Ipv6Addr = Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1);
+    const ULA_PROBE: Ipv6Addr = Ipv6Addr::new(0xfd12, 0, 0, 0, 0, 0, 0, 1);
+
+    /// IPv6 CIDR 是否包含给定地址；非 IPv6 写法（如 10.0.0.0/8）一律不匹配。
+    fn cidr6_contains(cidr: &str, ip: Ipv6Addr) -> bool {
+        let (net, prefix) = match cidr.split_once('/') {
+            Some((n, p)) => (n, p.parse::<u32>().unwrap_or(128)),
+            None => (cidr, 128),
+        };
+        let Ok(net) = net.parse::<Ipv6Addr>() else {
+            return false;
+        };
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        u128::from(net) & mask == u128::from(ip) & mask
+    }
+}
