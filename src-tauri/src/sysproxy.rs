@@ -14,6 +14,9 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SystemProxyStatus {
     pub enabled: bool,
+    /// 当前平台是否支持查询真实系统代理状态。
+    /// 为 false 时 `enabled` 恒为 false 仅表示「未实现」，前端不能据此判定代理未生效。
+    pub supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_proxy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,10 +104,17 @@ impl SystemProxyManager {
         {
             self.status_linux().await
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            // Windows/macOS 状态查询：直接移植为后续实现保留，当前返回未启用
-            // TODO(phase-5): 补全 win/mac 的 getProxyStatus
+            self.status_macos().await
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // TODO(phase-5): 补全 win 的 getProxyStatus
+            SystemProxyStatus::default()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
             SystemProxyStatus::default()
         }
     }
@@ -312,6 +322,7 @@ impl SystemProxyManager {
         if self.ensure_gsettings().await.is_err() {
             return st;
         }
+        st.supported = true;
         let mode = self.get_string("org.gnome.system.proxy", "mode").await.unwrap_or_default();
         if mode != "manual" {
             return st;
@@ -718,8 +729,27 @@ fn apply_backup_windows(
 }
 
 // ---------------------------------------------------------------------------
-// macOS: networksetup（直接移植，未在沙箱实测）
+// macOS: networksetup
 // ---------------------------------------------------------------------------
+
+/// 解析 `networksetup -listallnetworkservices` 的输出为可用服务名列表。
+///
+/// 输出首行是说明文字：
+/// `An asterisk (*) denotes that a network service is disabled.`
+/// 它不以 `*` 开头，若被当成服务名传给 `-setwebproxy` 会返回
+/// `** Error: The parameters were not valid.`（exit 4），进而让整个设置流程中断，
+/// 结果是一个服务都没配上——界面显示已连接但实际无法上网。
+#[cfg(target_os = "macos")]
+fn parse_network_services(out: &str) -> Vec<String> {
+    out.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.contains("denotes that a network service is disabled"))
+        // 以 '*' 开头 = 该服务已停用，跳过
+        .filter(|l| !l.starts_with('*'))
+        .map(|l| l.to_string())
+        .collect()
+}
 
 #[cfg(target_os = "macos")]
 impl SystemProxyManager {
@@ -730,18 +760,23 @@ impl SystemProxyManager {
             .await
             .map_err(|e| format!("networksetup 执行失败: {}", e))?;
         if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit code {}", out.status.code().unwrap_or(-1))
+            };
+            return Err(detail);
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
     async fn network_services(&self) -> Result<Vec<String>, String> {
         let out = self.ns(&["-listallnetworkservices"]).await?;
-        Ok(out
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('*'))
-            .collect())
+        Ok(parse_network_services(&out))
     }
 
     async fn enable_macos(
@@ -760,13 +795,30 @@ impl SystemProxyManager {
         let sport = socks_port.to_string();
         let result: Result<(), String> = async {
             let services = self.network_services().await?;
+            if services.is_empty() {
+                return Err("未找到可用的网络服务".to_string());
+            }
+            let mut applied = 0usize;
+            let mut failures: Vec<String> = Vec::new();
             for svc in &services {
-                self.ns(&["-setwebproxy", svc, address, &port]).await?;
-                self.ns(&["-setwebproxystate", svc, "on"]).await?;
-                self.ns(&["-setsecurewebproxy", svc, address, &port]).await?;
-                self.ns(&["-setsecurewebproxystate", svc, "on"]).await?;
-                self.ns(&["-setsocksfirewallproxy", svc, address, &sport]).await?;
-                self.ns(&["-setsocksfirewallproxystate", svc, "on"]).await?;
+                // 单个服务失败（服务刚被拔掉/被系统回收）不应中断其余服务
+                let one: Result<(), String> = async {
+                    self.ns(&["-setwebproxy", svc, address, &port]).await?;
+                    self.ns(&["-setwebproxystate", svc, "on"]).await?;
+                    self.ns(&["-setsecurewebproxy", svc, address, &port]).await?;
+                    self.ns(&["-setsecurewebproxystate", svc, "on"]).await?;
+                    self.ns(&["-setsocksfirewallproxy", svc, address, &sport]).await?;
+                    self.ns(&["-setsocksfirewallproxystate", svc, "on"]).await?;
+                    Ok(())
+                }
+                .await;
+                match one {
+                    Ok(()) => applied += 1,
+                    Err(e) => failures.push(format!("{} ({})", svc, e)),
+                }
+            }
+            if applied == 0 {
+                return Err(format!("所有网络服务均设置失败: {}", failures.join("; ")));
             }
             Ok(())
         }
@@ -788,11 +840,54 @@ impl SystemProxyManager {
         // 备份的还原由 disable_proxy 统一处理，这里只做无备份时的兜底关闭
         let services = self.network_services().await?;
         for svc in &services {
-            self.ns(&["-setwebproxystate", svc, "off"]).await?;
-            self.ns(&["-setsecurewebproxystate", svc, "off"]).await?;
-            self.ns(&["-setsocksfirewallproxystate", svc, "off"]).await?;
+            let _ = self.ns(&["-setwebproxystate", svc, "off"]).await;
+            let _ = self.ns(&["-setsecurewebproxystate", svc, "off"]).await;
+            let _ = self.ns(&["-setsocksfirewallproxystate", svc, "off"]).await;
         }
         Ok(())
+    }
+
+    /// 读取真实系统代理状态：取第一个「HTTP 代理已启用」的服务作为代表，
+    /// 供前端判断系统代理是否真的生效（此前恒返回未启用，界面无法反映实际状态）。
+    async fn status_macos(&self) -> SystemProxyStatus {
+        let mut st = SystemProxyStatus::default();
+        let Ok(services) = self.network_services().await else {
+            return st;
+        };
+        st.supported = true;
+        for svc in &services {
+            let web = self
+                .ns(&["-getwebproxy", svc])
+                .await
+                .ok()
+                .map(|o| parse_proxy_block(&o))
+                .unwrap_or_default();
+            if !web.0 || web.1.is_empty() || web.2 == 0 {
+                continue;
+            }
+            st.enabled = true;
+            st.http_proxy = Some(format!("{}:{}", web.1, web.2));
+            let secure = self
+                .ns(&["-getsecurewebproxy", svc])
+                .await
+                .ok()
+                .map(|o| parse_proxy_block(&o))
+                .unwrap_or_default();
+            if secure.0 && !secure.1.is_empty() && secure.2 > 0 {
+                st.https_proxy = Some(format!("{}:{}", secure.1, secure.2));
+            }
+            let socks = self
+                .ns(&["-getsocksfirewallproxy", svc])
+                .await
+                .ok()
+                .map(|o| parse_proxy_block(&o))
+                .unwrap_or_default();
+            if socks.0 && !socks.1.is_empty() && socks.2 > 0 {
+                st.socks_proxy = Some(format!("{}:{}", socks.1, socks.2));
+            }
+            return st;
+        }
+        st
     }
 }
 
@@ -812,12 +907,7 @@ fn ns_sync(args: &[&str]) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn macos_services_sync() -> Vec<String> {
     ns_sync(&["-listallnetworkservices"])
-        .map(|out| {
-            out.lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty() && !l.starts_with('*'))
-                .collect()
-        })
+        .map(|out| parse_network_services(&out))
         .unwrap_or_default()
 }
 
@@ -942,5 +1032,54 @@ mod tests {
         assert!(proxy_server_is_self(flowz, "127.0.0.1", 65534));
         assert!(!proxy_server_is_self(flowz, "127.0.0.1", 7890));
         assert!(!proxy_server_is_self("http=corp:8080", "127.0.0.1", 65533));
+    }
+
+    /// `-listallnetworkservices` 首行说明文字不能被当成服务名，
+    /// 否则 `-setwebproxy` 会因参数非法直接中断整个设置流程。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_network_services_skips_header_and_disabled() {
+        let out = "An asterisk (*) denotes that a network service is disabled.\n\
+                   USB 10/100/1000 LAN\n\
+                   *Thunderbolt Bridge\n\
+                   Wi-Fi\n";
+        assert_eq!(
+            parse_network_services(out),
+            vec!["USB 10/100/1000 LAN".to_string(), "Wi-Fi".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_proxy_block_output() {
+        let out = "Enabled: Yes\nServer: 127.0.0.1\nPort: 65533\nAuthenticated Proxy Enabled: 0\n";
+        let (enabled, server, port) = parse_proxy_block(out);
+        assert!(enabled);
+        assert_eq!(server, "127.0.0.1");
+        assert_eq!(port, 65533);
+    }
+
+    /// 真机端到端：真实改写系统代理再还原。
+    /// 默认 ignore（会动系统网络设置），需要时手动执行：
+    /// `cargo test --lib sysproxy::tests::macos_enable_disable_roundtrip -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "会真实修改系统代理设置"]
+    async fn macos_enable_disable_roundtrip() {
+        let mut m = SystemProxyManager::new();
+
+        m.enable_proxy("127.0.0.1", 65533, 65534)
+            .await
+            .expect("启用系统代理失败");
+
+        let st = m.get_proxy_status().await;
+        assert!(st.supported, "macOS 应支持状态查询");
+        assert!(st.enabled, "启用后状态应为已启用");
+        assert_eq!(st.http_proxy.as_deref(), Some("127.0.0.1:65533"));
+
+        m.disable_proxy().await.expect("禁用系统代理失败");
+
+        let st = m.get_proxy_status().await;
+        assert!(!st.enabled, "禁用后状态应为未启用");
     }
 }

@@ -235,8 +235,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         // Check timeout
         if (attempts >= maxAttempts) {
           console.log('[StartProxy] Connection timeout');
+          const coreUp = get().connectionStatus?.proxyCore?.running;
+          const sysProxyOn = get().connectionStatus?.proxy?.enabled;
           set({
-            error: '连接超时：无法在预期时间内建立连接，请检查服务器配置',
+            error:
+              coreUp && !sysProxyOn
+                ? '系统代理未生效：sing-box 已启动，但未能修改系统代理设置，请查看日志'
+                : '连接超时：无法在预期时间内建立连接，请检查服务器配置',
             isLoading: false,
             proxyPhase: 'idle',
           });
@@ -395,6 +400,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       const proxyStatus = await api.proxy.getStatus();
       const current = get().connectionStatus;
       const ps = proxyStatus as { running: boolean; pid?: number; uptime?: number; error?: string };
+      const proxyModeType = get().config?.proxyModeType || 'systemProxy';
+
+      // 系统代理模式：「已连接」必须同时满足 sing-box 运行 + 系统代理真的开启。
+      // 只按 ps.running 判定会在设置系统代理失败时误报已连接（实际流量没走代理）。
+      let proxyEnabled = ps.running;
+      if (proxyModeType !== 'tun' && ps.running) {
+        try {
+          const sp = (await api.systemProxy.getStatus()) as {
+            enabled?: boolean;
+            supported?: boolean;
+          };
+          // supported=false 表示当前平台未实现状态查询（如 Windows），保持原判定
+          if (sp?.supported) {
+            proxyEnabled = sp.enabled === true;
+          }
+        } catch (e) {
+          console.warn('[Status] 读取系统代理状态失败，退回按进程状态判定:', e);
+        }
+      }
+
       const next: ConnectionStatus = {
         proxyCore: {
           running: ps.running,
@@ -403,10 +428,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           error: ps.error,
         },
         proxy: {
-          enabled: ps.running,
+          enabled: proxyEnabled,
           server: (ps as { currentServer?: { name?: string } }).currentServer?.name,
         },
-        proxyModeType: get().config?.proxyModeType || 'systemProxy',
+        proxyModeType,
       };
       if (
         !current ||
@@ -419,8 +444,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       ) {
         set({ connectionStatus: next });
       }
-      // 代理实际在运行但 store 有残留 error（如超时后实际连上了），清除错误状态
-      if (next.proxyCore.running && get().error) {
+      // 代理确实在生效但 store 有残留 error（如超时后实际连上了），清除错误状态。
+      // 系统代理模式下必须同时满足系统代理已开启，否则会把「系统代理未生效」的报错清掉。
+      if (next.proxyCore.running && next.proxy.enabled && get().error) {
         set({ error: null });
       }
     } catch (error) {
