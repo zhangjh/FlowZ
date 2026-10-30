@@ -1,7 +1,7 @@
 [package]
 name = "flowz"
 version = "4.0.5"
-description = "FlowZ - Tauri 2 migration scaffold (phase 1). Rust backend is being ported incrementally; see TODOs in src/lib.rs."
+description = "FlowZ - 简洁现代的跨平台代理客户端"
 edition = "2021"
 rust-version = "1.77.2"
 
