@@ -20,7 +20,7 @@ jobs:
             platform: win
             target: x86_64-pc-windows-msvc
             extraArgs: '--bundles nsis'
-          - os: macos-14
+          - os: macos-15
             platform: mac
             target: aarch64-apple-darwin
             extraArgs: ''
