@@ -496,9 +496,10 @@ pub fn generate_singbox_config(
 }
 
 fn generate_log_config(config: &UserConfig, ctx: &GenContext) -> SingBoxLogConfig {
-    // TS 默认 debug（应用层过滤低价值日志）
+    // TUN 模式下日志仅写入文件，debug 级别会产生海量 DNS/路由日志并快速膨胀
+    // （实测数小时可达数百 MB），默认降为 info；需要排障时可在应用层切换。
     let mut out = SingBoxLogConfig {
-        level: "debug".to_string(),
+        level: "info".to_string(),
         timestamp: true,
         output: None,
     };

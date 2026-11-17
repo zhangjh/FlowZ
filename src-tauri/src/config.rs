@@ -422,7 +422,10 @@ pub fn default_config() -> UserConfig {
         proxy_mode: ProxyMode::Global,
         proxy_mode_type: ProxyModeType::SystemProxy,
         tun_config: TunModeConfig {
-            mtu: 9000,
+            // 9000 过大：真实链路 MTU 通常 ~1480，gvisor 按 tun MTU 钳制 MSS 会导致
+            // 大段被静默丢弃（握手通、数据段超时）。与手机端固定 1400 及
+            // singbox.rs 中 mtu==0 的兜底值保持一致。
+            mtu: 1400,
             stack: TunStack::System,
             auto_route: true,
             strict_route: true,
@@ -620,10 +623,20 @@ pub fn config_path() -> Result<PathBuf, String> {
 fn parse_config(content: &str) -> Result<(UserConfig, bool), String> {
     let raw: Value =
         serde_json::from_str(content).map_err(|e| format!("配置文件损坏: {}", e))?;
-    let migrated = has_missing_id(&raw);
+    let mut migrated = has_missing_id(&raw);
     let mut cfg: UserConfig =
         serde_json::from_value(raw).map_err(|e| format!("配置文件损坏: {}", e))?;
     validate_config(&mut cfg).map_err(|e| format!("配置验证失败: {}", e))?;
+
+    // 产品级迁移：旧版本把 mtu 默认值固化成 9000（过大，真实链路 ~1480 时
+    // gvisor 按 tun MTU 钳制 MSS，导致大段被静默丢弃、握手通但数据段超时）。
+    // 仅改 default_config 的默认值无法覆盖已保存的用户配置，故加载时把历史
+    // 默认值 9000 自动迁移为 1400，并借 migrated 标志回写落盘（幂等）。
+    if cfg.tun_config.mtu == 9000 {
+        cfg.tun_config.mtu = 1400;
+        migrated = true;
+    }
+
     Ok((cfg, migrated))
 }
 
@@ -793,5 +806,32 @@ mod tests {
         cfg.custom_rules.push(rule_with_id(""));
         validate_config(&mut cfg).unwrap();
         assert!(!cfg.custom_rules[0].id.trim().is_empty());
+    }
+
+    /// 回归：老版本固化的 mtu=9000 应在加载时自动迁移为 1400 并标记回写；
+    /// 已是 1400 或用户自定义值的配置不应被误改（幂等）。
+    #[test]
+    fn legacy_mtu_9000_is_migrated_on_load() {
+        let mut cfg = default_config();
+        cfg.tun_config.mtu = 9000;
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+
+        let (loaded, migrated) = parse_config(&text).unwrap();
+        assert!(migrated, "旧 mtu 应标记为需要迁移并回写");
+        assert_eq!(loaded.tun_config.mtu, 1400, "9000 应迁移为 1400");
+
+        let text2 = serde_json::to_string_pretty(&loaded).unwrap();
+        let (_again, migrated2) = parse_config(&text2).unwrap();
+        assert!(!migrated2, "回写后 mtu 已稳定，不应再次迁移");
+    }
+
+    #[test]
+    fn custom_mtu_is_not_overwritten() {
+        let mut cfg = default_config();
+        cfg.tun_config.mtu = 1500;
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        let (loaded, migrated) = parse_config(&text).unwrap();
+        assert!(!migrated, "自定义 mtu 不应触发迁移");
+        assert_eq!(loaded.tun_config.mtu, 1500, "用户自定义值应保留");
     }
 }

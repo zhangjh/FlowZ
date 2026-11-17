@@ -318,7 +318,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 确保有默认的TUN配置
       if (!config.tunConfig) {
         config.tunConfig = {
-          mtu: 9000,
+          mtu: 1400,
           stack: 'system',
           autoRoute: true,
           strictRoute: true,

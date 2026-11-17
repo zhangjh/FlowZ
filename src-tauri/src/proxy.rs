@@ -531,10 +531,45 @@ fn setup_mac_tun_dns(sb_config: &crate::singbox::SingBoxConfig, logs: &SharedLog
     }
 }
 
+/// 清除 sing-box 的 selector 缓存文件。
+///
+/// `experimental.cache_file`（%APPDATA%/FlowZ/cache.db）会持久化 selector 的
+/// 选中状态，重启时该状态优先于 singbox_config.json 里的 `default`。结果为
+/// 用户在 UI 切换分组/节点后，内核仍按缓存里的旧选择连接，切换看起来"失效"。
+/// 在重启流程中（旧进程已 stop）删除缓存，使新配置的 default 生效。
+///
+/// TUN 模式下 `stop()` 只向守护进程异步下发 CMD_STOP，sing-box 真正退出并释放
+/// 文件句柄需要一点时间（脚本内 kill + 500ms），因此采用短间隔重试删除，
+/// 直到文件不再存在或超时。删除失败不阻断重启，仅静默跳过。
+async fn clear_selector_cache() {
+    let dir = match config::user_data_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let candidates = ["cache.db", "cache-direct.db"];
+    for _ in 0..20 {
+        let mut remaining = false;
+        for name in &candidates {
+            let path = dir.join(name);
+            if path.exists() && std::fs::remove_file(&path).is_err() {
+                remaining = true;
+            }
+        }
+        if !remaining {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 impl ProxyManager {
     pub async fn restart(&mut self, app: &AppHandle, cfg: &UserConfig) -> Result<(), String> {
         let _ = app.emit("event:proxyRestarting", serde_json::json!({}));
         self.stop(app).await?;
+        // sing-box 的 experimental.cache_file 会持久化 selector 选中状态，
+        // 下次启动时用它覆盖 singbox_config.json 里的 default，导致用户在 UI
+        // 切了分组/节点后仍连旧节点。重启前清掉缓存，让新 default 生效。
+        clear_selector_cache().await;
         self.start(app, cfg).await
     }
 
