@@ -515,10 +515,31 @@ fn generate_log_config(config: &UserConfig, ctx: &GenContext) -> SingBoxLogConfi
     out
 }
 
+/// 从探测到的系统 DNS 列表中挑一个可用作「内网域名真实解析」的上游。
+///
+/// TUN 模式下系统 DNS 可能已被指向 TUN 劫持地址（172.19.x / fdfe:dcba::），
+/// 这类地址不能作为上游（查询会绕回 sing-box 自己形成死循环）。回环地址同理。
+/// 一个可用地址都找不到时返回 None，真实解析域名会回退到 dns-local。
+fn pick_intranet_dns(servers: &[String]) -> Option<String> {
+    servers
+        .iter()
+        .find(|ip| {
+            !ip.is_empty()
+                && !ip.starts_with("127.")
+                && ip.as_str() != "::1"
+                && !crate::dns::is_tun_internal_address(ip)
+        })
+        .cloned()
+}
+
 fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
     let tun = is_tun_mode(&config.proxy_mode_type.to_string());
 
     let mut servers = Vec::new();
+    // 标记了「真实解析」的内网域名所用的上游 tag。
+    // 系统代理模式下 dns-local 就是 local（系统 DNS），直接用它即可；
+    // TUN 模式下 dns-local 是公共 DoH，解析不了企业内网域名，需另开 dns-intranet。
+    let mut real_dns_tag = "dns-local".to_string();
     if tun {
         // TUN 模式下系统 DNS 已被指向 TUN 劫持地址，此时若用 type:'local'，
         // 解析会绕回 sing-box 自己形成死循环（代理服务器域名解析超时、direct 拿到 fakeip 而连不通）。
@@ -534,6 +555,23 @@ fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
             inet4_range: None,
             inet6_range: None,
         });
+
+        // 企业内网域名在公共 DNS 上是 NXDOMAIN，
+        // 只能由系统内网 DNS（如公司 10.x 上的 AD/DNS）解析。公共 DoH 无法满足，
+        // 故新增一个走系统内网 DNS 的上游，供「绕过 FakeIP / 真实解析」的域名使用。
+        // 该 IP 来自 get_system_dns_servers()，与 TUN exclude / 上游 DNS 直连规则
+        // 取自同一份列表，查询不会绕回 TUN；不指定 detour（见上方致命退出说明）。
+        if let Some(intranet) = pick_intranet_dns(&get_system_dns_servers()) {
+            servers.push(SingBoxDnsServer {
+                tag: "dns-intranet".to_string(),
+                server_type: "udp".to_string(),
+                server: Some(intranet),
+                detour: None,
+                inet4_range: None,
+                inet6_range: None,
+            });
+            real_dns_tag = "dns-intranet".to_string();
+        }
     } else {
         servers.push(SingBoxDnsServer {
             tag: "dns-local".to_string(),
@@ -572,14 +610,19 @@ fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
         });
     }
 
-    // bypassFakeIP 域名走本地真实解析
+    // 需要真实解析的域名：显式勾选 bypassFakeIP，或策略为直连的域名。
+    //
+    // 直连域名必须拿真实 IP：fakeip（198.18.x）是虚拟地址，直连出站拨它必然连不通。
+    // 企业内网域名（公网 DNS 为 NXDOMAIN）也必须走系统内网 DNS 才能解析。
+    // 两类都归到 real_dns_tag（TUN 下为 dns-intranet / 系统内网 DNS）。
     let mut bypass: Vec<String> = Vec::new();
     for rule in &config.custom_rules {
-        if !rule.enabled {
+        if !rule.enabled || rule.domains.is_empty() {
             continue;
         }
-        let has_flag = rule.bypass_fake_ip == Some(true);
-        if !has_flag || rule.domains.is_empty() {
+        let has_flag = rule.bypass_fake_ip == Some(true)
+            || rule.action == crate::config::RuleAction::Direct;
+        if !has_flag {
             continue;
         }
         for d in &rule.domains {
@@ -589,7 +632,7 @@ fn generate_dns_config(config: &UserConfig) -> SingBoxDnsConfig {
     if !bypass.is_empty() {
         rules.push(SingBoxDnsRule {
             domain_suffix: Some(bypass),
-            server: "dns-local".to_string(),
+            server: real_dns_tag,
             ..Default::default()
         });
     }
@@ -1255,6 +1298,81 @@ mod tests {
     fn dns_fallback_keeps_detected_servers() {
         let detected = vec!["10.0.0.1".to_string(), "8.8.8.8".to_string()];
         assert_eq!(apply_dns_fallback(detected.clone()), detected);
+    }
+
+    /// pick_intranet_dns 必须跳过 TUN 劫持地址与回环，只挑真实内网/系统 DNS。
+    #[test]
+    fn pick_intranet_dns_skips_tun_and_loopback() {
+        let servers = vec![
+            "172.19.0.2".to_string(),      // TUN 劫持地址
+            "127.0.0.1".to_string(),       // 回环
+            "::1".to_string(),             // IPv6 回环
+            "10.126.142.129".to_string(),  // 真内网 DNS
+            "10.126.142.187".to_string(),
+        ];
+        assert_eq!(
+            pick_intranet_dns(&servers).as_deref(),
+            Some("10.126.142.129"),
+            "应挑出第一个非 TUN/回环的内网 DNS"
+        );
+        // 全是不可用地址时返回 None
+        let only_tun = vec!["172.19.0.2".to_string(), "127.0.0.1".to_string()];
+        assert_eq!(pick_intranet_dns(&only_tun), None);
+        assert_eq!(pick_intranet_dns(&[]), None);
+    }
+
+    /// 回归：TUN 模式下直连规则 / bypassFakeIP 规则的域名，其 DNS 必须走
+    /// dns-intranet（系统内网 DNS），而不是公共 DoH（dns-local），
+    /// 否则 archery.mcdchina.net 这类内网域名被公共 DNS 判 NXDOMAIN 而失败。
+    #[test]
+    fn tun_direct_domains_resolve_via_intranet_dns() {
+        let mut cfg = sample_config();
+        cfg.proxy_mode_type = crate::config::ProxyModeType::Tun;
+        cfg.custom_rules.push(crate::config::DomainRule {
+            id: "r-intranet".into(),
+            domains: vec!["archery.mcdchina.net".into()],
+            action: crate::config::RuleAction::Direct,
+            enabled: true,
+            bypass_fake_ip: Some(true),
+        });
+        let sb = generate_singbox_config(&cfg, &sample_ctx()).unwrap();
+        let dns = sb.dns.as_ref().unwrap();
+
+        // 存在 dns-intranet 上游，且指向 udp 类型的系统 DNS
+        let intranet = dns
+            .servers
+            .iter()
+            .find(|s| s.tag == "dns-intranet")
+            .expect("TUN 模式应生成 dns-intranet 上游");
+        assert_eq!(intranet.server_type, "udp");
+        assert!(intranet.server.is_some());
+
+        // 真实解析规则的 server 指向 dns-intranet（而非 dns-local / fakeip）
+        let real_rule = dns
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r.domain_suffix
+                    .as_ref()
+                    .map(|d| d.iter().any(|x| x == "archery.mcdchina.net"))
+                    .unwrap_or(false)
+            })
+            .expect("应生成内网域名真实解析规则");
+        assert_eq!(real_rule.server, "dns-intranet");
+    }
+
+    /// 系统代理模式下 dns-local 本就是 local（系统 DNS），不应多生成 dns-intranet。
+    #[test]
+    fn system_proxy_mode_has_no_intranet_dns_server() {
+        let cfg = sample_config(); // 默认 systemProxy
+        let sb = generate_singbox_config(&cfg, &sample_ctx()).unwrap();
+        let dns = sb.dns.as_ref().unwrap();
+        assert!(
+            !dns.servers.iter().any(|s| s.tag == "dns-intranet"),
+            "系统代理模式不需要独立的 dns-intranet"
+        );
     }
 
     /// 回归：dns-local 上游必须同时出现在 TUN 排除地址与「上游 DNS 直连」规则中。

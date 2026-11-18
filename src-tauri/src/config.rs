@@ -344,7 +344,10 @@ pub struct DomainRule {
     pub domains: Vec<String>,
     pub action: RuleAction,
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // 前端字段名是 bypassFakeIP（IP 全大写），而 rename_all=camelCase 只会生成
+    // bypassFakeIp。必须显式 rename，否则该字段反序列化时被丢弃、序列化时被
+    // skip_serializing_if(None) 跳过，导致「绕过 FakeIP」勾选后保存即丢失、回显永不勾选。
+    #[serde(rename = "bypassFakeIP", default, skip_serializing_if = "Option::is_none")]
     pub bypass_fake_ip: Option<bool>,
 }
 
@@ -762,6 +765,45 @@ mod tests {
             enabled: true,
             bypass_fake_ip: None,
         }
+    }
+
+    /// 回归：「绕过 FakeIP」开关（前端字段 bypassFakeIP）必须能在
+    /// JSON <-> UserConfig 之间无损往返。
+    /// 字段曾因 rename_all=camelCase 只能生成 bypassFakeIp 而丢失，
+    /// 导致勾选保存后字段消失、再次编辑不回显。
+    #[test]
+    fn bypass_fake_ip_field_roundtrips_with_frontend_key() {
+        // 1) 序列化：Rust 结构体 -> JSON 必须是 bypassFakeIP（大写 IP）
+        let mut rule = rule_with_id("rule_bypass");
+        rule.bypass_fake_ip = Some(true);
+        let value = serde_json::to_value(&rule).unwrap();
+        assert_eq!(
+            value["bypassFakeIP"], serde_json::json!(true),
+            "序列化键名必须是 bypassFakeIP"
+        );
+        assert!(
+            value.get("bypassFakeIp").is_none(),
+            "不应生成错误的大小写 bypassFakeIp"
+        );
+
+        // 2) 反序列化：前端传来的 bypassFakeIP 必须被读入
+        let from_frontend = serde_json::json!({
+            "id": "rule_bypass",
+            "domains": ["archery.mcdchina.net"],
+            "action": "direct",
+            "enabled": true,
+            "bypassFakeIP": true
+        });
+        let parsed: DomainRule = serde_json::from_value(from_frontend).unwrap();
+        assert_eq!(parsed.bypass_fake_ip, Some(true), "bypassFakeIP 必须被反序列化");
+
+        // 3) 完整配置落盘往返（走 parse_config，含 validate）
+        let mut cfg = default_config();
+        cfg.custom_rules.push(parsed);
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("\"bypassFakeIP\""), "落盘文本必须含 bypassFakeIP");
+        let (loaded, _) = parse_config(&text).unwrap();
+        assert_eq!(loaded.custom_rules[0].bypass_fake_ip, Some(true));
     }
 
     #[test]
